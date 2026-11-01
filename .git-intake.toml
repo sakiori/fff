@@ -2,17 +2,19 @@ integration = "main"
 publish = { remote = "origin", via = "merge-request" }
 install = "cargo fetch --locked"
 checks = [
-  "cargo fmt --all -- --check",
-  "cargo clippy --no-default-features --features zlob -- -D warnings",
-  "make lint-mcp",
+  { name = "fmt", run = "cargo fmt --all -- --check" },
+  { name = "clippy", run = "cargo clippy --no-default-features --features zlob -- -D warnings" },
+  { name = "lint-mcp", run = "make lint-mcp" },
   # Watchers poll in tests, so results do not depend on OS event delivery. The
   # three skipped fs_delete_handler_test tests build notify's native watcher
   # themselves and test OS and notify delivery, not fff code. The two skipped
   # watch_subscription_test rename tests assert native rename pairing, which a
-  # polling walk cannot guarantee. Upstream's CI covers native delivery. See
-  # CUSTOM.md, Verification.
-  "FFF_TEST_POLL_WATCHER_MS=25 make test-rust TEST_ARGS='--exact --skip raw_notify_nonrecursive_detects_deletion --skip raw_notify_multi_nonrecursive_detects_deletion --skip debounced_nonrecursive_detects_deletion --skip renaming_out_of_a_watched_subtree_still_notifies --skip renaming_into_a_watched_subtree_still_notifies'",
-  "FFF_TEST_POLL_WATCHER_MS=25 make test-mcp TEST_ARGS='--exact --skip raw_notify_nonrecursive_detects_deletion --skip raw_notify_multi_nonrecursive_detects_deletion --skip debounced_nonrecursive_detects_deletion --skip renaming_out_of_a_watched_subtree_still_notifies --skip renaming_into_a_watched_subtree_still_notifies'",
+  # polling walk cannot guarantee. The fork's pipelines run the full suite
+  # natively: native-tests on Linux in merge requests, macos-tests on macOS for
+  # main and releases; upstream's CI covers native delivery too. See CUSTOM.md,
+  # Verification.
+  { name = "test-rust", run = "FFF_TEST_POLL_WATCHER_MS=25 make test-rust TEST_ARGS='--exact --skip raw_notify_nonrecursive_detects_deletion --skip raw_notify_multi_nonrecursive_detects_deletion --skip debounced_nonrecursive_detects_deletion --skip renaming_out_of_a_watched_subtree_still_notifies --skip renaming_into_a_watched_subtree_still_notifies'" },
+  { name = "test-mcp", run = "FFF_TEST_POLL_WATCHER_MS=25 make test-mcp TEST_ARGS='--exact --skip raw_notify_nonrecursive_detects_deletion --skip raw_notify_multi_nonrecursive_detects_deletion --skip debounced_nonrecursive_detects_deletion --skip renaming_out_of_a_watched_subtree_still_notifies --skip renaming_into_a_watched_subtree_still_notifies'" },
 ]
 
 [[upstream]]
@@ -20,3 +22,10 @@ name = "fff"
 url = "https://github.com/dmtrKovalenko/fff.git"
 branch = "main"
 mode = "follow"
+
+# Releases are v<base>-sakiori.<YYYYMMDD>.<n>, the base being the newest upstream release
+# main contains with its patch raised. See CUSTOM.md, Releases.
+[release]
+upstream = "fff"
+tags = "v*"
+labels = ["sakiori"]

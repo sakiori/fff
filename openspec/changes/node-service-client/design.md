@@ -276,35 +276,45 @@ Each platform package carries `libfff_c` and `fff-mcp` at its root. The Node
 package resolves both from one location, the library `FFF_C_LIB` names with the
 executable beside it, its platform package or a development build, never one
 from each, and maps a path inside an `.asar` archive to its
-`.asar.unpacked` counterpart when that file exists. Its CommonJS entry is the same module as its ESM entry: `require`
+`.asar.unpacked` counterpart when that file exists. Its CommonJS entry is the
+same module as its ESM entry: `require`
 loads the ES module, which needs Node 20.19 or 22.12 and later, and avoids two
 copies of the native state in one process. `make stage-node-platform` copies
 one build of both into the host's platform package.
 
-The fork names these packages under its own scope, `@sakiori/fff-node` and
-`@sakiori/fff-bin-<platform>`, so they can never be mistaken for upstream's
-packages. The Node package resolves its platform package by the fork's names.
-Only the platform packages the fork builds carry its names; the other
+The fork publishes these packages under its own scope, `@sakiori/fff-node` and
+`@sakiori/fff-bin-<platform>`, to npmjs.org, so they can never be mistaken for
+upstream releases. The Node package resolves its platform package by the fork's
+names. Only the platform packages the fork builds carry its names; the Windows
 `fff-bin-*` directories stay upstream's, and the version script gives each
 consumer the platform packages of its own scope. A consumer that imports the
-upstream name keeps its imports with a package-manager alias. A platform package
-carries `libfff_c` and `fff-mcp` of one build, so that a Node application and
-the agents that run that `fff-mcp` share one service. `libfff_c` and `fff-mcp`
-come from separate cargo invocations, since one invocation would unify
-`fff-mcp`'s dependency features into the library. The identity hashes no
-dependency features beyond the walker backend, so the build compares the
-identity each invocation reports.
+upstream name keeps its imports with a package-manager alias. The release
+pipeline builds them for macOS arm64 and x64 on the macOS runner and for Linux
+x64 and arm64, glibc and musl, with cargo-zigbuild, in the same jobs and from
+the same stamped tree as the `fff-mcp` archives, so that a Node application and
+the agents that install `fff-mcp` from the same release share one service.
+Where a target has both, the platform package carries the archive's `fff-mcp`
+file. `libfff_c` and `fff-mcp` come from separate cargo invocations on every
+target, since one invocation would unify `fff-mcp`'s dependency features into
+the library. On musl they also differ in linking: the executable links musl
+statically so that it runs on any Linux, and a statically linked musl target
+cannot produce a shared library, which a Node.js on musl must load dynamically.
+The identity hashes neither the link flag nor dependency features beyond the
+walker backend; the build compares the identity each invocation reports, and
+the packing job compares those of all targets. The glibc builds target glibc
+2.28, the floor of Node.js's own Linux builds.
 
-The Node package depends on its platform packages as ordinary dependencies,
-pinned to its own version, and the platform packages declare no `os`, `cpu` or
-`libc`. A registry whose package metadata carries neither optional dependencies
-nor those platform fields would install the usual pattern of optional platform
-packages without any native files. Every install therefore downloads all
-platform packages, and the package loads the one of the running platform,
-telling glibc from musl on Linux at run time; an application bundle copies only
-its target's. The platform packages declare no platform fields because a
-registry that serves them would make npm refuse a required package of another
-platform, and pnpm with `engine-strict`.
+The platform packages follow upstream's pattern: each declares `os`, `cpu` and
+on Linux `libc`, and the Node package lists them as optional dependencies pinned
+to its own version, so npm and pnpm install only the running platform's one.
+The package still tells glibc from musl on Linux at run time to pick it, and
+reports an unsupported platform when no package matches.
+
+The packages go to npmjs.org in the tag's pipeline by trusted publishing, with
+provenance, the platform packages before the Node package that names them, and
+before the archives and the GitLab Release that marks the whole release
+published. npm never replaces a version, so a retried job skips a package
+published with the same tarball and fails on one published with another.
 
 ## Verification
 

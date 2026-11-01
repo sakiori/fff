@@ -1,0 +1,493 @@
+# Pipelines of sakiori-oss/fff on GitLab.com. CUSTOM.md, "Releases", describes the process and
+# the project settings it relies on.
+#
+# - Merge request: fmt, clippy, lint-mcp, ci-scripts, native-tests and node-tests on Linux, and
+#   check-build-linux, the Linux release builds, when a change can affect the build.
+# - Push to main: macos-tests, the native suite on the macOS runner.
+# - Schedule on main: git-intake-sync takes upstream through a merge request, and release-tag
+#   cuts v<base>-sakiori.<YYYYMMDD>.<n> on the tip unless a release points at it.
+# - Release tag: release-check, release-version, build-linux, build-darwin and macos-tests,
+#   pack-npm, sign, publish-npm, publish, and release last: the GitLab Release.
+# - Started by hand on main: a rehearsal of a release with the version <base>-sakiori.<day>.0,
+#   whose rehearse-npm only reads the registry; nothing is signed or published.
+#
+# Linux jobs run on the group's x86_64 Linux runner, tagged sakiori-oss-linux, except
+# publish-npm, which npm's trusted publishing keeps on GitLab.com's shared runners. Apple's SDK
+# may be used only on Apple hardware, so darwin targets build natively on the forks' Apple
+# silicon runner, which takes this project's jobs tagged sakiori-oss-macos only from protected
+# refs and runs each in a disposable macOS virtual machine. Release
+# jobs run only in this project. Tools are pinned by version and SHA-256 in
+# .gitlab/scripts/install-tools.sh, images by digest.
+
+workflow:
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+    # The Linux runner keeps a working copy that merge request jobs also use, so a release clones.
+    - if: $CI_COMMIT_TAG =~ /^v\d+\.\d+\.\d+-sakiori\.\d{8}\.[1-9]\d?$/
+      variables:
+        GIT_STRATEGY: clone
+    - if: $CI_COMMIT_TAG
+      when: never
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH && $CI_PIPELINE_SOURCE =~ /^(push|schedule|web|api)$/
+  auto_cancel:
+    on_new_commit: none
+
+stages:
+  - check
+  - build
+  - pack
+  - sign
+  - publish
+  - release
+
+variables:
+  GIT_DEPTH: "1"
+  # The toolchain of every job; rust-toolchain.toml asks for the current stable, which CI pins.
+  RUSTUP_TOOLCHAIN: "1.98.1"
+  RUST_IMAGE: rust:1.98.1-trixie@sha256:a8a5f0a1e5fe7dfe1d352591e4a1c7dd2c08fd70475cae872cf3458ba0df0546
+  # Cirrus Labs' macOS 26 base image with the Xcode Command Line Tools, gitlab-runner and Rosetta.
+  MACOS_IMAGE: ghcr.io/cirruslabs/macos-tahoe-base@sha256:4aaa751fa7538902d73c767f27a066fc87e83f183069da4e4b5022863abd4c77
+  CARGO_HOME: $CI_PROJECT_DIR/.cargo
+  CARGO_TERM_COLOR: always
+  TOOLS: $CI_PROJECT_DIR/.tools
+  # The git-intake release the release jobs install, with its x86_64-unknown-linux-musl
+  # archive's SHA-256.
+  GIT_INTAKE_VERSION: "0.4.1"
+  GIT_INTAKE_SHA256_X86_64_LINUX: bf1aa4048172d435155e2389c45c0b57f685121df6db628ba8172f2e1684306b
+
+default:
+  image: $RUST_IMAGE
+  tags:
+    - sakiori-oss-linux
+  interruptible: false
+  retry:
+    max: 1
+    when:
+      - runner_system_failure
+      - runner_external_dependency_failure
+      - runner_interrupted
+      - stuck_pending_with_matching_runners
+      - stuck_pending_no_matching_runners
+      - no_updates_running
+      - no_updates_canceling
+
+# Zig for zlob, and libclang, which zlob's bindgen loads, from the image's Debian release.
+.zig:
+  before_script:
+    - apt-get update -qq
+    - apt-get install -y -qq --no-install-recommends libclang-dev > /dev/null
+    - .gitlab/scripts/install-tools.sh "$TOOLS" zig
+    - export PATH="$TOOLS/bin:$PATH"
+    - zig version
+    - cargo --version
+
+.check:
+  extends: .zig
+  stage: check
+  needs: []
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+  cache:
+    key:
+      files:
+        - Cargo.lock
+      prefix: $CI_JOB_NAME_SLUG
+    paths:
+      - .cargo/registry/index
+      - .cargo/registry/cache
+      - target/
+
+fmt:
+  extends: .check
+  before_script:
+    - rustup component add rustfmt
+  cache: []
+  script:
+    - cargo fmt --all -- --check
+
+clippy:
+  extends: .check
+  script:
+    - rustup component add clippy
+    - cargo clippy --no-default-features --features zlob -- -D warnings
+
+lint-mcp:
+  extends: .check
+  script:
+    - rustup component add clippy
+    - make lint-mcp
+
+# The pipeline's scripts: executable in git, shellcheck clean, and the Zig pin upstream's.
+ci-scripts:
+  extends: .check
+  before_script: []
+  cache: []
+  script:
+    - |
+      plain=$(git ls-files -s -- '.gitlab/scripts/*.sh' | grep -v '^100755 ' || true)
+      [ -z "$plain" ] || { printf 'not executable in git (git update-index --chmod=+x):\n%s\n' "$plain" >&2; exit 1; }
+    - .gitlab/scripts/install-tools.sh "$TOOLS" shellcheck
+    - '"$TOOLS/bin/shellcheck" .gitlab/scripts/*.sh'
+    - .gitlab/scripts/check-zig-pin.sh
+
+# The full test suite with the OS event service behind the watchers (inotify here): no polling
+# interval and no skipped tests (see "Verification" in CUSTOM.md).
+native-tests:
+  extends: .check
+  timeout: 1h
+  script:
+    - make test-rust
+    - make test-mcp
+
+# The Node package's tests against a release build of libfff_c and fff-mcp.
+node-tests:
+  extends: .check
+  timeout: 1h
+  script:
+    - .gitlab/scripts/install-tools.sh "$TOOLS" node
+    - node --version
+    - (cd packages && npm ci --workspace fff-node --ignore-scripts --no-audit --no-fund)
+    - make test-node
+
+# git-intake from its release archive, for the jobs that run it; they need the full history.
+.git-intake:
+  variables:
+    GIT_DEPTH: "0"
+  before_script:
+    - .gitlab/scripts/install-tools.sh "$TOOLS" git-intake
+    - export PATH="$TOOLS/bin:$PATH"
+
+# The schedule's jobs push and open merge requests with GITLAB_TOKEN, the token of the group's
+# release bot, whose pushes start pipelines. The variable is scoped to the git-intake
+# environment, which only these jobs name.
+.git-intake-bot:
+  stage: check
+  needs: []
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "schedule" && $CI_PROJECT_PATH == "sakiori-oss/fff"
+  environment:
+    name: git-intake
+    action: prepare
+  variables:
+    GIT_DEPTH: "0"
+    GIT_STRATEGY: clone
+    # Without this flag the runner rewrites every URL of the server to one that
+    # carries the job token, whose pushes neither create protected tags nor
+    # start pipelines; with it the runner offers the job token through a
+    # credential helper, which the job replaces below.
+    FF_GIT_URLS_WITHOUT_TOKENS: "true"
+  before_script:
+    - '[ -n "${GITLAB_TOKEN:-}" ] || { echo "GITLAB_TOKEN is not set; CUSTOM.md, Releases, describes it" >&2; exit 1; }'
+    - .gitlab/scripts/install-tools.sh "$TOOLS" git-intake
+    - export PATH="$TOOLS/bin:$PATH"
+    - git config user.name Sakiori
+    - git config user.email oss@sakiori.app
+    # The empty helper clears the runner's job-token helper configured before it.
+    - git config --add credential.helper ''
+    - git config --add credential.helper '!f() { echo username=oauth2; echo "password=$GITLAB_TOKEN"; }; f'
+    - git remote set-url origin "$CI_PROJECT_URL.git"
+    # A push URL that carries credentials would push without GITLAB_TOKEN.
+    - |
+      case "$(git remote get-url --push origin)" in
+        *@*) echo "git rewrites the push URL to carry credentials; it must reach the server without them" >&2; exit 1 ;;
+      esac
+
+git-intake-sync:
+  extends: .git-intake-bot
+  resource_group: git-intake-sync
+  script:
+    - git intake sync
+
+release-tag:
+  extends: .git-intake-bot
+  resource_group: release-tag
+  script:
+    - git intake release tag
+
+# A release builds nothing before its tag passes the check; the notes are written with it.
+release-check:
+  extends: .git-intake
+  stage: check
+  needs: []
+  rules:
+    - if: $CI_COMMIT_TAG && $CI_PROJECT_PATH == "sakiori-oss/fff"
+  script:
+    - git intake release check
+    - git intake release notes > release-notes.md
+    - cat release-notes.md
+  artifacts:
+    paths:
+      - release-notes.md
+    expire_in: 30 days
+
+# The version every build stamps: the tag's, or a rehearsal's <base>-sakiori.<YYYYMMDD>.0.
+release-version:
+  extends: .git-intake
+  stage: check
+  needs:
+    - job: release-check
+      optional: true
+  rules:
+    - if: $CI_COMMIT_TAG && $CI_PROJECT_PATH == "sakiori-oss/fff"
+    - if: $CI_PIPELINE_SOURCE =~ /^(web|api)$/ && $CI_PROJECT_PATH == "sakiori-oss/fff"
+  script:
+    - git intake release version --dotenv > release.env
+    - cat release.env
+  artifacts:
+    reports:
+      dotenv: release.env
+
+# Each build leaves the native files of its platform package in native/ and, for musl and
+# darwin, the fff-mcp archive in dist/ (build-release.sh).
+.build-linux:
+  extends: .zig
+  stage: build
+  timeout: 1h
+  parallel:
+    matrix:
+      - TARGET:
+          - x86_64-unknown-linux-musl
+          - aarch64-unknown-linux-musl
+          - x86_64-unknown-linux-gnu
+          - aarch64-unknown-linux-gnu
+  script:
+    - .gitlab/scripts/install-tools.sh "$TOOLS" cargo-zigbuild
+    - if [ -n "${RELEASE_VERSION:-}" ]; then .gitlab/scripts/stamp-version.sh "$RELEASE_VERSION"; fi
+    - .gitlab/scripts/build-release.sh "$TARGET"
+  artifacts:
+    paths:
+      - dist/
+      - native/
+    expire_in: 30 days
+
+# A merge request that can change the build builds every Linux target with the committed
+# version, so a release never meets a broken build for the first time.
+check-build-linux:
+  extends: .build-linux
+  needs: []
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+      changes:
+        paths:
+          - Cargo.toml
+          - Cargo.lock
+          - crates/*/Cargo.toml
+          - crates/*/build.rs
+          - .cargo/config.toml
+          - .gitlab/scripts/**/*
+          - .gitlab-ci.yml
+          - mise.toml
+          - rust-toolchain.toml
+        compare_to: refs/heads/main
+  cache:
+    key:
+      files:
+        - Cargo.lock
+      prefix: build-$TARGET
+    paths:
+      - .cargo/registry/index
+      - .cargo/registry/cache
+      - target/
+
+# A release build depends on the tag's commit and the pinned image and tools only, so it
+# restores no cache.
+build-linux:
+  extends: .build-linux
+  needs:
+    - job: release-version
+  rules:
+    - if: $CI_COMMIT_TAG && $CI_PROJECT_PATH == "sakiori-oss/fff"
+    - if: $CI_PIPELINE_SOURCE =~ /^(web|api)$/ && $CI_PROJECT_PATH == "sakiori-oss/fff"
+  cache: []
+
+# Jobs of the macOS runner. Each runs in a virtual machine cloned from MACOS_IMAGE and deleted
+# after it, which caches nothing; the pinned rustup-init installs the toolchain into the job.
+.macos:
+  image: $MACOS_IMAGE
+  tags:
+    - sakiori-oss-macos
+  cache: []
+  variables:
+    GIT_STRATEGY: clone
+    RUSTUP_HOME: $CI_PROJECT_DIR/.rustup
+  before_script:
+    # The runner refuses any other job before it starts a virtual machine; the job does again.
+    - |
+      [ "${CI_COMMIT_REF_PROTECTED:-}" = true ] || { echo "the macOS runner takes protected refs only" >&2; exit 1; }
+    - .gitlab/scripts/install-tools.sh "$TOOLS" rustup zig node
+    - env -u RUSTUP_TOOLCHAIN "$TOOLS/bin/rustup-init" -y --quiet --no-modify-path --profile minimal --default-toolchain none
+    - export PATH="$CARGO_HOME/bin:$TOOLS/bin:$PATH"
+    - rustup toolchain install "$RUSTUP_TOOLCHAIN" --profile minimal --no-self-update
+    - zig version
+    - cargo --version
+
+build-darwin:
+  extends: .macos
+  stage: build
+  needs:
+    - job: release-version
+  rules:
+    - if: $CI_COMMIT_TAG && $CI_PROJECT_PATH == "sakiori-oss/fff"
+    - if: $CI_PIPELINE_SOURCE =~ /^(web|api)$/ && $CI_PROJECT_PATH == "sakiori-oss/fff"
+  timeout: 1h
+  parallel:
+    matrix:
+      - TARGET:
+          - aarch64-apple-darwin
+          - x86_64-apple-darwin
+  script:
+    - .gitlab/scripts/stamp-version.sh "$RELEASE_VERSION"
+    - .gitlab/scripts/build-release.sh "$TARGET"
+  artifacts:
+    paths:
+      - dist/
+      - native/
+    expire_in: 30 days
+
+# The full native suite with FSEvents, no polling and no skips, and the Node package's tests,
+# for every push to main, rehearsal and release; a release publishes nothing before it passes.
+macos-tests:
+  extends: .macos
+  stage: check
+  needs: []
+  rules:
+    - if: $CI_COMMIT_TAG && $CI_PROJECT_PATH == "sakiori-oss/fff"
+    - if: $CI_PIPELINE_SOURCE =~ /^(push|web|api)$/ && $CI_PROJECT_PATH == "sakiori-oss/fff"
+  timeout: 2h
+  script:
+    - make test-rust
+    - make test-mcp
+    - (cd packages && npm ci --workspace fff-node --ignore-scripts --no-audit --no-fund)
+    - make test-node
+
+# The npm tarballs of @sakiori/fff-node and its six platform packages.
+pack-npm:
+  stage: pack
+  needs:
+    - job: build-linux
+      artifacts: true
+    - job: build-darwin
+      artifacts: true
+    - job: release-version
+  rules:
+    - if: $CI_COMMIT_TAG && $CI_PROJECT_PATH == "sakiori-oss/fff"
+    - if: $CI_PIPELINE_SOURCE =~ /^(web|api)$/ && $CI_PROJECT_PATH == "sakiori-oss/fff"
+  script:
+    - .gitlab/scripts/install-tools.sh "$TOOLS" node
+    - export PATH="$TOOLS/bin:$PATH"
+    - .gitlab/scripts/pack-npm.sh
+  artifacts:
+    paths:
+      - dist-npm/
+    expire_in: 30 days
+
+# The only job besides publish-npm that holds an ID token for Sigstore; it runs no build code.
+sign:
+  stage: sign
+  needs:
+    - job: build-linux
+      artifacts: true
+    - job: build-darwin
+      artifacts: true
+  rules:
+    - if: $CI_COMMIT_TAG && $CI_PROJECT_PATH == "sakiori-oss/fff"
+  id_tokens:
+    SIGSTORE_ID_TOKEN:
+      aud: sigstore
+  script:
+    - .gitlab/scripts/install-tools.sh "$TOOLS" cosign
+    - export PATH="$TOOLS/bin:$PATH"
+    - .gitlab/scripts/sign.sh
+  artifacts:
+    paths:
+      - dist/
+    expire_in: 30 days
+
+.npm:
+  stage: publish
+  script:
+    - .gitlab/scripts/install-tools.sh "$TOOLS" node
+    - export PATH="$TOOLS/bin:$PATH"
+    - npm --version
+    - node .gitlab/scripts/publish-npm.mjs $PUBLISH_NPM_FLAGS
+
+# npm publishes with trusted publishing, which works only on GitLab.com's shared runners, and
+# with provenance; NPM_TOKEN, scoped to the npm environment, exists only for a first publish.
+# One release publishes at a time: the npm packages, the registry files, then the Release.
+publish-npm:
+  extends: .npm
+  tags:
+    - saas-linux-small-amd64
+  needs:
+    - job: pack-npm
+      artifacts: true
+    - job: release-version
+    - job: macos-tests
+      artifacts: false
+    - job: sign
+      artifacts: false
+  rules:
+    - if: $CI_COMMIT_TAG && $CI_PROJECT_PATH == "sakiori-oss/fff"
+  environment:
+    name: npm
+    action: prepare
+  resource_group: release-publish
+  id_tokens:
+    NPM_ID_TOKEN:
+      aud: npm:registry.npmjs.org
+    SIGSTORE_ID_TOKEN:
+      aud: sigstore
+  variables:
+    PUBLISH_NPM_FLAGS: ""
+
+# A rehearsal reports per package whether a release would publish or skip it, and fails where
+# a release's publish would.
+rehearse-npm:
+  extends: .npm
+  needs:
+    - job: pack-npm
+      artifacts: true
+    - job: release-version
+    - job: macos-tests
+      artifacts: false
+  rules:
+    - if: $CI_PIPELINE_SOURCE =~ /^(web|api)$/ && $CI_PROJECT_PATH == "sakiori-oss/fff"
+  variables:
+    PUBLISH_NPM_FLAGS: --check
+
+publish:
+  stage: publish
+  needs:
+    - job: sign
+      artifacts: true
+    - job: publish-npm
+      artifacts: false
+    - job: macos-tests
+      artifacts: false
+  rules:
+    - if: $CI_COMMIT_TAG && $CI_PROJECT_PATH == "sakiori-oss/fff"
+  resource_group: release-publish
+  script:
+    - .gitlab/scripts/install-tools.sh "$TOOLS" jq
+    - export PATH="$TOOLS/bin:$PATH"
+    - .gitlab/scripts/publish.sh
+  artifacts:
+    paths:
+      - release-links.json
+    expire_in: 30 days
+
+# The last job: the release is published once its GitLab Release exists.
+release:
+  stage: release
+  needs:
+    - job: release-check
+      artifacts: true
+    - job: publish
+      artifacts: true
+  rules:
+    - if: $CI_COMMIT_TAG && $CI_PROJECT_PATH == "sakiori-oss/fff"
+  resource_group: release-publish
+  script:
+    - .gitlab/scripts/install-tools.sh "$TOOLS" glab jq
+    - export PATH="$TOOLS/bin:$PATH"
+    - .gitlab/scripts/release.sh

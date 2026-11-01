@@ -1,3 +1,12 @@
+> [!NOTE]
+> This is `sakiori-oss/fff`, a downstream fork of [fff](https://github.com/dmtrKovalenko/fff)
+> that follows upstream's `main`. It adds a shared index service, so the MCP clients of one
+> user that search the same directory share one index, and a Node package,
+> `@sakiori/fff-node`, that searches through that service. `fff-mcp` releases are on this
+> project's GitLab Releases and the Node package is on npm. [CUSTOM.md](./CUSTOM.md)
+> describes the downstream behavior, installation and maintenance; the rest of this README
+> is upstream's.
+
 <a href="./assets/logo-orange.png"><img alt="FFF" src="./assets/logo-orange.png" width="300"></a>
 
 <p>
@@ -50,8 +59,8 @@ Pick what you are interested in:
 
 Works with Claude Code, Codex, OpenCode, Cursor, Cline, and any MCP-capable client. A resident Rust index supports file discovery and content search across tool calls.
 
-This downstream branch shares MCP indexes across compatible clients. See
-[CUSTOM.md](./CUSTOM.md#shared-mcp-service) for local builds, scope behavior and
+This fork shares MCP indexes across compatible clients. See
+[CUSTOM.md](./CUSTOM.md#shared-mcp-service) for installation, scope behavior and
 service lifecycle commands.
 
 ![Measured search time and tokens for FFF MCP versus normal shell search](./chart.png)

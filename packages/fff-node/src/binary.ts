@@ -116,9 +116,9 @@ function nativeFilesIn(dir: string): Result<NativeFiles> | null {
 /**
  * Resolve the native files from the platform-specific npm package.
  *
- * @sakiori/fff-node depends on every platform package; the host's one (e.g.
- * @sakiori/fff-bin-darwin-arm64) holds both files at its root. An application
- * bundle may ship only its target's one.
+ * @sakiori/fff-node lists every platform package as an optional dependency, and an
+ * install brings the host's one (e.g. @sakiori/fff-bin-darwin-arm64), which holds
+ * both files at its root.
  */
 function resolveFromNpmPackage(packageName: string): Result<NativeFiles> | null {
   let packageJsonPath: string;
@@ -126,7 +126,7 @@ function resolveFromNpmPackage(packageName: string): Result<NativeFiles> | null 
     const require = createRequire(join(getPackageDir(), "package.json"));
     packageJsonPath = require.resolve(`${packageName}/package.json`);
   } catch {
-    // Not installed, e.g. left out of an application bundle
+    // Not installed, e.g. optional dependencies omitted or left out of a bundle
     return null;
   }
   return nativeFilesIn(dirname(packageJsonPath));
@@ -197,12 +197,12 @@ function resolveNativeFiles(): Result<NativeFiles> {
   if (found) return found;
   if (!packageName) {
     return err(
-      `@sakiori/fff-node supports macOS on arm64 and Linux on x64 with glibc or musl, not ${triple}; set FFF_C_LIB to a source build`,
+      `@sakiori/fff-node supports macOS and Linux with glibc or musl, each on x64 and arm64, not ${triple}; set FFF_C_LIB to a source build`,
       ErrorCode.unsupportedPlatform,
     );
   }
   return err(
-    `fff native files not found: install ${packageName} beside @sakiori/fff-node, or build libfff_c and fff-mcp from source with \`make prepare-node\``,
+    `fff native files not found: install ${packageName} beside @sakiori/fff-node, which an install that omits optional dependencies skips, or build libfff_c and fff-mcp from source with \`make prepare-node\``,
     ErrorCode.libraryUnavailable,
   );
 }

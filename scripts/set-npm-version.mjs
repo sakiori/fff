@@ -10,14 +10,9 @@ if (!pkgDir || !version) {
 // fff-bun/fff-node pull their native binaries from a platform package at runtime.
 // Those are only resolvable once published, so they are injected here instead of
 // living in the manifests where they would break `npm ci` and bun installs. Each
-// consumer takes the platform packages of its own npm scope: the fork publishes
-// @sakiori/fff-node with the @sakiori/fff-bin-* packages it builds, as plain
-// dependencies, since a registry may drop optionalDependencies and os/cpu/libc
-// from package metadata; the package loads the host's platform package at runtime.
-const PLATFORM_DEP_FIELDS = {
-  "@ff-labs/fff-bun": "optionalDependencies",
-  "@sakiori/fff-node": "dependencies",
-};
+// consumer takes the platform packages of its own npm scope as optional dependencies:
+// the fork publishes @sakiori/fff-node with the @sakiori/fff-bin-* packages it builds.
+const PLATFORM_DEP_CONSUMERS = ["@ff-labs/fff-bun", "@sakiori/fff-node"];
 const WORKSPACE_DEPS = ["@ff-labs/fff-bun", "@sakiori/fff-node"];
 
 const manifestPath = join(pkgDir, "package.json");
@@ -35,8 +30,7 @@ for (const dep of WORKSPACE_DEPS) {
   if (pkg.dependencies?.[dep]) pkg.dependencies[dep] = version;
 }
 
-const platformDepField = PLATFORM_DEP_FIELDS[pkg.name];
-if (platformDepField) {
+if (PLATFORM_DEP_CONSUMERS.includes(pkg.name)) {
   const platformDeps = {};
   const scope = `${pkg.name.split("/")[0]}/`;
   for (const name of platformPackageNames().filter((name) => name.startsWith(scope))) {
@@ -46,7 +40,7 @@ if (platformDepField) {
     console.error(`no platform packages found under packages/, refusing to publish ${pkg.name}`);
     process.exit(1);
   }
-  pkg[platformDepField] = { ...pkg[platformDepField], ...platformDeps };
+  pkg.optionalDependencies = { ...pkg.optionalDependencies, ...platformDeps };
 }
 
 writeFileSync(manifestPath, `${JSON.stringify(pkg, null, 2)}\n`);

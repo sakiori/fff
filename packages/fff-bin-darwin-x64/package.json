@@ -1,18 +1,18 @@
 {
-  "name": "@ff-labs/fff-bin-darwin-x64",
+  "name": "@sakiori/fff-bin-darwin-x64",
   "version": "0.0.0",
-  "description": "fff native binary for macOS x64 (Intel)",
+  "description": "fff native library and shared service executable for macOS x64 (Intel)",
   "os": ["darwin"],
   "cpu": ["x64"],
   "main": "libfff_c.dylib",
-  "files": ["libfff_c.dylib"],
+  "files": ["libfff_c.dylib", "fff-mcp"],
   "publishConfig": {
     "access": "public"
   },
   "license": "MIT",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/dmtrKovalenko/fff.git",
+    "url": "git+https://gitlab.com/sakiori-oss/fff.git",
     "directory": "packages/fff-bin-darwin-x64"
   }
 }

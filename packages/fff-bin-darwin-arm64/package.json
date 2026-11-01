@@ -2,6 +2,8 @@
   "name": "@sakiori/fff-bin-darwin-arm64",
   "version": "0.0.0",
   "description": "fff native library and shared service executable for macOS ARM64 (Apple Silicon)",
+  "os": ["darwin"],
+  "cpu": ["arm64"],
   "main": "libfff_c.dylib",
   "files": ["libfff_c.dylib", "fff-mcp"],
   "publishConfig": {

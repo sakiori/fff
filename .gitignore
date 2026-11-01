@@ -19,6 +19,13 @@ crates/fff-notify-debouncer-full/
 packages/fff-bun/glob-bench-bin
 
 dist/
+/dist-npm/
+/native/
+
+# CI keeps CARGO_HOME and its tools inside the project
+/.cargo/*
+!/.cargo/config.toml
+/.tools/
 scripts/benchmark-results/
 
 # Native binaries (downloaded at install)

@@ -12,17 +12,20 @@ This is the Node package of the fork of fff at <https://gitlab.com/sakiori-oss/f
 npm install @sakiori/fff-node
 ```
 
-The native library and the `fff-mcp` service executable come in platform packages. The package depends on all of them, so every install downloads each one, and it loads the one of the running platform:
+The native library and the `fff-mcp` service executable come in platform packages, which the package lists as optional dependencies; npm and pnpm install only the one that matches the running platform's operating system, CPU and, on Linux, C library:
 
-| Platform | Architecture          | Package                            |
-| -------- | --------------------- | ---------------------------------- |
-| macOS    | ARM64 (Apple Silicon) | `@sakiori/fff-bin-darwin-arm64`   |
-| Linux    | x64 (glibc)           | `@sakiori/fff-bin-linux-x64-gnu`  |
-| Linux    | x64 (musl)            | `@sakiori/fff-bin-linux-x64-musl` |
+| Platform | Architecture          | Package                             |
+| -------- | --------------------- | ----------------------------------- |
+| macOS    | ARM64 (Apple Silicon) | `@sakiori/fff-bin-darwin-arm64`     |
+| macOS    | x64 (Intel)           | `@sakiori/fff-bin-darwin-x64`       |
+| Linux    | x64 (glibc)           | `@sakiori/fff-bin-linux-x64-gnu`    |
+| Linux    | ARM64 (glibc)         | `@sakiori/fff-bin-linux-arm64-gnu`  |
+| Linux    | x64 (musl)            | `@sakiori/fff-bin-linux-x64-musl`   |
+| Linux    | ARM64 (musl)          | `@sakiori/fff-bin-linux-arm64-musl` |
 
-On any other platform, `FileFinder.create` fails with an error naming the supported ones. An application bundle needs only the platform package of its target.
+On any other platform, `FileFinder.create` fails with `unsupportedPlatform`, naming the supported ones. An install that omits optional dependencies has no native files, and `FileFinder.create` fails with `libraryUnavailable`. The glibc packages need glibc 2.28 or later.
 
-A project that imports the upstream name `@ff-labs/fff-node` can keep its imports with a package-manager alias.
+A project that imports the upstream name `@ff-labs/fff-node` keeps its imports with a package-manager alias: `npm install @ff-labs/fff-node@npm:@sakiori/fff-node@<version>`.
 
 Requires Node.js 20.19 or later in the 20 line, or 22.12 and later. The package is an ES module; CommonJS `require` loads the same module, which relies on `require` of ES modules in those Node.js versions. In Electron, that takes a release whose bundled Node.js is one of them.
 

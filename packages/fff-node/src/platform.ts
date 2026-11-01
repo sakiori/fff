@@ -140,8 +140,11 @@ export function getServiceExecutableFilename(): string {
  */
 export const TRIPLE_TO_NPM_PACKAGE: Record<string, string> = {
   "aarch64-apple-darwin": "@sakiori/fff-bin-darwin-arm64",
+  "x86_64-apple-darwin": "@sakiori/fff-bin-darwin-x64",
   "x86_64-unknown-linux-gnu": "@sakiori/fff-bin-linux-x64-gnu",
+  "aarch64-unknown-linux-gnu": "@sakiori/fff-bin-linux-arm64-gnu",
   "x86_64-unknown-linux-musl": "@sakiori/fff-bin-linux-x64-musl",
+  "aarch64-unknown-linux-musl": "@sakiori/fff-bin-linux-arm64-musl",
 };
 
 /**

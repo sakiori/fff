@@ -6,6 +6,9 @@ behavior, configuration, compatibility, or maintenance requirements.
 
 ## Branches
 
+The fork is the public project `sakiori-oss/fff` on GitLab.com,
+<https://gitlab.com/sakiori-oss/fff>.
+
 - `main` is the fork's branch and carries the downstream changes on top of
   upstream. It changes only through merge requests and is never force-pushed.
 - Feature branches start from `main` and contain one logical change each.
@@ -15,39 +18,52 @@ producing one commit per feature. The project merges by fast-forward; if `main`
 moved on since the feature branch started, GitLab's rebase brings the branch up
 to date before the merge. The commit describes the resulting behavior and why it
 changed. Subsequent work starts from the updated `main`; a previously
-squash-merged feature branch is not reused.
+squash-merged feature branch is not reused. Upstream updates are the exception:
+they are merged without squash (see [Upstream updates](#upstream-updates)).
 
 ## Upstream updates
 
 The upstream fff repository is not a remote of the fork. `.git-intake.toml`
-describes it by URL and branch, and upstream updates are made with git-intake
-in follow mode, which merges upstream `main` into `main`.
+describes it by URL and branch, and upstream updates are made with
+[git-intake](https://gitlab.com/sakiori-oss/git-intake) in follow mode, which
+merges upstream `main` into `main` and publishes the update as a merge request
+from the branch `git-intake/update`. The configuration uses named checks and a
+`[release]` section, which need git-intake 0.4.1 or later, locally as in CI;
+the pipeline installs the release `GIT_INTAKE_VERSION` in `.gitlab-ci.yml` names.
+
+A daily pipeline schedule on `main` runs `git intake sync` in the job
+`git-intake-sync`. Without an open update merge request it merges the upstream
+tip `main` lacks and opens the merge request; with one open it catches it up
+with `main` by a catch-up merge when `main` moved on, and otherwise changes
+nothing. The merge request's own pipeline runs the checks. A conflict fails the
+job; then run `git intake sync` in a clone, which meets the same conflict in an
+update worktree, resolve it against the intended behavior of both upstream and
+downstream changes, stage the resolutions, run `git intake continue` and
+`git intake finish`, which pushes the result to the merge request.
+
+Merge the update's merge request by fast-forward with _Squash commits_
+unticked, so that its merge commits land on `main`, keeping upstream ancestry
+and the sync records that `status` and the next update read; git-intake refuses
+to build on a squashed or rebased update. Do not use GitLab's rebase button
+either: when `main` moved on, the next `git intake sync`, scheduled or run by
+hand, catches the merge request up instead.
 
 `git intake status` shows the last synced upstream commit and how far `main` is
-behind, and `git intake log` lists the upstream commits still pending.
-`git intake start fff=<rev>` merges upstream up to the chosen revision, a
-commit of upstream `main` or an upstream tag (see _Choosing a target_ in the
-[git-intake](https://gitlab.com/sakiori-oss/git-intake) README), in a
-separate update worktree; without `=<rev>` it takes the tip it fetches. Resolve
-conflicts against the intended behavior of both upstream and downstream
-changes, stage the resolutions and run `git intake continue`.
+behind, and `git intake log` lists the upstream commits still pending. An update
+to a chosen revision is made by hand: `git intake start fff=<rev>` merges
+upstream up to a commit of upstream `main` or an upstream tag (see _Choosing a
+target_ in the git-intake README) in a separate update worktree,
 `git intake verify` runs the install command and the checks listed in the
-configuration; the combined result must pass them before the update is ready.
+configuration, polling the watchers (see [Verification](#verification)), and
 `git intake finish` opens the merge request into `main`.
 
 `mise.toml` pins the Zig version that builds zlob. It is downstream-only and
 must match the Zig version upstream pins in its workflow setup-zig steps and in
-`flake.nix`; when an update changes upstream's pin, change `mise.toml` in the
-same update.
-
-Merge the update's merge request by fast-forward with _Squash commits_
-unticked, so that the verified merge commit itself lands on `main`, keeping
-upstream ancestry and the sync record that `status` and the next update read.
-If `main` moved on and GitLab asks for a rebase, do not rebase: a rebase or a
-squash replaces the verified commit, and `finish` refuses it. Run
-`git intake abort`, update the local `main` and start the update again. Once
-the merge request is merged, run `git intake finish` again to complete the
-update.
+`flake.nix`; the `ci-scripts` job of merge request pipelines checks that. When
+an update changes upstream's pin, change `mise.toml` in the same update,
+together with the Zig version and the checksums of its release archives in
+`.gitlab/scripts/install-tools.sh`, which refuses a Zig version other than the
+one `mise.toml` pins.
 
 ## Feature delivery
 
@@ -58,6 +74,253 @@ and update this document with the downstream behavior that is actually delivered
 Before integration, verify the feature against the current `main`, including
 relevant upstream compatibility checks. Squash integration records the feature
 as a single change; it does not replace functional verification.
+
+Merge request pipelines run on the group's Linux runner: `cargo fmt`,
+clippy with zlob, `make lint-mcp`, shellcheck over the pipeline's scripts and
+the Zig pin check, the full test suite with native watchers (see
+[Verification](#verification)) and `make test-node`. When a change touches the
+build (manifests, build scripts, `.cargo/config.toml`, `.gitlab/scripts/`, the
+pipeline, `mise.toml` or the toolchain file), they also build the Linux release
+files. The macOS runner takes protected refs only, so the native suite and
+`make test-node` run on macOS in the pipeline of every push to `main`, after
+the merge; a failure there is fixed forward on `main`, and a release cannot
+pass it.
+
+## Releases
+
+The fork releases `fff-mcp`, the downstream MCP executable, as archives on its
+GitLab Releases, and the Node package `@sakiori/fff-node` with its platform
+packages on npmjs.org. Releases are cut and checked with git-intake's release
+commands; nothing but the pipeline of a release tag publishes.
+
+A release is the protected tag `v<base>-sakiori.<YYYYMMDD>.<n>` on a commit of
+`main`, its version the tag without the `v`. `<base>` is the version of the
+newest upstream release (an upstream tag `v*`) that the commit contains, with
+its patch number raised by one: `main` holds that release and later commits, so
+the version sorts after the upstream release it contains and before the next
+one. `<YYYYMMDD>` is the UTC day the tag is cut and `<n>` counts that day's
+releases from 1. A release is published once its GitLab Release exists, which
+the pipeline creates last.
+
+- A daily pipeline schedule on `main` runs `git intake release tag` in the job
+  `release-tag`: it tags the tip of `main` with the next release unless a
+  release already points at it. When the release at the tip is not published,
+  because its pipeline is running or failed, it creates nothing and fails. An
+  off-cycle release is the schedule run by hand.
+- The tag's pipeline starts with `git intake release check`, which refuses a
+  tag not of release form, not on the commit, not on `main`'s downstream line,
+  with another base, sorting before an earlier release, or already published;
+  nothing is built before it passes. The same job writes the release notes
+  with `git intake release notes`: the subjects of the fork's own commits and
+  the upstream updates since the previous release.
+- `git intake release version` gives the version every build stamps into
+  `crates/fff-mcp/Cargo.toml` and `Cargo.lock` in its working tree only, so
+  `fff-mcp --version` reports it. The builds use upstream's release profile
+  `ci` and zlob. On the group's Linux runner cargo-zigbuild builds `fff-mcp`
+  and `libfff_c` for `x86_64-unknown-linux-musl` and
+  `aarch64-unknown-linux-musl`, `fff-mcp` linked statically against musl and
+  `libfff_c` dynamically, as Node.js on musl loads it, and for
+  `x86_64-unknown-linux-gnu` and `aarch64-unknown-linux-gnu` against glibc
+  2.28, which is also the oldest glibc Node.js's own Linux builds run on. The
+  macOS runner builds both for `aarch64-apple-darwin` and
+  `x86_64-apple-darwin`, for macOS 13 or later, and signs them ad hoc; Apple's
+  SDK may be used only on Apple hardware, so the darwin targets are not
+  cross-compiled. The same runner runs the native test suite and
+  `make test-node`, and nothing is published before they pass.
+- Every file of a release has one build identity, so the Node package of a
+  release starts and joins the same service as the `fff-mcp` that mise installs
+  from that release's archives. Every target builds `libfff_c` and `fff-mcp` in
+  separate cargo invocations, so `libfff_c` has the same features on every
+  target, and the build checks that both report the same identity. A platform
+  package holds the same `fff-mcp` file as the target's archive, and the packing
+  job checks that all targets report one identity.
+- The packing job packs `@sakiori/fff-node` and the six platform packages
+  `@sakiori/fff-bin-darwin-arm64`, `-darwin-x64`, `-linux-x64-gnu`,
+  `-linux-arm64-gnu`, `-linux-x64-musl` and `-linux-arm64-musl` at the
+  release's version. Each platform package declares `os`, `cpu` and on Linux
+  `libc`, and the Node package lists them all as optional dependencies at
+  exactly that version; the packing job fails otherwise.
+- The signing job writes `SHA256SUMS` over the archives
+  `fff-mcp-v<version>-<target>.tar.gz` of the musl and darwin targets, each
+  holding the `fff-mcp` binary and `LICENSE` at its root with a `.sha256` beside
+  it, and signs every archive and `SHA256SUMS` with cosign, keyless: the job's
+  GitLab ID token obtains a short-lived Sigstore certificate naming this
+  project's CI configuration and the tag, recorded in Sigstore's public
+  transparency log, and each signature is a `.sigstore.json` bundle.
+- The npm publish job publishes the platform packages, then the Node package,
+  to npmjs.org with the dist-tag `latest` and provenance, by trusted publishing
+  from GitLab.com's shared runners. The publish job then uploads the archives,
+  their `.sha256` files and bundles, `SHA256SUMS` and its bundle to the generic
+  package `fff-mcp`, version `v<version>`, and the release job creates the
+  GitLab Release last, with the notes and a link to every file at
+  `https://gitlab.com/sakiori-oss/fff/-/releases/v<version>/downloads/binaries/<file>`.
+- A failed release is finished, not cut again: retry its failed jobs. A
+  retried npm publish job skips packages published with the same tarball and
+  fails on a package published with another one, since npm never replaces a
+  version; retry only the failed publish job, not the builds or the packing
+  before it. If npm packages were published and the builds or the packing ran
+  again, their tarballs differ and the version can no longer be completed:
+  leave it and release the next one with an off-cycle release, which
+  `git intake release tag` cuts once `main` moved on. A retried publish job
+  uploads only the files the package lacks and refuses one it holds with other
+  content; a retried release job succeeds when the Release exists with exactly
+  its links. Rollback is forward, by a revert and an off-cycle release.
+- A pipeline started by hand on `main` ("Run pipeline", or
+  `glab ci run --branch main`) is a rehearsal: the builds, the macOS tests and
+  the packing of a release with the version `<base>-sakiori.<YYYYMMDD>.0`,
+  which no release tag takes, and nothing signed or published. Its npm job only
+  reads npmjs.org: it reports per package whether a release would publish it or
+  skip it, and fails on a package published with another tarball. Rehearse
+  after a change to the build, since merge request pipelines cannot build on
+  the macOS runner.
+
+Install a release of `fff-mcp` with mise's GitLab backend, which picks the
+archive of the running platform by its target triple and needs no token:
+
+```sh
+mise use -g gitlab:sakiori-oss/fff@<version>
+```
+
+`<version>` is the tag without its `v`, for example
+`0.11.1-sakiori.20301101.1`; `mise ls-remote gitlab:sakiori-oss/fff` lists
+the releases. Configure MCP clients as described in
+[Building and running](#building-and-running), with the `fff-mcp` that mise
+installs.
+
+Install the Node package from npmjs.org, pinning a release:
+
+```sh
+npm install --save-exact @sakiori/fff-node@<version>
+pnpm add --save-exact @sakiori/fff-node@<version>
+```
+
+The install brings only the platform package of the running platform. A
+project that imports `@ff-labs/fff-node` keeps its imports with an alias:
+`npm install --save-exact @ff-labs/fff-node@npm:@sakiori/fff-node@<version>`.
+`npm audit signatures` checks the packages' registry signatures and provenance
+attestations.
+
+Check an archive against its checksum and its signature, which must name this
+project's pipeline for the release's tag:
+
+```sh
+tag=v<version>
+file="fff-mcp-$tag-<target>.tar.gz"
+base="https://gitlab.com/sakiori-oss/fff/-/releases/$tag/downloads/binaries"
+curl --fail --location --remote-name "$base/$file" \
+  --remote-name "$base/$file.sha256" --remote-name "$base/$file.sigstore.json"
+sha256sum -c "$file.sha256"   # or: shasum -a 256 -c "$file.sha256"
+cosign verify-blob --bundle "$file.sigstore.json" \
+  --certificate-identity "https://gitlab.com/sakiori-oss/fff//.gitlab-ci.yml@refs/tags/$tag" \
+  --certificate-oidc-issuer https://gitlab.com \
+  "$file"
+```
+
+The double slash belongs to the identity: it separates the project from the
+path of its CI configuration. `SHA256SUMS` and `SHA256SUMS.sigstore.json` are
+checked the same way, and `sha256sum -c SHA256SUMS --ignore-missing` then
+checks any archive of the release.
+
+### Project settings
+
+The release process relies on these settings, which the project's owners apply:
+
+- The group `sakiori-oss`: under _Packages and registries_, duplicate generic
+  packages not allowed, so no file of a published version is uploaded again.
+  The group's release bot user, a Maintainer of the
+  group with two-factor authentication and completed identity verification,
+  without which GitLab.com runs none of its pipelines.
+- The project is public, with its package registry visible to everyone, so
+  release links download without a token. Auto DevOps is off.
+- _Merge requests_: merge method _Fast-forward merge_; _Squash commits when
+  merging_ set to _Encourage_ (`default_on`), never _Require_: an update merge
+  request is merged with squash unticked, every other one squashed;
+  _Pipelines must succeed_ on and _Skipped pipelines are considered
+  successful_ off; automatic rebase before merge and merge trains off.
+- `main` is protected: _Allowed to push and merge_ No one, _Allowed to merge_
+  Maintainers, force push off. No protected-branch rule matches
+  `git-intake/update`, so its merge request pipelines get no protected
+  variable.
+- Tags `v*-sakiori.*` are protected, _Allowed to create_ Maintainers; the bot
+  user creates them, and a release tag is never moved or deleted.
+- _CI/CD > Variables_: _Allow merge request pipelines to access protected
+  variables and runners_ off, and _Minimum role to use pipeline variables_
+  _No one allowed_, so no pipeline variable overrides what the release jobs and
+  the macOS runner check. `GITLAB_TOKEN` holds a personal access token of the
+  bot user with the scopes `api` and `write_repository` and an expiry of at most
+  a year, replaced before it expires; it is protected, masked and hidden, and
+  scoped to the environment `git-intake`, which only the schedule's jobs name.
+  Its pushes, unlike the job token's, start pipelines.
+- _Build > Pipeline schedules_: one daily schedule on `main`, owned by the bot
+  user, which runs `git-intake-sync` and `release-tag`.
+- Members of the project are Maintainers or above. npm's trusted publisher
+  binds the project, the CI file and the environment `npm`, not a protected
+  ref, so a member who could push a branch could publish from it.
+- `NPM_TOKEN` exists only while a new npm package is bootstrapped (below).
+- Instance runners on: the npm publish job runs on GitLab.com's shared
+  runners. Group runners on for the rest (below).
+
+### New npm packages
+
+npm configures a trusted publisher only for a package that exists, so the
+first version of every new package, such as a new platform package, is
+published with a token:
+
+1. On npmjs.com, create a granular access token with read and write access to
+   the packages of the `@sakiori` scope, allowed to publish without a
+   two-factor prompt, expiring within days.
+2. Store it in the project as `NPM_TOKEN`: protected, masked and hidden, scoped
+   to the environment `npm`, which only the npm publish job names. The job
+   writes it to npm's user configuration only when it is set.
+3. Release, off-cycle if needed. npm tries trusted publishing first and falls
+   back to the token for packages without a trusted publisher; the job
+   publishes with provenance either way.
+4. In each new package's settings on npmjs.com, add a trusted publisher for
+   GitLab CI/CD: namespace `sakiori-oss`, project `fff`, top-level CI file path
+   `.gitlab-ci.yml`, environment `npm`. Then set the package to require
+   two-factor authentication and disallow tokens.
+5. Delete the `NPM_TOKEN` variable and revoke the token.
+
+### Runners
+
+Every job but the macOS jobs and the npm publish job runs on the group's Linux
+runner, a group runner of `sakiori-oss` with the tag `sakiori-oss-linux` and
+_Run untagged jobs_ off, in a Docker container of the image the job names. It
+also runs the merge request pipelines of `git-intake/update`, which carry
+upstream's code, so it is not privileged and holds no credentials of its own,
+and a tag pipeline clones afresh instead of reusing the working copy those
+jobs leave. A merge request from a fork outside the group finds no runner in
+that fork; a Maintainer runs its pipeline in this project. The npm publish
+job runs on GitLab.com's shared runners, the only ones npm's trusted
+publishing accepts.
+
+The darwin builds and the macOS tests run on the macOS runner of the
+`sakiori-oss` forks, on Apple silicon. Each job runs in a fresh macOS virtual machine that
+[Tart](https://tart.run/) clones from the image `MACOS_IMAGE` in
+`.gitlab-ci.yml` names and deletes after the job, so nothing a job runs
+persists or reaches a later job, and the virtual machine cannot reach the
+host's services or local network. It is set up as the _macOS runner_ section
+of git-intake's `RELEASING.md` describes (Tart, Softnet, Cirrus Labs'
+gitlab-tart-executor behind a wrapper owned by root, the image pulled ahead),
+with these settings:
+
+- A project runner enabled in `sakiori-oss/fff` and the other forks whose
+  releases build on macOS, then locked to them, with the tag
+  `sakiori-oss-macos`, _Run untagged jobs_ off, _Protected_ on, and a maximum
+  job timeout of two hours.
+- Before any virtual machine starts, the executor's wrapper refuses every job
+  of this project but one on a protected ref
+  (`CI_COMMIT_REF_PROTECTED` is `true`) that is either the branch `main` in a
+  pipeline from a push or started by hand (`CI_PIPELINE_SOURCE` `push`, `web`
+  or `api`), or a release tag matching
+  `^v[0-9]+\.[0-9]+\.[0-9]+-sakiori\.[0-9]{8}\.[1-9][0-9]?$`. It also refuses
+  a job that sets a variable of gitlab-tart-executor's (`TART_EXECUTOR_*`),
+  clones for this project only a Cirrus Labs base image pinned by digest, and
+  runs one job at a time. Every other project's jobs it refuses or allows by
+  that project's own rules.
+
+While the runner is offline, the macOS jobs wait, and the release with them;
+GitLab fails a job no runner picks up, which is retried once the runner is back.
 
 ## Downstream behavior
 
@@ -507,13 +770,15 @@ that are not UTF-8 fail the call. The in-process functions are unchanged for
 the other bindings.
 
 The fork's Node package is `@sakiori/fff-node`. Its platform packages
-`@sakiori/fff-bin-darwin-arm64`, `@sakiori/fff-bin-linux-x64-gnu` and
-`@sakiori/fff-bin-linux-x64-musl` each carry the native library and the
-`fff-mcp` executable of one build at their root; the other `packages/fff-bin-*`
-directories stay upstream's and are not published by the fork. The Node
-package depends on all three, and they declare no `os`, `cpu` or `libc`, since
-a registry may serve neither optional dependencies nor those fields; the package
-picks the running platform's one, on Linux by glibc or musl.
+`@sakiori/fff-bin-<platform>`, for macOS on arm64 and x64 and Linux on x64 and
+arm64 with glibc or musl, each carry the native library and the `fff-mcp`
+executable of one build at their root; the Windows `packages/fff-bin-*`
+directories stay upstream's and are not published by the fork. As upstream's
+packages do, the platform packages declare `os`, `cpu` and on Linux `libc`, and
+the Node package lists them as optional dependencies at its own version, so an
+install brings only the running platform's one; the package picks it by the
+running platform, on Linux by glibc or musl. Releases publish the six platform
+packages and the Node package to npmjs.org (see [Releases](#releases)).
 `FileFinder.create` always opens a service-backed instance with the
 executable of the platform package, starting the service when none of that
 build runs, and returns the service's error when it cannot start or be reached
@@ -831,8 +1096,11 @@ as one paired event, which native backends deliver; a polling walk is not an
 atomic snapshot, so it can report the two sides in separate batches; how fff
 delivers a rename to subscribers of either side is checked with injected events
 in the watch registry's unit tests. Native
-event delivery is covered by `make test-rust` and `make test-mcp` run without
-the variable and without skips, these tests included, and by upstream's CI. `make test-rust`
+event delivery is covered by the `native-tests` job of the fork's merge request
+pipelines, which runs `make test-rust` and `make test-mcp` on Linux without the
+variable and without skips, these tests included, by the `macos-tests` job,
+which runs them the same way on macOS for every push to `main`, rehearsal and
+release, and by upstream's CI. `make test-rust`
 and `make test-mcp` pass `TEST_ARGS` to the test harness. In debug builds,
 `SharedFilePicker::end_rescan_cooldown` lets a test end the rescan cooldown
 instead of waiting for it.

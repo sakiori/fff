@@ -34,10 +34,11 @@ index:
   not by the bytes of the file, so a copy re-signed inside an application meets
   the same release installed elsewhere.
 
-The Node package and its platform packages are named `@sakiori/fff-node` and
-`@sakiori/fff-bin-<platform>`, with platform packages for macOS arm64 and Linux
-x64 (glibc and musl). The Node package depends on every platform package and
-loads the running platform's one.
+The fork's release pipeline publishes the Node package and its platform
+packages to npmjs.org as `@sakiori/fff-node` and `@sakiori/fff-bin-<platform>`
+for macOS on arm64 and x64 and Linux on x64 and arm64 with glibc and musl. The
+platform packages are optional dependencies that declare their platform, so an
+install brings only the running platform's one.
 
 ## Capabilities
 

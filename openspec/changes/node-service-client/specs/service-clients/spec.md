@@ -154,18 +154,23 @@ answer.
 - **AND** when only one of the two files is unpacked, `FileFinder.create` fails naming the missing one
 
 ### Requirement: Published packages
-The fork's Node package and platform packages SHALL carry the native library and
-the service executable of the same build for macOS arm64 and Linux x64 with
-glibc and with musl.
+The fork's release SHALL publish to npmjs.org the Node package and platform
+packages that carry the native library and the service executable of the same
+build for macOS on arm64 and x64 and Linux on x64 and arm64 with glibc and with
+musl.
 
 #### Scenario: Fork names
-- **WHEN** the packages are packed
+- **WHEN** the release publishes the packages
 - **THEN** they are named `@sakiori/fff-node` and `@sakiori/fff-bin-<platform>`, and the Node package resolves the fork's platform package
 
-#### Scenario: Install
-- **WHEN** a consumer installs a version of the Node package with npm or pnpm
-- **THEN** every platform package of that version is installed with it, at the same version
-- **AND** the package loads the native files of the running platform's package
+#### Scenario: Install from npm
+- **WHEN** a consumer installs a release of the Node package from npmjs.org with npm or pnpm
+- **THEN** only the platform package that matches the running platform's operating system, CPU and, on Linux, C library is installed with it, at the same version
+- **AND** the package loads the native files of that platform package
+
+#### Scenario: Platform without a package
+- **WHEN** the Node package runs on a platform none of its platform packages matches
+- **THEN** `FileFinder.create` fails with `unsupportedPlatform`
 
 #### Scenario: Matching parts
 - **WHEN** a consumer installs a release of the Node package
