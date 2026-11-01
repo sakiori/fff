@@ -1,0 +1,14 @@
+integration = "main"
+publish = { remote = "origin", via = "merge-request" }
+install = "cargo fetch --locked"
+checks = [
+  "cargo fmt --all -- --check",
+  "cargo clippy --no-default-features --features zlob -- -D warnings",
+  "make test-rust",
+]
+
+[[upstream]]
+name = "fff"
+url = "https://github.com/dmtrKovalenko/fff.git"
+branch = "main"
+mode = "follow"
