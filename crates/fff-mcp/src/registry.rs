@@ -33,6 +33,8 @@ pub(crate) struct Session {
     kind: SessionKind,
     options: IndexOptions,
     binding: RwLock<Arc<Binding>>,
+    // Marked whenever the binding is replaced.
+    rebound: tokio::sync::watch::Sender<()>,
     repository: Mutex<RepositoryProbe>,
     registry: Weak<Registry>,
     _lease: Lease,
@@ -101,13 +103,16 @@ impl Registry {
         .await
         .map_err(|_| ServiceError::RegistryUnavailable)??;
         let repository = probe.root().cloned();
-        let index = self.resolve(&scope, repository, &options).await?;
+        let index = self
+            .resolve(&scope, repository, &options, kind == SessionKind::Watch)
+            .await?;
         let binding = Binding::new(index, &scope)?;
         let session = Arc::new(Session {
             scope,
             kind,
             options,
             binding: RwLock::new(Arc::new(binding)),
+            rebound: tokio::sync::watch::Sender::new(()),
             repository: Mutex::new(probe),
             registry: Arc::downgrade(self),
             _lease: lease,
@@ -148,16 +153,22 @@ impl Registry {
         (indexes, sessions)
     }
 
-    // Finds a compatible index for `scope` or starts building one.
+    // Finds a compatible index for `scope` or starts building one. A watch subscription
+    // needs one whose watcher runs or is starting.
     async fn resolve(
         self: &Arc<Self>,
         scope: &Path,
         repository: Option<PathBuf>,
         options: &IndexOptions,
+        watching: bool,
     ) -> Result<Arc<Index>, ServiceError> {
         let candidates: Vec<_> = live(&self.indexes)
             .into_iter()
-            .filter(|index| index.serves(options) && index.repository == repository)
+            .filter(|index| {
+                index.serves(options)
+                    && index.repository == repository
+                    && (!watching || index.watcher_runs())
+            })
             .collect();
         let selection = {
             let scope = scope.to_path_buf();
@@ -270,10 +281,12 @@ impl Registry {
             }
             let current = session.snapshot();
             let repository = session.repository.lock().root().cloned();
+            let watching = session.kind == SessionKind::Watch;
             let best = indexes
                 .iter()
                 .filter(|index| {
                     index.serves(&session.options)
+                        && (!watching || index.watcher() == fff_service::protocol::Watcher::Ready)
                         && index.repository == repository
                         && (index.depth() < current.index.depth()
                             || index.depth() == current.index.depth()
@@ -296,7 +309,12 @@ impl Registry {
     ) -> Result<(), ServiceError> {
         let repository = session.repository.lock().root().cloned();
         let index = self
-            .resolve(&session.scope, repository, &session.options)
+            .resolve(
+                &session.scope,
+                repository,
+                &session.options,
+                session.kind == SessionKind::Watch,
+            )
             .await?;
         session.rebind(stale, index)
     }
@@ -351,6 +369,11 @@ impl Binding {
 impl Session {
     pub fn snapshot(&self) -> Arc<Binding> {
         self.binding.read().clone()
+    }
+
+    // Changes whenever the session moves to another binding.
+    pub fn rebindings(&self) -> tokio::sync::watch::Receiver<()> {
+        self.rebound.subscribe()
     }
 
     pub async fn prepare(self: &Arc<Self>) -> Result<Arc<Binding>, SessionError> {
@@ -428,6 +451,7 @@ impl Session {
             }
             std::mem::replace(&mut *binding, replacement)
         };
+        self.rebound.send_replace(());
         drop(retired);
         Ok(())
     }

@@ -156,11 +156,11 @@ pub use index::bigram_filter;
 pub mod simd_string_utils;
 // ==================================
 
-mod coverage;
 mod error;
 mod git_status_worker;
 /// Built-in exclusions for roots outside a repository.
 pub mod ignore;
+mod listeners;
 mod scan;
 mod score;
 mod sort_buffer;
@@ -179,8 +179,8 @@ pub mod watch;
 pub use watch::{WatchEvent, WatchEventKind, WatchId, WatchOptions};
 
 // fff error
-pub use coverage::CoverageSubscription;
 pub use error::{Error, Result};
+pub use listeners::ListenerSubscription;
 pub use scan::{BackgroundStatus, WatcherStatus};
 
 pub use fff_query_parser::*;

@@ -21,6 +21,9 @@ import {
   ffiHealthCheckStatic,
   ffiRestartIndex,
   ffiServiceCall,
+  ffiRegisterWatchCallback,
+  ffiUnwatch,
+  ffiWatchStart,
   isAvailable,
   type NativeHandle,
 } from "./ffi.js";
@@ -38,14 +41,18 @@ import type {
   ScanProgress,
   SearchOptions,
   SearchResult,
-  WatchBatchCallback,
-  WatchOptions,
   WatchUnsubscribe,
 } from "./fff-api.js";
 import { definitionModeToInt } from "./fff-api.js";
 
 import { ErrorCode, err, type Result } from "./errors.js";
-import type { FrecencyOptions, ServiceInitOptions } from "./service-options.js";
+import type {
+  FrecencyOptions,
+  ServiceInitOptions,
+  ServiceWatchBatchCallback,
+  ServiceWatchOptions,
+} from "./service-options.js";
+import { deleteWatchListener, setWatchListener } from "./watch-delivery.js";
 
 /** Interval of the readiness polls of `waitForScan` and `waitForIndexReady`. */
 const READY_POLL_MS = 50;
@@ -201,9 +208,15 @@ function page(options?: SearchOptions & FrecencyOptions) {
 export class FileFinder {
   private handle: NativeHandle | null;
   private readonly calls = new CallQueue();
+  private readonly watching: boolean;
+  /** The instance's subscriptions by native id, with how to fail one still pending. */
+  private readonly watches = new Map<number, (failure: Result<WatchUnsubscribe>) => void>();
+  /** Registrations of the watch callback in flight, which `destroy` lets finish. */
+  private readonly registrations = new Set<Promise<unknown>>();
 
-  private constructor(handle: NativeHandle) {
+  private constructor(handle: NativeHandle, watching: boolean) {
     this.handle = handle;
+    this.watching = watching;
   }
 
   /**
@@ -259,21 +272,28 @@ export class FileFinder {
       return result;
     }
 
-    return { ok: true, value: new FileFinder(result.value) };
+    return { ok: true, value: new FileFinder(result.value, !(options.disableWatch ?? false)) };
   }
 
   /**
    * Destroy the instance and end its service session.
    *
    * Calls made after this report the instance as destroyed; calls made before
-   * it finish first. The service releases the index once no session uses it.
-   * An instance that is never destroyed keeps its session until the process
-   * exits.
+   * it finish first. Its watch subscriptions end, and their callbacks are not
+   * called once this is called. The service releases the index once no
+   * session uses it. An instance that is never destroyed keeps its session
+   * until the process exits.
    */
   async destroy(): Promise<void> {
     const handle = this.handle;
     if (handle === null) return;
     this.handle = null;
+    for (const [watchId, settle] of this.watches) {
+      deleteWatchListener(watchId);
+      settle(err("FileFinder instance has been destroyed.", ErrorCode.destroyed));
+    }
+    this.watches.clear();
+    await Promise.allSettled([...this.registrations]);
     await this.calls.run(async () => {
       await ffiDestroy(handle);
       return { ok: true, value: undefined };
@@ -671,16 +691,128 @@ export class FileFinder {
   }
 
   /**
-   * Unavailable: the shared service delivers no filesystem events to programs.
+   * Subscribe to changes of the files under the instance's directory, as the
+   * shared service's watcher sees them.
+   *
+   * `pattern` may be a glob relative to the instance's directory (`./` works),
+   * an exact path, or a directory, relative or absolute inside the instance's
+   * directory; without one, the subscription covers the whole directory.
+   * Ignored files never trigger an event. The callback receives batches on the
+   * event loop, with absolute paths. When changes are lost, because the
+   * callback runs slower than they come, the index was rescanned, the session
+   * moved to another index or the connection to the service broke, one
+   * `rescan` event naming the instance's directory replaces them; a broken
+   * connection reconnects by itself, starting the service when none runs. A
+   * callback falls behind once more than 1024 of its events wait on the event
+   * loop. A `failed` event ends a subscription the service can no longer
+   * serve, as after its directory was removed, or that a reconnect was refused.
+   * Once ready, neither the subscription nor its delivery keeps the process
+   * alive, and subscribing holds none of the package's native workers.
+   *
+   * @returns Once every later change is delivered, the function that ends the
+   *   subscription: once it returns, the callback is not called again.
+   *   `unavailable` when the instance was created with `disableWatch`, and the
+   *   service's reason when it refuses the subscription.
+   *
+   * @example
+   * ```typescript
+   * const watched = await finder.watch("src/**", (events) => {
+   *   for (const event of events) console.log(event.kind, event.path);
+   * }, { repository: true });
+   * if (watched.ok) watched.value(); // unsubscribe
+   * ```
    */
-  watch(callback: WatchBatchCallback, options?: WatchOptions): Result<WatchUnsubscribe>;
+  watch(
+    callback: ServiceWatchBatchCallback,
+    options?: ServiceWatchOptions,
+  ): Promise<Result<WatchUnsubscribe>>;
   watch(
     pattern: string,
-    callback: WatchBatchCallback,
-    options?: WatchOptions,
-  ): Result<WatchUnsubscribe>;
-  watch(): Result<WatchUnsubscribe> {
-    return unavailable("watch");
+    callback: ServiceWatchBatchCallback,
+    options?: ServiceWatchOptions,
+  ): Promise<Result<WatchUnsubscribe>>;
+  watch(
+    first: string | ServiceWatchBatchCallback,
+    second?: ServiceWatchBatchCallback | ServiceWatchOptions,
+    third?: ServiceWatchOptions,
+  ): Promise<Result<WatchUnsubscribe>> {
+    const [pattern, callback, options] =
+      typeof first === "string"
+        ? [first, second as ServiceWatchBatchCallback, third]
+        : ["", first, second as ServiceWatchOptions | undefined];
+    if (typeof callback !== "function") {
+      return Promise.resolve(
+        err("watch needs a callback for the batches", ErrorCode.invalidRequest),
+      );
+    }
+    const handle = this.handle;
+    if (handle === null) {
+      return Promise.resolve(err("FileFinder instance has been destroyed.", ErrorCode.destroyed));
+    }
+    if (!this.watching) {
+      return Promise.resolve(
+        err(
+          "FileFinder.watch is unavailable on an instance created with disableWatch",
+          ErrorCode.unavailable,
+        ),
+      );
+    }
+    return this.subscribe(handle, pattern, callback, options ?? {});
+  }
+
+  private async subscribe(
+    handle: NativeHandle,
+    pattern: string,
+    callback: ServiceWatchBatchCallback,
+    options: ServiceWatchOptions,
+  ): Promise<Result<WatchUnsubscribe>> {
+    const registration = ffiRegisterWatchCallback(handle);
+    this.registrations.add(registration);
+    const registered = await registration;
+    this.registrations.delete(registration);
+    if (!registered.ok) return registered;
+    if (this.handle !== handle) {
+      return err("FileFinder instance has been destroyed.", ErrorCode.destroyed);
+    }
+    // The library returns at once and reports readiness through the callback, so no
+    // native worker waits for the index.
+    const started = ffiWatchStart(handle, pattern, options.ignore ?? [], options.repository ?? false);
+    if (!started.ok) return started;
+    const watchId = started.value;
+    const base = ffiGetBasePath(handle);
+    const directory = base.ok && base.value ? base.value : "";
+    return new Promise((resolve) => {
+      let ready = false;
+      const end = () => {
+        this.watches.delete(watchId);
+        deleteWatchListener(watchId);
+        if (this.handle === handle) ffiUnwatch(handle, watchId);
+      };
+      const unsubscribe: WatchUnsubscribe = () => {
+        if (this.watches.has(watchId)) end();
+      };
+      this.watches.set(watchId, resolve);
+      setWatchListener(watchId, {
+        handle,
+        ready: () => {
+          ready = true;
+          resolve({ ok: true, value: unsubscribe });
+        },
+        events: (events) => {
+          if (ready) callback(events);
+        },
+        lost: () => {
+          if (ready) return callback([{ path: directory, kind: "rescan" }]);
+          end();
+          resolve(err("The watch delivery restarted before the subscription was ready"));
+        },
+        failed: (error, code) => {
+          end();
+          if (ready) callback([{ path: directory, kind: "failed", error, code }]);
+          else resolve(err(error, code));
+        },
+      });
+    });
   }
 
   /**

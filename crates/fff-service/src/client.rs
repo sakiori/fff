@@ -212,12 +212,16 @@ async fn exchange(
     send_message(&mut send, &hello)
         .await
         .map_err(|e| transient(&e))?;
-    let reply = tokio::time::timeout(
-        HANDSHAKE_TIMEOUT,
-        read_message::<Reply, _>(&mut recv, MAX_REPLY_LINE_BYTES),
-    )
-    .await
-    .map_err(|e| transient(&e))?
+    let reply = read_message::<Reply, _>(&mut recv, MAX_REPLY_LINE_BYTES);
+    // A subscription is ready once its index is, which a large tree may take longer than a
+    // handshake to reach; the caller's own timeout bounds it.
+    let reply = if matches!(request, Request::Watch { .. }) {
+        reply.await
+    } else {
+        tokio::time::timeout(HANDSHAKE_TIMEOUT, reply)
+            .await
+            .map_err(|e| transient(&e))?
+    }
     .map_err(|e: MessageError| transient(&e))?;
     Ok((reply, (recv, send)))
 }

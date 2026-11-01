@@ -12,6 +12,14 @@ use tracing::{debug, error};
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct WatchId(pub u64);
 
+impl WatchId {
+    /// A process-unique id from the sequence subscriptions take theirs from, for bindings
+    /// that route subscriptions of their own beside them.
+    pub fn next() -> Self {
+        WatchId(NEXT_WATCH_ID.fetch_add(1, Ordering::Relaxed))
+    }
+}
+
 pub(crate) type WatchCallback = Box<dyn Fn(WatchId, &[WatchEvent]) + Send + Sync>;
 
 /// The kind of filesystem change.
@@ -119,6 +127,15 @@ impl SubIgnore {
     }
 }
 
+// `path` relative to `dir`, both base-relative with `/` separators.
+fn below<'a>(path: &'a str, dir: &str) -> Option<&'a str> {
+    let rest = path.strip_prefix(dir)?;
+    if rest.is_empty() {
+        return Some(rest);
+    }
+    rest.strip_prefix('/')
+}
+
 fn relative_pattern(pattern: &str, base: &Path) -> Option<PathBuf> {
     let expanded = crate::path_utils::expand_tilde(pattern);
     let relative = if expanded.is_absolute() || expanded.has_root() {
@@ -189,6 +206,8 @@ fn resolve_sub_ignore(patterns: &[String], base: &Path) -> Result<SubIgnore, Err
 
 struct WatchSub {
     id: WatchId,
+    // Base-relative directory the matcher and ignores are relative to; empty for the base.
+    dir: String,
     matcher: WatchMatcher,
     ignore: SubIgnore,
     callback: WatchCallback,
@@ -198,6 +217,26 @@ struct WatchSub {
 
 impl WatchSub {
     fn filter_mask(&self, paths: &[&str], scratch: &mut Vec<usize>) -> WatchMask {
+        if self.dir.is_empty() {
+            return self.relative_mask(paths, scratch);
+        }
+        let mut inside: WatchMask = 0;
+        let relative: Vec<&str> = paths
+            .iter()
+            .enumerate()
+            .map(|(index, path)| match below(path, &self.dir) {
+                Some(relative) => {
+                    inside |= 1 << index;
+                    relative
+                }
+                None => "",
+            })
+            .collect();
+        self.relative_mask(&relative, scratch) & inside
+    }
+
+    // Matches paths relative to the subscription's directory.
+    fn relative_mask(&self, paths: &[&str], scratch: &mut Vec<usize>) -> WatchMask {
         let mut mask = 0;
 
         match &self.matcher {
@@ -390,6 +429,7 @@ impl WatchRegistry {
         !self.state.lock().subs.is_empty()
     }
 
+    #[cfg(test)]
     pub(crate) fn subscribe(
         &self,
         base_path: &Path,
@@ -397,8 +437,22 @@ impl WatchRegistry {
         options: WatchOptions,
         callback: WatchCallback,
     ) -> Result<WatchId, Error> {
-        let matcher = WatchMatcher::new(pattern, base_path)?;
-        let ignore = resolve_sub_ignore(&options.ignore, base_path)?;
+        self.subscribe_within(base_path, Path::new(""), pattern, options, callback)
+    }
+
+    // `pattern` and the ignores are relative to `dir`, a base-relative directory.
+    pub(crate) fn subscribe_within(
+        &self,
+        base_path: &Path,
+        dir: &Path,
+        pattern: &str,
+        options: WatchOptions,
+        callback: WatchCallback,
+    ) -> Result<WatchId, Error> {
+        let root = base_path.join(dir);
+        let matcher = WatchMatcher::new(pattern, &root)?;
+        let ignore = resolve_sub_ignore(&options.ignore, &root)?;
+        let dir = dir.to_string_lossy().replace('\\', "/");
 
         let mut state = self.state.lock();
         if state.base_path.as_deref() != Some(base_path) {
@@ -406,9 +460,10 @@ impl WatchRegistry {
         }
         self.dispatcher.start()?;
 
-        let id = WatchId(NEXT_WATCH_ID.fetch_add(1, Ordering::Relaxed));
+        let id = WatchId::next();
         let sub = Arc::new(WatchSub {
             id,
+            dir: dir.trim_end_matches('/').to_owned(),
             matcher,
             ignore,
             callback,
@@ -694,6 +749,61 @@ mod tests {
                 _ => panic!("expected dir"),
             }
         }
+    }
+
+    #[test]
+    fn subscriptions_within_a_directory_match_relative_to_it() {
+        let base = Path::new("/repo");
+        let registry = registry(base);
+        let (glob_cb, glob_events) = collector();
+        registry
+            .subscribe_within(
+                base,
+                Path::new("app[1]"),
+                "src/**",
+                WatchOptions::default(),
+                glob_cb,
+            )
+            .unwrap();
+        let (all_cb, all_events) = collector();
+        let ignore_gen = WatchOptions {
+            ignore: vec!["gen".into()],
+        };
+        registry
+            .subscribe_within(base, Path::new("app[1]"), "", ignore_gen, all_cb)
+            .unwrap();
+
+        registry.dispatch(
+            base,
+            vec![
+                raw("/repo/app[1]/main.rs", WatchEventKind::Modified, false),
+                raw("/repo/app[1]/src/deep.rs", WatchEventKind::Modified, false),
+                raw("/repo/app[1]/gen/out.rs", WatchEventKind::Created, false),
+                raw("/repo/main.rs", WatchEventKind::Modified, false),
+                raw("/repo/app[1]x/main.rs", WatchEventKind::Modified, false),
+            ],
+        );
+        registry.dispatch_rescan(base);
+        registry.wait_for_dispatch();
+
+        let paths = |events: &Collected| -> Vec<PathBuf> {
+            events.lock().iter().map(|e| e.path.clone()).collect()
+        };
+        assert_eq!(
+            paths(&glob_events),
+            vec![
+                PathBuf::from("/repo/app[1]/src/deep.rs"),
+                PathBuf::from("/repo")
+            ]
+        );
+        assert_eq!(
+            paths(&all_events),
+            vec![
+                PathBuf::from("/repo/app[1]/main.rs"),
+                PathBuf::from("/repo/app[1]/src/deep.rs"),
+                PathBuf::from("/repo"),
+            ]
+        );
     }
 
     #[test]

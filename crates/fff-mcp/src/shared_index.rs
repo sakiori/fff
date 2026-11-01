@@ -5,7 +5,7 @@ use std::time::Duration;
 use fff::file_picker::FilePicker;
 use fff::scope::SearchScope;
 use fff::{
-    BackgroundStatus, CoverageSubscription, FFFMode, FilePickerOptions, SharedFilePicker,
+    BackgroundStatus, FFFMode, FilePickerOptions, ListenerSubscription, SharedFilePicker,
     SharedFrecency,
 };
 use fff_service::protocol::{IndexOptions, Readiness, ServiceError, Watcher};
@@ -35,7 +35,9 @@ pub(crate) struct Index {
     frecency: SharedFrecency,
     background: BackgroundStatus,
     ready: tokio::sync::watch::Sender<bool>,
-    _coverage: CoverageSubscription,
+    // Marked after each rescan a program requests.
+    rescans: tokio::sync::watch::Sender<()>,
+    _coverage: ListenerSubscription,
 }
 
 impl Index {
@@ -104,6 +106,7 @@ impl Index {
             frecency,
             background,
             ready: tokio::sync::watch::Sender::new(false),
+            rescans: tokio::sync::watch::Sender::new(()),
             _coverage: coverage,
         }))
     }
@@ -137,7 +140,15 @@ impl Index {
             .map_err(|error| ServiceError::Index {
                 root: self.root.clone(),
                 reason: error.to_string(),
-            })
+            })?;
+        self.rescans.send_replace(());
+        Ok(())
+    }
+
+    // Changes after each rescan a program requests; the watcher's own rescans reach watch
+    // subscribers through the core.
+    pub fn rescans(&self) -> tokio::sync::watch::Receiver<()> {
+        self.rescans.subscribe()
     }
 
     // Applies changes a program reports to the index as the watcher would.
@@ -164,6 +175,11 @@ impl Index {
             fff::WatcherStatus::Failed => Watcher::Failed,
             fff::WatcherStatus::Stopped => Watcher::Stopped,
         }
+    }
+
+    // A watcher that runs or is starting, as a watch subscription needs.
+    pub fn watcher_runs(&self) -> bool {
+        matches!(self.watcher(), Watcher::Starting | Watcher::Ready)
     }
 
     pub fn depth(&self) -> usize {

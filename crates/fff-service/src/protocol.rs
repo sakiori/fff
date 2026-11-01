@@ -6,7 +6,7 @@ use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 // Bump whenever a message below or a program frame changes shape.
-pub const PROTOCOL: u32 = 4;
+pub const PROTOCOL: u32 = 5;
 /// Largest hello the service reads.
 pub const MAX_MESSAGE_BYTES: usize = 64 * 1024;
 /// Largest reply a client reads; a status lists every index and session.
@@ -48,6 +48,14 @@ pub enum Request {
     Program {
         scope: PathBuf,
         options: IndexOptions,
+    },
+    /// A watch subscription for the changes under `scope`: `ready` follows once it is
+    /// subscribed, then the service sends only event frames, see `watch`, until the program
+    /// closes the connection.
+    Watch {
+        scope: PathBuf,
+        options: IndexOptions,
+        subscription: crate::watch::WatchRequest,
     },
     Status,
     Stop,
@@ -153,6 +161,7 @@ pub struct IndexStatus {
 pub enum SessionKind {
     Mcp,
     Program,
+    Watch,
 }
 
 #[derive(Serialize, Deserialize)]

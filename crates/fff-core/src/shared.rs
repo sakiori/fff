@@ -3,7 +3,6 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, RwLock, RwLockReadGuard, RwLockWriteGuard, Weak};
 use std::time::{Duration, Instant};
 
-use crate::coverage::{CoverageListeners, CoverageSubscription};
 use crate::dbs::lmdb::{LmdbStore, spawn_lmdb_gc};
 use crate::error::Error;
 use crate::file_picker::FilePicker;
@@ -11,6 +10,7 @@ use crate::frecency::FrecencyTracker;
 use crate::git::GitStatusCache;
 use crate::git_recency;
 use crate::git_status_worker::GitStatusWorker;
+use crate::listeners::{CoverageListeners, ListenerSubscription, RepositoryListeners};
 use crate::query_tracker::QueryTracker;
 use crate::rescan_stats::{RescanCounters, RescanReason, RescanStats};
 use crate::rescan_throttle::{Admission, RescanThrottle};
@@ -92,8 +92,12 @@ pub struct SharedPickerInner {
     /// Watch subscriptions live outside the picker lock so delivery and
     /// (un)subscribing never contend with searches.
     watchers: Arc<WatchRegistry>,
-    /// Coverage listeners live outside the picker lock and survive picker replacement.
+    /// Coverage and repository listeners live outside the picker lock and survive
+    /// picker replacement.
     coverage: Arc<CoverageListeners>,
+    repository: Arc<RepositoryListeners>,
+    // Git dirs of repositories inside the index, with their work trees.
+    git_dirs: parking_lot::Mutex<ahash::AHashMap<PathBuf, GitDir>>,
     rescans: RescanCounters,
     rescan_throttle: RescanThrottle,
     held_events: EventHold,
@@ -106,6 +110,8 @@ impl Default for SharedPickerInner {
             picker: parking_lot::RwLock::new(None),
             watchers: Arc::new(WatchRegistry::default()),
             coverage: Arc::default(),
+            repository: Arc::default(),
+            git_dirs: Default::default(),
             rescans: Default::default(),
             rescan_throttle: RescanThrottle::default(),
             held_events: EventHold::default(),
@@ -401,6 +407,29 @@ impl SharedFilePicker {
         options: WatchOptions,
         callback: impl Fn(WatchId, &[WatchEvent]) + Send + Sync + 'static,
     ) -> Result<WatchId, Error> {
+        self.watch_in(None, pattern, options, callback)
+    }
+
+    /// Like [`Self::watch`] for the changes below `dir`, a directory inside the indexed
+    /// base path: `pattern` and the ignores are relative to `dir`, as if it were the base
+    /// path. Rescan events still name the base path.
+    pub fn watch_within(
+        &self,
+        dir: &Path,
+        pattern: &str,
+        options: WatchOptions,
+        callback: impl Fn(WatchId, &[WatchEvent]) + Send + Sync + 'static,
+    ) -> Result<WatchId, Error> {
+        self.watch_in(Some(dir), pattern, options, callback)
+    }
+
+    fn watch_in(
+        &self,
+        dir: Option<&Path>,
+        pattern: &str,
+        options: WatchOptions,
+        callback: impl Fn(WatchId, &[WatchEvent]) + Send + Sync + 'static,
+    ) -> Result<WatchId, Error> {
         let (base_path, has_watcher, watcher_ready) = {
             let guard = self.read()?;
             let picker = guard.as_ref().ok_or(Error::FilePickerMissing)?;
@@ -419,9 +448,19 @@ impl SharedFilePicker {
             return Err(Error::WatcherNotReady);
         }
 
+        let dir = match dir {
+            Some(dir) => dir
+                .strip_prefix(&base_path)
+                .map_err(|_| Error::InvalidGlobPattern {
+                    pattern: dir.display().to_string(),
+                    reason: "the watched directory must be inside the indexed base path".into(),
+                })?
+                .to_path_buf(),
+            None => PathBuf::new(),
+        };
         self.0
             .watchers
-            .subscribe(&base_path, pattern, options, Box::new(callback))
+            .subscribe_within(&base_path, &dir, pattern, options, Box::new(callback))
     }
 
     /// Remove a watch subscription. Returns `true` if the id was active.
@@ -447,6 +486,41 @@ impl SharedFilePicker {
 
     pub(crate) fn rebase_watches(&self, base_path: &Path) {
         self.0.watchers.rebase(base_path);
+        self.0.git_dirs.lock().clear();
+    }
+
+    // Returns false when `git_dir` was known already as the directory it is now; true for a
+    // new one and for one removed and created again since, also within one batch.
+    pub(crate) fn register_git_dir(&self, git_dir: &Path, work_tree: &Path) -> bool {
+        let identity = dir_identity(git_dir);
+        let known = self.0.git_dirs.lock().insert(
+            git_dir.to_path_buf(),
+            GitDir {
+                work_tree: work_tree.to_path_buf(),
+                identity,
+            },
+        );
+        known.is_none_or(|known| known.identity != identity || identity.is_none())
+    }
+
+    // Forgets the git dirs of repositories at or below a removed `path`, so that one created
+    // there again is recorded and watched anew: the old watches went with it. The removal
+    // decides, also when the path is back by the time the batch is read, as a file system
+    // may give the new directory the old one's inode.
+    pub(crate) fn forget_git_dirs_under(&self, path: &Path) {
+        self.0.git_dirs.lock().retain(|git_dir, known| {
+            !git_dir.starts_with(path) && !known.work_tree.starts_with(path)
+        });
+    }
+
+    // The registered git dir holding `path`, with its work tree.
+    pub(crate) fn registered_git_dir(&self, path: &Path) -> Option<(PathBuf, PathBuf)> {
+        let git_dirs = self.0.git_dirs.lock();
+        path.ancestors().skip(1).find_map(|dir| {
+            git_dirs
+                .get(dir)
+                .map(|known| (dir.to_path_buf(), known.work_tree.clone()))
+        })
     }
 
     pub(crate) fn watch_registry(&self) -> &Arc<WatchRegistry> {
@@ -460,8 +534,26 @@ impl SharedFilePicker {
     pub fn subscribe_coverage(
         &self,
         listener: impl Fn() + Send + Sync + 'static,
-    ) -> CoverageSubscription {
-        self.0.coverage.subscribe(listener)
+    ) -> ListenerSubscription {
+        self.0.coverage.subscribe(move |_: &()| listener())
+    }
+
+    /// Calls `listener` with the root of a git work tree when the watcher sees a change of
+    /// its git state that affects file status: the index, HEAD, its log or an operation in
+    /// progress such as a merge. The work tree is the index's own repository's or that of a
+    /// repository nested in the index, which is also announced once it is first watched.
+    /// Files under `.git` are never watch events. The listener runs on the watcher's or a
+    /// scan's thread: it must return promptly and must not access this picker. Dropping the
+    /// subscription removes it.
+    pub fn subscribe_repository_state(
+        &self,
+        listener: impl Fn(&Path) + Send + Sync + 'static,
+    ) -> ListenerSubscription {
+        self.0.repository.subscribe(listener)
+    }
+
+    pub(crate) fn repository_listeners(&self) -> &Arc<RepositoryListeners> {
+        &self.0.repository
     }
 
     pub(crate) fn coverage_listeners(&self) -> &Arc<CoverageListeners> {
@@ -710,3 +802,32 @@ pub type SharedFrecency = SharedDb<FrecencyTracker>;
 
 /// Thread-safe shared handle to the [`QueryTracker`] instance.
 pub type SharedQueryTracker = SharedDb<QueryTracker>;
+
+// A recorded git dir: its work tree, and which directory it was when recorded.
+pub(crate) struct GitDir {
+    work_tree: PathBuf,
+    identity: Option<DirIdentity>,
+}
+
+// What tells a directory from one created at the same path later: a file system may give
+// the new one the inode the old one freed, but not its birth time, where it records one.
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct DirIdentity {
+    file: (u64, u64),
+    born: Option<std::time::SystemTime>,
+}
+
+fn dir_identity(path: &Path) -> Option<DirIdentity> {
+    let metadata = std::fs::metadata(path).ok()?;
+    #[cfg(unix)]
+    let file = {
+        use std::os::unix::fs::MetadataExt;
+        (metadata.dev(), metadata.ino())
+    };
+    #[cfg(not(unix))]
+    let file = (0, 0);
+    Some(DirIdentity {
+        file,
+        born: metadata.created().ok(),
+    })
+}

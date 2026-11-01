@@ -1301,6 +1301,33 @@ fn a_replaced_subdirectory_reports_what_changed() {
     );
 }
 
+// A scan that already read a recreated directory leaves its walk nothing to change; the
+// files the batch's own events name are still changes subscribers hear of.
+#[test]
+fn a_file_named_in_a_replaced_directory_is_reported_although_the_index_has_it() {
+    let f = Fixture::new();
+    f.write("sub/named.rs", "fn named() {}");
+    f.write("sub/unnamed.rs", "fn unnamed() {}");
+    f.index();
+    let events = f.subscribe("");
+
+    f.feed([
+        event(EventKind::Create(CreateKind::Folder), f.path("sub")),
+        create(f.path("sub/named.rs")),
+    ]);
+
+    let received: Vec<_> = events
+        .recv_timeout(Duration::from_secs(1))
+        .unwrap()
+        .into_iter()
+        .map(|e| (e.path, e.kind))
+        .collect();
+    assert_eq!(
+        received,
+        vec![(f.path("sub/named.rs"), WatchEventKind::Modified)]
+    );
+}
+
 #[test]
 fn a_new_directory_repeated_in_a_batch_is_walked_once() {
     let f = Fixture::new();

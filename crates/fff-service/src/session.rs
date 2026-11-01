@@ -56,18 +56,18 @@ pub struct ProgramSession {
 }
 
 // What the session connects to, resolved once against the program's working directory.
-struct Target {
+pub(crate) struct Target {
     directory: PathBuf,
     request: Request,
     launcher: Launcher,
-    connect_timeout: Duration,
+    pub(crate) connect_timeout: Duration,
     response_timeout: Duration,
 }
 
 impl ProgramSession {
     /// Connects to the service of this build, starting it when none runs.
     pub fn open(config: &ProgramConfig) -> Result<Self, ClientError> {
-        let target = Target::resolve(config)?;
+        let target = Target::resolve(config, |scope, options| Request::Program { scope, options })?;
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()?;
@@ -241,7 +241,11 @@ impl ProgramSession {
 }
 
 impl Target {
-    fn resolve(config: &ProgramConfig) -> Result<Self, ClientError> {
+    // `request` builds the hello's request from the absolute scope and the options.
+    pub(crate) fn resolve(
+        config: &ProgramConfig,
+        request: impl FnOnce(PathBuf, IndexOptions) -> Request,
+    ) -> Result<Self, ClientError> {
         let directory = config
             .service_dir
             .clone()
@@ -256,10 +260,7 @@ impl Target {
             .transpose()?;
         Ok(Self {
             directory: std::path::absolute(directory)?,
-            request: Request::Program {
-                scope: std::path::absolute(&config.scope)?,
-                options,
-            },
+            request: request(std::path::absolute(&config.scope)?, options),
             launcher: Launcher {
                 executable: std::path::absolute(&config.executable)?,
                 idle_timeout_secs: config.idle_timeout_secs,
@@ -287,14 +288,23 @@ impl Target {
         runtime: &tokio::runtime::Runtime,
         timeout: Duration,
     ) -> Result<(Connection, Vec<String>), ClientError> {
+        runtime.block_on(self.open(timeout))
+    }
+
+    // Opens a session within `timeout`, starting the service when none runs.
+    pub(crate) async fn open(
+        &self,
+        timeout: Duration,
+    ) -> Result<(Connection, Vec<String>), ClientError> {
         let namespace = Namespace::open(&self.directory).map_err(ClientError::Namespace)?;
-        runtime.block_on(open_session(
+        open_session(
             &namespace,
             &Build::current(),
             &self.request,
             &self.launcher,
             timeout,
-        ))
+        )
+        .await
     }
 
     // How long a call may take before the session gives up on the service.

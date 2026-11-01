@@ -348,8 +348,8 @@ pub unsafe extern "C" fn fff_create_instance_with_value(opts: FffCreateOptions) 
 /// library's build, starting that service from `executable` when none runs.
 ///
 /// The instance takes the same handle as in-process instances and works with
-/// every search, grep, scan and health function. Functions without a service
-/// equivalent (watching, query tracking and history, git status refresh,
+/// every search, grep, scan, watch and health function. Functions without a
+/// service equivalent (query tracking and history, git status refresh,
 /// restarting in another directory) return an error naming them as
 /// unavailable over the shared service.
 ///

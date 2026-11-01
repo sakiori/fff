@@ -1,6 +1,7 @@
+use std::collections::HashMap;
 use std::ffi::c_void;
 use std::path::{Path, PathBuf};
-use std::sync::{Mutex, PoisonError};
+use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
 use fff_service::client::ClientError;
@@ -10,6 +11,9 @@ use fff_service::program::{
 };
 use fff_service::protocol::{IndexOptions, ServiceError};
 use fff_service::session::{CONNECT_TIMEOUT, ProgramConfig, ProgramSession, RESPONSE_TIMEOUT};
+use fff_service::watch::{Delivery, Subscription, WatchEventKind, WatchRequest};
+
+use crate::watch::{FFF_WATCH_EVENT_READY, FFF_WATCH_EVENT_REPOSITORY};
 
 use crate::ffi_types::{
     FFF_ERROR_FAILED, FFF_ERROR_INVALID_REQUEST, FFF_ERROR_LOST_SERVICE, FFF_ERROR_OUTSIDE_SCOPE,
@@ -24,6 +28,10 @@ const DEFAULT_IDLE_TIMEOUT_SECS: u64 = 60 * 60;
 // An instance whose index lives in the shared service.
 pub(crate) struct ServiceInstance {
     session: ProgramSession,
+    // What subscriptions open their connections with.
+    config: ProgramConfig,
+    watch_callback: Arc<crate::watch::WatchCallbackSlot>,
+    watches: Mutex<HashMap<u64, Subscription>>,
     base_path: PathBuf,
     ai_syntax: bool,
     frecency_db: Option<String>,
@@ -51,7 +59,7 @@ impl ServiceInstance {
             .and_then(|value| value.parse().ok())
             .unwrap_or(DEFAULT_IDLE_TIMEOUT_SECS);
         let frecency_db = settings.options.frecency_db.clone();
-        let session = ProgramSession::open(&ProgramConfig {
+        let config = ProgramConfig {
             scope: settings.base_path.clone(),
             options: settings.options,
             executable: settings.executable,
@@ -61,9 +69,13 @@ impl ServiceInstance {
             log_level: settings.log_level,
             connect_timeout: settings.timeout.unwrap_or(CONNECT_TIMEOUT),
             response_timeout: settings.timeout.unwrap_or(RESPONSE_TIMEOUT),
-        })?;
+        };
+        let session = ProgramSession::open(&config)?;
         Ok(Self {
             session,
+            config,
+            watch_callback: Arc::default(),
+            watches: Mutex::default(),
             base_path: settings.base_path,
             ai_syntax: settings.ai_syntax,
             frecency_db,
@@ -71,8 +83,121 @@ impl ServiceInstance {
         })
     }
 
+    // Ends the subscriptions first: the callback may be freed once this returns.
     pub(crate) fn close(self) {
+        let watches = std::mem::take(&mut *self.watches());
+        drop(watches);
+        self.watch_callback.clear();
         let _ = self.session.close();
+    }
+
+    pub(crate) fn watch_callback(&self) -> &crate::watch::WatchCallbackSlot {
+        &self.watch_callback
+    }
+
+    fn watches(&self) -> std::sync::MutexGuard<'_, HashMap<u64, Subscription>> {
+        self.watches.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    // Opens a subscription of the instance's directory on the service.
+    pub(crate) fn watch(
+        &self,
+        pattern: &str,
+        options: fff::WatchOptions,
+        repository: bool,
+    ) -> *mut FffResult {
+        if !self.config.options.watch {
+            return FffResult::err_with(
+                "Watching is unavailable on an instance created without watch",
+                FFF_ERROR_UNAVAILABLE,
+            );
+        }
+        if !self.watch_callback.is_set() {
+            return FffResult::err(
+                "No watch callback registered. Call fff_set_watch_callback first.",
+            );
+        }
+        let relative = |pattern: &str| self.relative_pattern(pattern);
+        let request = match (
+            relative(pattern),
+            options.ignore.iter().map(|p| relative(p)).collect(),
+        ) {
+            (Ok(pattern), Ok(ignore)) => WatchRequest {
+                pattern,
+                ignore,
+                repository,
+            },
+            (Err(error), _) | (_, Err(error)) => return error,
+        };
+        // The ids of in-process subscriptions, which bindings route through the same map.
+        let id = fff::WatchId::next().0;
+        let slot = self.watch_callback.clone();
+        let base = self.base_path.clone();
+        let deliver = move |delivery: Delivery| {
+            let events = match delivery {
+                Delivery::Events(events) => events,
+                Delivery::Ready => {
+                    return slot.deliver(id, &[(base.as_path(), FFF_WATCH_EVENT_READY, None)]);
+                }
+                Delivery::Failed(error) => {
+                    let message = format!("The watch subscription ended: {error}");
+                    return slot.deliver_failure(id, &base, &message, error_code(&error));
+                }
+            };
+            // An empty path names the directory itself, which a join would end with a separator.
+            let at = |path: &str| match path {
+                "" => base.clone(),
+                path => base.join(path),
+            };
+            let paths: Vec<_> = events
+                .iter()
+                .map(|event| (at(&event.path), event.from.as_deref().map(at)))
+                .collect();
+            let batch: Vec<_> = events
+                .iter()
+                .zip(&paths)
+                .map(|(event, (path, from))| (path.as_path(), kind(event.kind), from.as_deref()))
+                .collect();
+            slot.deliver(id, &batch);
+        };
+        match Subscription::start(&self.config, request, deliver) {
+            Ok(subscription) => {
+                self.watches().insert(id, subscription);
+                FffResult::ok_int(id as i64)
+            }
+            Err(error) => failure(&error, "Failed to subscribe: "),
+        }
+    }
+
+    // Returns whether `id` was a subscription of this instance.
+    pub(crate) fn unwatch(&self, id: u64) -> bool {
+        let subscription = self.watches().remove(&id);
+        subscription.is_some()
+    }
+
+    // Patterns travel relative to the instance's directory, which may be spelled otherwise.
+    fn relative_pattern(&self, pattern: &str) -> Result<String, *mut FffResult> {
+        let expanded = fff::path_utils::expand_tilde(pattern);
+        if !expanded.is_absolute() {
+            return Ok(pattern.to_owned());
+        }
+        let inside = |path: &Path| {
+            path.strip_prefix(&self.base_path)
+                .ok()
+                .map(|relative| relative.to_string_lossy().into_owned())
+        };
+        inside(&expanded)
+            .or_else(|| {
+                fff::path_utils::canonicalize(&expanded)
+                    .ok()
+                    .and_then(|path| inside(&path))
+            })
+            .ok_or_else(|| {
+                FffResult::err_with(
+                    &format!("{pattern} is outside the instance's directory"),
+                    FFF_ERROR_OUTSIDE_SCOPE,
+                )
+            })
     }
 
     pub(crate) fn base_path(&self) -> &Path {
@@ -271,6 +396,18 @@ impl ServiceInstance {
             serde_json::json!({ "initialized": false }),
         );
         Ok(())
+    }
+}
+
+// The `kind` byte of the C interface.
+fn kind(kind: WatchEventKind) -> u8 {
+    match kind {
+        WatchEventKind::Created => 0,
+        WatchEventKind::Modified => 1,
+        WatchEventKind::Removed => 2,
+        WatchEventKind::Rescan => 3,
+        WatchEventKind::Renamed => 4,
+        WatchEventKind::Repository => FFF_WATCH_EVENT_REPOSITORY,
     }
 }
 

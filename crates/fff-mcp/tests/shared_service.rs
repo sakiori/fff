@@ -22,8 +22,9 @@ use fff_service::program::{
     GlobRequest, GrepCursor, GrepMode, GrepOptions, GrepRequest, GrepResults, MixedEntry,
     MultiGrepRequest, ProgramError, SearchRequest,
 };
-use fff_service::protocol::IndexOptions;
+use fff_service::protocol::{IndexOptions, ServiceError};
 use fff_service::session::{CONNECT_TIMEOUT, ProgramConfig, ProgramSession, RESPONSE_TIMEOUT};
+use fff_service::watch::{Delivery, Subscription, WatchEvent, WatchEventKind, WatchRequest};
 use interprocess::local_socket::{Stream, prelude::*};
 use serde_json::{Value, json};
 
@@ -2876,4 +2877,613 @@ fn program_reported_changes_apply_before_the_reply() {
             "{error}"
         );
     }
+}
+
+// A subscription whose deliveries arrive on a channel, once it is ready.
+fn subscribe(scope: &Path, service: &Path, request: WatchRequest) -> (Subscription, Events) {
+    subscribe_with(program_config(scope, service), request)
+}
+
+fn subscribe_with(config: ProgramConfig, request: WatchRequest) -> (Subscription, Events) {
+    let (sender, deliveries) = mpsc::channel();
+    let subscription = Subscription::start(&config, request, move |delivery| {
+        let _ = sender.send(delivery);
+    })
+    .unwrap();
+    let events = Events(deliveries);
+    match events.next("the subscription to be ready") {
+        Delivery::Ready => {}
+        other => panic!("subscription not ready: {other:?}"),
+    }
+    (subscription, events)
+}
+
+struct Events(mpsc::Receiver<Delivery>);
+
+impl Events {
+    fn next(&self, what: &str) -> Delivery {
+        self.0
+            .recv_timeout(EVENTUAL)
+            .unwrap_or_else(|error| panic!("{what}: {error}"))
+    }
+
+    // Returns the first event `wanted` accepts and every event before it.
+    fn until(&self, what: &str, wanted: impl Fn(&WatchEvent) -> bool) -> Vec<WatchEvent> {
+        let deadline = Instant::now() + EVENTUAL;
+        let mut seen = Vec::new();
+        loop {
+            let left = deadline.saturating_duration_since(Instant::now());
+            match self.0.recv_timeout(left) {
+                Ok(Delivery::Events(events)) => {
+                    for event in events {
+                        let done = wanted(&event);
+                        seen.push(event);
+                        if done {
+                            return seen;
+                        }
+                    }
+                }
+                Ok(other) => panic!("{what}: {other:?}; received {seen:?}"),
+                Err(error) => panic!("{what}: {error}; received {seen:?}"),
+            }
+        }
+    }
+
+    // Changes and stages `file` until a repository event for `root` shows the repository's
+    // git dir is watched. A rescan, which the queue delivers in place of the changes after
+    // it, proves nothing, so the queue is drained and the change made again, a few times.
+    fn hears_staging(&self, work_tree: &Path, file: &str, root: &str) {
+        for _ in 0..3 {
+            change_and_stage(work_tree, file);
+            let seen = self.until("a repository event or a rescan", |event| {
+                is_rescan(event) || repository_event(root)(event)
+            });
+            if seen.last().is_some_and(|event| !is_rescan(event)) {
+                return;
+            }
+            while self.0.try_recv().is_ok() {}
+        }
+        panic!("only rescans followed staging in {root}");
+    }
+
+    // The error that ended the subscription, after any events.
+    fn failure(&self, what: &str) -> ClientError {
+        loop {
+            match self.next(what) {
+                Delivery::Events(_) => {}
+                Delivery::Failed(error) => return error,
+                Delivery::Ready => panic!("{what}: ready again"),
+            }
+        }
+    }
+}
+
+fn change(path: &str, kind: WatchEventKind) -> impl Fn(&WatchEvent) -> bool {
+    move |event| event.path == path && event.kind == kind
+}
+
+fn is_rescan(event: &WatchEvent) -> bool {
+    event.kind == WatchEventKind::Rescan
+}
+
+fn with_repository() -> WatchRequest {
+    WatchRequest {
+        repository: true,
+        ..WatchRequest::default()
+    }
+}
+
+fn watch_sessions(stats: &Value) -> usize {
+    stats["sessions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|session| session["kind"] == "watch")
+        .count()
+}
+
+// A repository with `sub` inside and its log files ignored.
+fn repository_fixture(root: &Path) -> (PathBuf, PathBuf) {
+    let (project, sub) = fixture(root);
+    git2::Repository::init(&project).unwrap();
+    std::fs::write(project.join(".gitignore"), "*.log\n").unwrap();
+    (project, sub)
+}
+
+// Changes `file` and stages it, so the index really changes: staging a file as it is
+// already staged may leave the index as it was.
+fn change_and_stage(work_tree: &Path, file: &str) {
+    let path = work_tree.join(file);
+    let mut body = std::fs::read(&path).unwrap();
+    body.extend_from_slice(b"// staged\n");
+    std::fs::write(&path, body).unwrap();
+    stage(work_tree, file);
+}
+
+fn stage(work_tree: &Path, file: &str) {
+    let repository = git2::Repository::open(work_tree).unwrap();
+    let mut index = repository.index().unwrap();
+    index.add_path(Path::new(file)).unwrap();
+    index.write().unwrap();
+}
+
+fn commit_all(work_tree: &Path) {
+    let repository = git2::Repository::open(work_tree).unwrap();
+    let mut index = repository.index().unwrap();
+    index
+        .add_all(["*"], git2::IndexAddOption::DEFAULT, None)
+        .unwrap();
+    index.write().unwrap();
+    let tree = repository.find_tree(index.write_tree().unwrap()).unwrap();
+    let signature = git2::Signature::now("fff", "fff@example.invalid").unwrap();
+    repository
+        .commit(Some("HEAD"), &signature, &signature, "init", &tree, &[])
+        .unwrap();
+}
+
+fn repository_event(path: &str) -> impl Fn(&WatchEvent) -> bool {
+    move |event| event.kind == WatchEventKind::Repository && event.path == path
+}
+
+fn canonical(path: &Path) -> String {
+    path.canonicalize().unwrap().to_string_lossy().into_owned()
+}
+
+#[test]
+fn watch_subscription_delivers_the_changes_of_its_directory_only() {
+    let tmp = Sandbox::new();
+    let service = tmp.service();
+    let (project, sub) = repository_fixture(tmp.path());
+    let _daemon = start_daemon(&service, "0");
+    let (_subscription, events) = subscribe(&sub, &service, WatchRequest::default());
+    assert_eq!(watch_sessions(&status(&service)), 1);
+
+    std::fs::write(sub.join("src/inside.rs"), "fn Changed() {}\n").unwrap();
+    events.until(
+        "a modified file",
+        change("src/inside.rs", WatchEventKind::Modified),
+    );
+
+    // Ignored and outside files come before a file the subscription hears, so their events
+    // would arrive with or before its.
+    std::fs::write(sub.join("debug.log"), "ignored\n").unwrap();
+    std::fs::write(project.join("submarine/outside.rs"), "fn Outside() {}\n").unwrap();
+    std::fs::write(sub.join("src/new.rs"), "fn New() {}\n").unwrap();
+    let seen = events.until(
+        "a created file",
+        change("src/new.rs", WatchEventKind::Created),
+    );
+    assert!(
+        seen.iter()
+            .all(|event| !event.path.contains("debug.log") && !event.path.contains("outside")),
+        "{seen:?}"
+    );
+
+    // Directories named like a git dir's parts are a project's own.
+    for logs in [sub.join("logs"), sub.join("src/logs")] {
+        std::fs::create_dir(&logs).unwrap();
+        std::fs::write(logs.join("today.txt"), "first\n").unwrap();
+        let path = logs.strip_prefix(&sub).unwrap().join("today.txt");
+        let path = path.to_string_lossy();
+        events.until(
+            "a file of a new logs directory",
+            change(&path, WatchEventKind::Created),
+        );
+        std::fs::write(logs.join("today.txt"), "second\n").unwrap();
+        events.until(
+            "a later change there",
+            change(&path, WatchEventKind::Modified),
+        );
+    }
+    let session = open_program(&sub, &service, program_options());
+    let indexed = session.search_files(search("today", 0, 10)).unwrap();
+    assert_eq!(indexed.items.len(), 2, "{:?}", indexed.items);
+
+    // A rescan a program requests reaches every subscription of the index.
+    session.rescan().unwrap();
+    events.until("a rescan of the index", is_rescan);
+}
+
+#[test]
+fn watch_subscription_hears_repository_state_only_when_asked() {
+    let tmp = Sandbox::new();
+    let service = tmp.service();
+    let (project, sub) = repository_fixture(tmp.path());
+    let _daemon = start_daemon(&service, "0");
+    let (_with, with_state) = subscribe(&project, &service, with_repository());
+    let (_without, without_state) = subscribe(&project, &service, WatchRequest::default());
+    let (_below, below) = subscribe(&sub, &service, with_repository());
+
+    stage(&project, "sub/src/inside.rs");
+    let seen = with_state.until("a repository event", |event| {
+        event.kind == WatchEventKind::Repository
+    });
+    assert_eq!(
+        seen.last().unwrap().path,
+        "",
+        "the root is the directory itself"
+    );
+    // A subscription below the work tree hears it by its absolute path.
+    below.until(
+        "the containing repository",
+        repository_event(&canonical(&project)),
+    );
+
+    std::fs::write(project.join("sentinel.rs"), "fn Sentinel() {}\n").unwrap();
+    let seen = without_state.until(
+        "the sentinel",
+        change("sentinel.rs", WatchEventKind::Created),
+    );
+    assert!(
+        seen.iter().all(
+            |event| event.kind != WatchEventKind::Repository && !event.path.starts_with(".git")
+        ),
+        "{seen:?}"
+    );
+}
+
+#[test]
+fn nested_repositories_reach_their_own_and_enclosing_subscriptions() {
+    let tmp = Sandbox::new();
+    let service = tmp.service();
+    let (outer, inner) = repository_fixture(tmp.path());
+    git2::Repository::init(&inner).unwrap();
+    // A folder that is no repository, with one inside, and a directory that becomes one.
+    let plain = tmp.path().join("plain");
+    let app = plain.join("app");
+    let late = plain.join("late");
+    std::fs::create_dir_all(&app).unwrap();
+    std::fs::create_dir_all(&late).unwrap();
+    std::fs::write(app.join("main.rs"), "fn main() {}\n").unwrap();
+    std::fs::write(late.join("lib.rs"), "fn lib() {}\n").unwrap();
+    git2::Repository::init(&app).unwrap();
+    let _daemon = start_daemon(&service, "0");
+    let (_outer, outer_events) = subscribe(&outer, &service, with_repository());
+    let (_inner, inner_events) = subscribe(&inner, &service, with_repository());
+    let (_plain, plain_events) = subscribe(&plain, &service, with_repository());
+    let (_app, app_events) = subscribe(&app, &service, with_repository());
+
+    stage(&inner, "src/inside.rs");
+    inner_events.until("the nested repository's own event", repository_event(""));
+    outer_events.until(
+        "the nested repository, seen from outside",
+        repository_event("sub"),
+    );
+
+    stage(&outer, ".gitignore");
+    outer_events.until("the outer repository's event", repository_event(""));
+    std::fs::write(inner.join("sentinel.rs"), "fn Sentinel() {}\n").unwrap();
+    let seen = inner_events.until(
+        "the sentinel",
+        change("sentinel.rs", WatchEventKind::Created),
+    );
+    // Its own repository may report again, by its own empty path; the outer one would come
+    // by the outer work tree's absolute path.
+    assert!(
+        seen.iter()
+            .all(|event| event.kind != WatchEventKind::Repository || event.path.is_empty()),
+        "the nested subscription heard the outer repository: {seen:?}"
+    );
+
+    stage(&app, "main.rs");
+    app_events.until("a repository inside a plain folder", repository_event(""));
+    plain_events.until("the repository inside the folder", repository_event("app"));
+
+    // A fresh repository's log appears with its first commit, after its git dir was
+    // watched, and commits only touch the log.
+    let fresh = plain.join("fresh");
+    std::fs::create_dir(&fresh).unwrap();
+    std::fs::write(fresh.join("lib.rs"), "fn fresh() {}\n").unwrap();
+    let repository = git2::Repository::init(&fresh).unwrap();
+    plain_events.until("the fresh repository", repository_event("fresh"));
+    stage(&fresh, "lib.rs");
+    plain_events.until("the fresh repository's index", repository_event("fresh"));
+    let tree = repository
+        .find_tree(repository.index().unwrap().write_tree().unwrap())
+        .unwrap();
+    let signature = git2::Signature::now("fff", "fff@example.invalid").unwrap();
+    let first = repository
+        .commit(Some("HEAD"), &signature, &signature, "first", &tree, &[])
+        .unwrap();
+    plain_events.until("the first commit", repository_event("fresh"));
+    let parent = repository.find_commit(first).unwrap();
+    repository
+        .commit(
+            Some("HEAD"),
+            &signature,
+            &signature,
+            "second",
+            &tree,
+            &[&parent],
+        )
+        .unwrap();
+    plain_events.until("a commit seen through the log", repository_event("fresh"));
+
+    // A repository initialised after the walk reached its directory.
+    git2::Repository::init(&late).unwrap();
+    stage(&late, "lib.rs");
+    plain_events.until(
+        "a repository created after the scan",
+        repository_event("late"),
+    );
+
+    // A repository removed and created again, as a fresh clone is, is watched anew.
+    std::fs::remove_dir_all(&app).unwrap();
+    plain_events.until(
+        "the removed repository",
+        change("app/main.rs", WatchEventKind::Removed),
+    );
+    std::fs::create_dir(&app).unwrap();
+    std::fs::write(app.join("main.rs"), "fn main() {}\n").unwrap();
+    git2::Repository::init(&app).unwrap();
+    plain_events.until(
+        "the recreated repository",
+        change("app/main.rs", WatchEventKind::Created),
+    );
+    stage(&app, "main.rs");
+    plain_events.until("the recreated repository's state", repository_event("app"));
+
+    // Also when it goes and comes back before the watcher looks, within one batch.
+    std::fs::remove_dir_all(&app).unwrap();
+    std::fs::create_dir(&app).unwrap();
+    std::fs::write(app.join("main.rs"), "fn main() { again() }\n").unwrap();
+    git2::Repository::init(&app).unwrap();
+    // It is announced, or its first state change heard; a later change then shows that its
+    // new git dir is watched.
+    stage(&app, "main.rs");
+    plain_events.until("the repository back at once", |event| {
+        repository_event("app")(event) || is_rescan(event)
+    });
+    while plain_events.0.try_recv().is_ok() {}
+    plain_events.hears_staging(&app, "main.rs", "app");
+}
+
+#[test]
+fn linked_worktrees_and_submodules_report_their_git_state() {
+    let tmp = Sandbox::new();
+    let service = tmp.service();
+    let (project, _) = repository_fixture(tmp.path());
+    commit_all(&project);
+    let repository = git2::Repository::open(&project).unwrap();
+    // Linked worktrees inside and outside the main work tree, whose `.git` is a file.
+    let inside = project.join("feature");
+    let outside = tmp.path().join("elsewhere");
+    repository.worktree("feature", &inside, None).unwrap();
+    repository.worktree("elsewhere", &outside, None).unwrap();
+    // A submodule whose git dir lies in the main repository's `.git`.
+    let vendor = project.join("vendor");
+    std::fs::create_dir(&vendor).unwrap();
+    std::fs::write(vendor.join("lib.rs"), "fn vendored() {}\n").unwrap();
+    let mut options = git2::RepositoryInitOptions::new();
+    options.workdir_path(&vendor).no_dotgit_dir(true);
+    git2::Repository::init_opts(repository.path().join("modules/vendor"), &options).unwrap();
+    assert!(vendor.join(".git").is_file());
+    let _daemon = start_daemon(&service, "0");
+    let (_main, main_events) = subscribe(&project, &service, with_repository());
+    let (_outside, outside_events) = subscribe(&outside, &service, with_repository());
+    let (_vendor, vendor_events) = subscribe(&vendor, &service, with_repository());
+
+    change_and_stage(&outside, "sub/src/inside.rs");
+    outside_events.until(
+        "a worktree whose git dir is outside it",
+        repository_event(""),
+    );
+    change_and_stage(&inside, "sub/src/inside.rs");
+    main_events.until(
+        "a worktree inside the main work tree",
+        repository_event("feature"),
+    );
+    stage(&vendor, "lib.rs");
+    vendor_events.until("the submodule's own event", repository_event(""));
+    main_events.until(
+        "the submodule, seen from its superproject",
+        repository_event("vendor"),
+    );
+
+    // A worktree removed and added again is watched anew. Its `.gitignore` going or
+    // coming may rescan the index, which stands for its files' events, and a quick return
+    // may read as a modification.
+    let feature = repository.find_worktree("feature").unwrap();
+    let mut prune = git2::WorktreePruneOptions::new();
+    prune.valid(true).working_tree(true);
+    feature.prune(Some(&mut prune)).unwrap();
+    main_events.until("the removed worktree", |event| {
+        is_rescan(event) || change("feature/.gitignore", WatchEventKind::Removed)(event)
+    });
+    let branch = repository.find_reference("refs/heads/feature").unwrap();
+    let mut add = git2::WorktreeAddOptions::new();
+    add.reference(Some(&branch));
+    repository.worktree("feature", &inside, Some(&add)).unwrap();
+    main_events.until("the added worktree", |event| {
+        is_rescan(event)
+            || event.path == "feature/.gitignore" && event.kind != WatchEventKind::Removed
+    });
+    main_events.hears_staging(&inside, "sub/src/inside.rs", "feature");
+}
+
+#[test]
+fn slow_watch_consumer_loses_its_own_changes_only() {
+    const ROUNDS: usize = 10;
+    const PER_ROUND: usize = 1500;
+    let tmp = Sandbox::new();
+    let service = tmp.service();
+    let (_, sub) = fixture(tmp.path());
+    let many = sub.join("many");
+    std::fs::create_dir(&many).unwrap();
+    for n in 0..ROUNDS * PER_ROUND {
+        std::fs::write(many.join(format!("f{n}.rs")), "").unwrap();
+    }
+    let _daemon = start_daemon(&service, "0");
+    let (blocked, gate) = mpsc::channel::<()>();
+    let (sender, deliveries) = mpsc::channel();
+    let _slow = Subscription::start(&program_config(&sub, &service), WatchRequest::default(), {
+        let mut gate = Some(gate);
+        move |delivery| {
+            // The first batch holds the subscription's thread until the test lets go.
+            if matches!(delivery, Delivery::Events(_))
+                && let Some(gate) = gate.take()
+            {
+                let _ = gate.recv();
+            }
+            let _ = sender.send(delivery);
+        }
+    })
+    .unwrap();
+    let slow = Events(deliveries);
+    assert!(matches!(slow.next("ready"), Delivery::Ready));
+    let (_reader, reader) = subscribe(&sub, &service, WatchRequest::default());
+    std::fs::write(sub.join("first.rs"), "fn First() {}\n").unwrap();
+    reader.until(
+        "the first change",
+        change("first.rs", WatchEventKind::Created),
+    );
+
+    // Rounds of modifications, each well below the watcher's own batch limit, while one
+    // subscription reads nothing and another reads everything.
+    let other = open_program(&sub, &service, program_options());
+    for round in 0..ROUNDS {
+        let body = "x".repeat(round + 1);
+        for n in round * PER_ROUND..(round + 1) * PER_ROUND {
+            std::fs::write(many.join(format!("f{n}.rs")), &body).unwrap();
+        }
+        let last = format!("f{}", (round + 1) * PER_ROUND - 1);
+        eventually("the index holds the round", || {
+            other
+                .search_files(search(&last, 0, 10))
+                .unwrap()
+                .items
+                .iter()
+                .any(|item| {
+                    item.relative_path.ends_with(&format!("{last}.rs"))
+                        && item.size == body.len() as u64
+                })
+        });
+    }
+
+    drop(blocked);
+    slow.until("a rescan for the changes it could not hold", is_rescan);
+    std::fs::write(sub.join("after.rs"), "fn After() {}\n").unwrap();
+    slow.until(
+        "a change after the rescan",
+        change("after.rs", WatchEventKind::Created),
+    );
+    // The reader kept up, so the index itself rescanned nothing.
+    let seen = reader.until(
+        "the reader's change",
+        change("after.rs", WatchEventKind::Created),
+    );
+    assert!(!seen.iter().any(is_rescan), "the watcher rescanned");
+}
+
+#[test]
+fn watch_subscription_follows_its_session_to_a_broader_index() {
+    let tmp = Sandbox::new();
+    let service = tmp.service();
+    let (project, sub) = fixture(tmp.path());
+    let _daemon = start_daemon(&service, "0");
+    let (_subscription, events) = subscribe(&sub, &service, WatchRequest::default());
+    let _parent = open_program(&project, &service, program_options());
+    wait_status(
+        &service,
+        "the subscription moves to the parent index",
+        index_count(1),
+    );
+    events.until("a rescan for the move", is_rescan);
+    std::fs::write(sub.join("src/inside.rs"), "fn Moved() {}\n").unwrap();
+    events.until(
+        "a change relative to the subscription's directory",
+        change("src/inside.rs", WatchEventKind::Modified),
+    );
+}
+
+#[test]
+fn watch_subscription_resubscribes_to_a_new_service_with_a_rescan() {
+    let tmp = Sandbox::new();
+    let service = tmp.service();
+    let (project, _) = fixture(tmp.path());
+    let mut daemon = start_daemon(&service, "0");
+    let (_subscription, events) = subscribe(&project, &service, WatchRequest::default());
+    let old = daemon.id() as u64;
+    daemon.kill().unwrap();
+    daemon.wait().unwrap();
+    // The subscription starts the service itself, as opening a session does.
+    events.until("a rescan once subscribed again", is_rescan);
+    let stats = status(&service);
+    assert_ne!(stats["pid"].as_u64(), Some(old), "{stats}");
+    assert_eq!(watch_sessions(&stats), 1, "{stats}");
+}
+
+#[test]
+fn watch_subscription_ends_when_its_directory_cannot_be_served() {
+    let tmp = Sandbox::new();
+    let service = tmp.service();
+    let (project, sub) = fixture(tmp.path());
+    let mut daemon = start_daemon(&service, "0");
+    // A removed directory ends the subscription the service holds.
+    let (_removed, removed) = subscribe(&sub, &service, WatchRequest::default());
+    std::fs::remove_dir_all(&sub).unwrap();
+    let error = removed.failure("the end of a removed directory's subscription");
+    assert!(
+        matches!(error, ClientError::Service(ServiceError::Scope { .. })),
+        "{error}"
+    );
+
+    // A reconnect the new service refuses ends it too, instead of retrying.
+    let gone = project.join("submarine");
+    let (_refused, refused) = subscribe(&gone, &service, WatchRequest::default());
+    daemon.kill().unwrap();
+    daemon.wait().unwrap();
+    std::fs::remove_dir_all(&gone).unwrap();
+    let error = refused.failure("the end of a refused reconnect");
+    assert!(
+        matches!(error, ClientError::Service(ServiceError::Scope { .. })),
+        "{error}"
+    );
+}
+
+#[test]
+fn ended_watch_subscription_releases_its_session() {
+    let tmp = Sandbox::new();
+    let service = tmp.service();
+    let (project, _) = fixture(tmp.path());
+    let _daemon = start_daemon(&service, "0");
+    let (subscription, events) = subscribe(&project, &service, WatchRequest::default());
+    assert_eq!(watch_sessions(&status(&service)), 1);
+    drop(subscription);
+    // Its delivery ended with it, so nothing can arrive any more.
+    while events.0.try_recv().is_ok() {}
+    assert!(matches!(
+        events.0.try_recv(),
+        Err(mpsc::TryRecvError::Disconnected)
+    ));
+    wait_status(
+        &service,
+        "the session ends with its subscription",
+        |stats| stats["sessions"].as_array().is_some_and(Vec::is_empty),
+    );
+
+    let snapshot = IndexOptions {
+        watch: false,
+        ..program_options()
+    };
+    let (sender, deliveries) = mpsc::channel();
+    let _refused = Subscription::start(
+        &ProgramConfig {
+            options: snapshot,
+            ..program_config(&project, &service)
+        },
+        WatchRequest::default(),
+        move |delivery| {
+            let _ = sender.send(delivery);
+        },
+    )
+    .unwrap();
+    let error = Events(deliveries).failure("a subscription to an index without a watcher");
+    assert!(
+        matches!(
+            error,
+            ClientError::Service(ServiceError::InvalidRequest { .. })
+        ),
+        "{error}"
+    );
 }

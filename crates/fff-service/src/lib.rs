@@ -7,6 +7,7 @@ pub mod session;
 mod sigpipe;
 #[cfg(unix)]
 pub mod socket;
+pub mod watch;
 
 use std::io;
 use std::path::{Path, PathBuf};

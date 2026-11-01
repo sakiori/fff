@@ -191,11 +191,14 @@ build-node-native:
 
 prepare-node: build-node-native sync-js-api
 	mkdir -p packages/fff-node/bin
-	cp target/release/libfff_c.dylib packages/fff-node/bin/ 2>/dev/null || true; \
-	cp target/release/libfff_c.so packages/fff-node/bin/ 2>/dev/null || true; \
-	cp target/release/fff_c.dll packages/fff-node/bin/ 2>/dev/null || true
-	cp target/release/fff-mcp packages/fff-node/bin/ 2>/dev/null || true; \
-	cp target/release/fff-mcp.exe packages/fff-node/bin/ 2>/dev/null || true
+	@# Copying over a file a running service maps gets the new one killed on macOS, so each
+	@# file lands under a temporary name and replaces the old one by a rename.
+	@for file in libfff_c.dylib libfff_c.so fff_c.dll fff-mcp fff-mcp.exe; do \
+	  if [ -f target/release/$$file ]; then \
+	    cp target/release/$$file packages/fff-node/bin/.$$file.tmp && \
+	    mv -f packages/fff-node/bin/.$$file.tmp packages/fff-node/bin/$$file || exit 1; \
+	  fi; \
+	done
 
 # Stages the host's build into its @sakiori/fff-bin-* package.
 stage-node-platform: build-node-native

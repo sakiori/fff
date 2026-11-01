@@ -2,7 +2,8 @@
  * Options of the Node package beyond the API it shares with fff-bun.
  */
 
-import type { InitOptions } from "./fff-api.js";
+import type { ErrorCode } from "./errors.js";
+import type { InitOptions, WatchEventKind, WatchOptions } from "./fff-api.js";
 
 /**
  * Initialization options of a `FileFinder`, whose index lives in the shared
@@ -42,3 +43,44 @@ export interface FrecencyOptions {
    */
   excludeFrecency?: boolean;
 }
+
+/**
+ * The kind of a watch event over the shared service: the shared kinds, and
+ * `repository` when the git state of a repository inside the instance's
+ * directory, or containing it, changed, for subscriptions that ask for it, and
+ * `failed` when the subscription ended for good after `watch` resolved: the
+ * service no longer serves its directory, as after the directory was removed,
+ * or refused a reconnect. No event follows a `failed` one.
+ */
+export type ServiceWatchEventKind = WatchEventKind | "repository" | "failed";
+
+/** A filesystem change, or a repository state change, of a subscription. */
+export interface ServiceWatchEvent {
+  /**
+   * Absolute path of the affected file; the instance's directory for `rescan`
+   * and `failed`, and the repository's work tree for `repository`.
+   */
+  path: string;
+  kind: ServiceWatchEventKind;
+  /** Absolute path the file moved from. Only set when `kind == "renamed"`. */
+  from?: string;
+  /** Why the subscription ended. Only set when `kind == "failed"`. */
+  error?: string;
+  /** The code of `error`. Only set when `kind == "failed"`. */
+  code?: ErrorCode;
+}
+
+/** Options of a watch subscription over the shared service. */
+export interface ServiceWatchOptions extends WatchOptions {
+  /**
+   * Also deliver a `repository` event, naming the repository's work tree,
+   * when the git state of a repository inside the instance's directory, or
+   * containing it, changes: its index, as `git add` writes it, HEAD, or an
+   * operation in progress such as a merge. Files under `.git` are never
+   * delivered as file events. (default: false)
+   */
+  repository?: boolean;
+}
+
+/** Receives the batches of a subscription on the event loop. */
+export type ServiceWatchBatchCallback = (events: ServiceWatchEvent[]) => void;

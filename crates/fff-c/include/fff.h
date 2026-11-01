@@ -66,7 +66,26 @@
 /**
  * Current version of [`FffWatchOptions`].
  */
-#define FFF_WATCH_OPTIONS_VERSION 1
+#define FFF_WATCH_OPTIONS_VERSION 2
+
+/**
+ * Kind of a watch event: the git state of a repository changed. Delivered only to
+ * subscriptions that ask for repository state, on instances of the shared service.
+ */
+#define FFF_WATCH_EVENT_REPOSITORY 5
+
+/**
+ * Kind of a watch event of a service-backed instance: the subscription ended for good,
+ * naming the instance's directory. `fff_watch_events_get_error` and
+ * `fff_watch_events_get_error_code` tell why; no batch follows.
+ */
+#define FFF_WATCH_EVENT_FAILED 6
+
+/**
+ * Kind of a watch event of a service-backed instance: the subscription is ready, naming
+ * the instance's directory; every later change is delivered.
+ */
+#define FFF_WATCH_EVENT_READY 7
 
 /**
  * Result envelope returned by all `fff_*` functions.
@@ -465,7 +484,9 @@ typedef struct FffMixedSearchResult {
  * A single watch event. `kind`: 0 = created, 1 = modified, 2 = removed,
  * 3 = rescan (events were lost; re-stat what you care about),
  * 4 = renamed (`path` is the destination; read the source with
- * `fff_watch_events_get_from_path`).
+ * `fff_watch_events_get_from_path`), 5 = repository (only when requested,
+ * see [`FffWatchOptions::repository`]), 6 = failed and 7 = ready (service-backed
+ * instances only).
  *
  * Layout is frozen: this is an array element, so growing it would change the
  * stride every existing binding compiled against.
@@ -491,6 +512,15 @@ typedef struct FffWatchEventBatch {
    * no renames at all.
    */
   char **rename_sources;
+  /**
+   * Why the subscription ended, for a batch of kind [`FFF_WATCH_EVENT_FAILED`]; null
+   * otherwise.
+   */
+  char *error;
+  /**
+   * The `FFF_ERROR_*` kind of `error`, 0 otherwise.
+   */
+  int64_t error_code;
 } FffWatchEventBatch;
 
 /**
@@ -516,6 +546,14 @@ typedef struct FffWatchOptions {
    */
   const char *const *ignore;
   uint32_t ignore_count;
+  /**
+   * Version 2: also deliver an event of kind [`FFF_WATCH_EVENT_REPOSITORY`] naming
+   * the work tree when the git state of a repository inside the instance's directory,
+   * or containing it, changes (its index, HEAD or an operation in progress such as a
+   * merge).
+   * Service-backed instances only; an in-process instance refuses it.
+   */
+  bool repository;
 } FffWatchOptions;
 
 /**
@@ -594,8 +632,8 @@ struct FffResult *fff_create_instance_with_value(struct FffCreateOptions opts);
  * library's build, starting that service from `executable` when none runs.
  *
  * The instance takes the same handle as in-process instances and works with
- * every search, grep, scan and health function. Functions without a service
- * equivalent (watching, query tracking and history, git status refresh,
+ * every search, grep, scan, watch and health function. Functions without a
+ * service equivalent (query tracking and history, git status refresh,
  * restarting in another directory) return an error naming them as
  * unavailable over the shared service.
  *
@@ -1642,6 +1680,8 @@ const char *fff_grep_result_get_regex_fallback_error(const struct FffGrepResult 
  * Register the instance-wide watch callback used by all `fff_watch`
  * subscriptions; call before the first `fff_watch`, calling again replaces it.
  *
+ * On a service-backed instance the callback runs on a thread of each subscription.
+ *
  * ## Safety
  * * `fff_handle` must be a valid instance pointer from `fff_create_instance`.
  * * `callback` must remain callable until fff_unwatch called
@@ -1659,6 +1699,18 @@ struct FffResult *fff_set_watch_callback(void *fff_handle,
  *
  * `pattern` if non `NULL` can be wildcard pattern, absolute, or relative path
  * that will be used to filter the events triggering exact subscription.
+ *
+ * On a service-backed instance the subscription lives in the shared service,
+ * and the call returns at once: a ready event (kind 7) follows once every later
+ * change is delivered, or a failed one (kind 6). When changes
+ * are lost, because the callback is slower than they come, the index was
+ * rescanned or the session moved to another index, one rescan event (kind 3)
+ * naming the instance's directory replaces them. A lost connection is
+ * reopened with backoff, starting the service when none runs, and delivers a
+ * rescan event once subscribed again; a failed event ends a subscription the
+ * service refuses or cannot serve any more, as when its directory was removed
+ * or its watcher stopped. An instance created without `watch`
+ * fails with [`FFF_ERROR_UNAVAILABLE`] in `int_value`.
  *
  * ## Safety
  * * `fff_handle` must be a valid instance pointer from `fff_create_instance`.
@@ -1684,7 +1736,21 @@ struct FffResult *fff_watch_args(void *fff_handle,
                                  uint32_t ignore_count);
 
 /**
+ * [`fff_watch_args`] that also takes [`FffWatchOptions::repository`].
+ *
+ * ## Safety
+ * As [`fff_watch_args`].
+ */
+struct FffResult *fff_watch_args_ex(void *fff_handle,
+                                    const char *pattern,
+                                    const char *const *ignore,
+                                    uint32_t ignore_count,
+                                    bool repository);
+
+/**
  * Remove a watch subscription. `int_value` = 1 if the id existed, 0 otherwise.
+ * On a service-backed instance, once it returns the callback is not called for
+ * the subscription again, unless it is called from that callback.
  *
  * ## Safety
  * `fff_handle` must be a valid instance pointer from `fff_create_instance`.
@@ -1718,17 +1784,39 @@ const char *fff_watch_events_get_from_path(const struct FffWatchEventBatch *batc
 
 /**
  * Kind of event `index` (0 = created, 1 = modified, 2 = removed, 3 = rescan,
- * 4 = renamed).
+ * 4 = renamed, 5 = repository, 6 = failed, 7 = ready).
  * 3 (rescan aka "re-stat something" kind) returned when OS based buffer
  * has been overflown and some events might be loss. Paths will contain a list of
  * directories that needs to be rescanned to ensure consistency.
  * 4 reports a move: `path` is the destination and
  * `fff_watch_events_get_from_path` yields the source.
+ * 5 names the work tree whose git state changed, for subscriptions that asked.
+ * 6 and 7 come only from service-backed instances, in a batch of their own that
+ * names the instance's directory: a subscription there always delivers 7 first,
+ * once it is ready, or 6 instead when it cannot be opened; a 6 after 7 ends it
+ * (see `fff_watch_events_get_error`). Nothing follows a 6.
  *
  * ## Safety
  * `batch` must be a valid `FffWatchEventBatch` pointer or null.
  */
 uint8_t fff_watch_events_get_kind(const struct FffWatchEventBatch *batch, uint32_t index);
+
+/**
+ * Why the subscription of a batch of kind 6 (failed) ended; null for other batches.
+ * Owned by the batch.
+ *
+ * ## Safety
+ * `batch` must be a valid `FffWatchEventBatch` pointer or null.
+ */
+const char *fff_watch_events_get_error(const struct FffWatchEventBatch *batch);
+
+/**
+ * The `FFF_ERROR_*` kind of a failed batch's error, 0 for other batches.
+ *
+ * ## Safety
+ * `batch` must be a valid `FffWatchEventBatch` pointer or null.
+ */
+int64_t fff_watch_events_get_error_code(const struct FffWatchEventBatch *batch);
 
 /**
  * Free a watch event batch delivered to the instance callback.

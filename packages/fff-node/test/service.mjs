@@ -7,6 +7,7 @@ import {
   existsSync,
   mkdirSync,
   mkdtempSync,
+  realpathSync,
   rmSync,
   symlinkSync,
   utimesSync,
@@ -19,6 +20,7 @@ import { fileURLToPath, pathToFileURL } from "node:url";
 import { readFile } from "node:fs/promises";
 import { createInterface } from "node:readline";
 import { ErrorCode, FileFinder, nativeInstanceCount, unpackedAsarPath } from "../dist/index.js";
+import { exitDeliveryWorkerForTest } from "../dist/watch-delivery.js";
 import { disposableNamespace, removeStateRoot } from "./support.mjs";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
@@ -41,6 +43,45 @@ async function open(basePath, options = {}) {
   const ready = await created.value.waitForIndexReady(30_000);
   assert.ok(ready.ok && ready.value, `index not ready: ${JSON.stringify(ready)}`);
   return created.value;
+}
+
+// Collects the events of a subscription; `until` resolves with every event up to the first
+// that `wanted` accepts, and fails the test when none arrives in time.
+function collector() {
+  const events = [];
+  let waiter = null;
+  const check = () => {
+    if (!waiter) return;
+    const index = events.findIndex(waiter.wanted);
+    if (index >= 0) {
+      const { resolve } = waiter;
+      waiter = null;
+      resolve(events.slice(0, index + 1));
+    }
+  };
+  return {
+    events,
+    callback: (batch) => {
+      events.push(...batch);
+      check();
+    },
+    until(wanted) {
+      return new Promise((resolve, reject) => {
+        const timer = setTimeout(
+          () => reject(new Error(`no matching event; received ${JSON.stringify(events)}`)),
+          30_000,
+        );
+        waiter = {
+          wanted,
+          resolve: (seen) => {
+            clearTimeout(timer);
+            resolve(seen);
+          },
+        };
+        check();
+      });
+    },
+  };
 }
 
 const paths = (result) => {
@@ -134,6 +175,67 @@ describe("FileFinder over the shared service", { concurrency: 1 }, () => {
     } finally {
       child.stdin.end();
       await once(child, "exit");
+    }
+  });
+
+  it("delivers watch events in a program Node runs in watch mode", async () => {
+    const dir = tree("watched-events", { "a.txt": "a\n" });
+    const child = spawn(
+      process.execPath,
+      [
+        "--watch",
+        join(__dirname, "watch-one-change.mjs"),
+        dir,
+        join(dir, "b.txt"),
+        join(namespace.root, "watched-events.log"),
+      ],
+      {
+        env: { ...process.env, FFF_MCP_SERVICE_DIR: namespace.dir },
+        stdio: ["ignore", "pipe", "inherit"],
+      },
+    );
+    const lines = createInterface({ input: child.stdout });
+    const next = async () => String((await once(lines, "line"))[0]).trim();
+    try {
+      assert.equal(await next(), "watching");
+      writeFileSync(join(dir, "b.txt"), "b\n");
+      assert.equal(await next(), "heard");
+      assert.match(await next(), /^Completed running/);
+    } finally {
+      child.kill();
+      await once(child, "exit");
+    }
+  });
+
+  it("delivers watch events in a program whose flags make code an ES module", { timeout: 120_000 }, async () => {
+    const dir = tree("module-input-events", { "a.txt": "a\n" });
+    const helper = pathToFileURL(join(__dirname, "watch-one-change.mjs")).href;
+    const child = spawn(
+      process.execPath,
+      [
+        "--input-type=module",
+        "-e",
+        `process.argv.splice(1, 0, "-e"); await import(${JSON.stringify(helper)});`,
+        dir,
+        join(dir, "b.txt"),
+        join(namespace.root, "module-input-events.log"),
+      ],
+      {
+        env: { ...process.env, FFF_MCP_SERVICE_DIR: namespace.dir },
+        stdio: ["ignore", "pipe", "inherit"],
+      },
+    );
+    const lines = createInterface({ input: child.stdout });
+    const next = () => lineOrExit(child, lines);
+    try {
+      assert.equal(await next(), "watching");
+      writeFileSync(join(dir, "b.txt"), "b\n");
+      assert.equal(await next(), "heard");
+    } finally {
+      if (child.exitCode === null && child.signalCode === null) {
+        child.kill();
+        await once(child, "exit");
+      }
     }
   });
 
@@ -394,7 +496,6 @@ describe("FileFinder over the shared service", { concurrency: 1 }, () => {
   it("reports methods without a service equivalent as unavailable", async () => {
     const finder = await open(tree("unavailable", { "a.txt": "a\n" }));
     const results = {
-      watch: finder.watch(() => {}),
       trackQuery: finder.trackQuery("a", "a.txt"),
       getHistoricalQuery: finder.getHistoricalQuery(0),
       refreshGitStatus: finder.refreshGitStatus(),
@@ -528,6 +629,208 @@ describe("FileFinder over the shared service", { concurrency: 1 }, () => {
       assert.equal(refused.ok, false, outside);
       assert.equal(refused.code, ErrorCode.outsideScope, refused.error);
     }
+  });
+
+  it("watches the directory once subscribed and delivers batches on the event loop", async () => {
+    const dir = realpathSync(tree("watched", { "a.txt": "a\n", "src/b.rs": "fn b() {}\n" }));
+    const finder = await open(dir);
+    const all = collector();
+    const sources = collector();
+    const watched = await finder.watch(all.callback);
+    assert.ok(watched.ok, JSON.stringify(watched));
+    const scoped = await finder.watch("src/**", sources.callback, { ignore: ["src/gen"] });
+    assert.ok(scoped.ok, JSON.stringify(scoped));
+
+    writeFileSync(join(dir, "a.txt"), "changed\n");
+    await all.until((event) => event.path === join(dir, "a.txt") && event.kind === "modified");
+    mkdirSync(join(dir, "src", "gen"));
+    writeFileSync(join(dir, "src", "gen", "out.rs"), "\n");
+    writeFileSync(join(dir, "src", "c.rs"), "fn c() {}\n");
+    const seen = await sources.until((event) => event.path === join(dir, "src", "c.rs"));
+    assert.ok(
+      seen.every((event) => !event.path.includes("gen") && !event.path.endsWith("a.txt")),
+      JSON.stringify(seen),
+    );
+
+    // Once unsubscribed, a callback hears nothing; the other subscription still does.
+    watched.value();
+    const before = all.events.length;
+    writeFileSync(join(dir, "src", "d.rs"), "fn d() {}\n");
+    await sources.until((event) => event.path === join(dir, "src", "d.rs"));
+    assert.equal(all.events.length, before, JSON.stringify(all.events.slice(before)));
+    scoped.value();
+  });
+
+  it("reports repository state to subscriptions that ask for it", async () => {
+    const dir = realpathSync(tree("repository-state", { "a.txt": "a\n", "src/b.txt": "b\n" }));
+    execFileSync("git", ["-C", dir, "init", "-q"]);
+    const finder = await open(dir);
+    const state = collector();
+    const watched = await finder.watch(state.callback, { repository: true });
+    assert.ok(watched.ok, JSON.stringify(watched));
+    // A directory below the work tree hears the repository that contains it.
+    const below = await open(join(dir, "src"));
+    const contained = collector();
+    const belowWatched = await below.watch(contained.callback, { repository: true });
+    assert.ok(belowWatched.ok, JSON.stringify(belowWatched));
+    execFileSync("git", ["-C", dir, "add", "a.txt"]);
+    const seen = await state.until((event) => event.kind === "repository");
+    assert.equal(seen.at(-1).path, dir);
+    assert.ok(seen.every((event) => !event.path.includes(".git")), JSON.stringify(seen));
+    const heard = await contained.until((event) => event.kind === "repository");
+    assert.equal(heard.at(-1).path, dir);
+    watched.value();
+    belowWatched.value();
+  });
+
+  it("replaces what a callback falling behind could not take with one rescan", async () => {
+    const files = Object.fromEntries(Array.from({ length: 1500 }, (_, n) => [`f${n}.rs`, ""]));
+    const dir = realpathSync(tree("watch-behind", files));
+    const finder = await open(dir);
+    const heard = collector();
+    let blocked = false;
+    let firstBatch = 0;
+    const watched = await finder.watch((batch) => {
+      if (!blocked) {
+        blocked = true;
+        firstBatch = batch.length;
+        // Holds the event loop until the service indexed every change, so more than the
+        // package holds for one callback arrive meanwhile.
+        for (let n = 0; n < 1500; n++) writeFileSync(join(dir, `f${n}.rs`), "changed");
+        execFileSync(
+          process.execPath,
+          [join(__dirname, "wait-for-size.mjs"), dir, "f1499.rs", "7", join(namespace.root, "wait.log")],
+          { env: { ...process.env, FFF_MCP_SERVICE_DIR: namespace.dir }, stdio: "inherit" },
+        );
+      }
+      heard.callback(batch);
+    });
+    assert.ok(watched.ok, JSON.stringify(watched));
+    writeFileSync(join(dir, "first.rs"), "first");
+    const seen = await heard.until((event) => event.kind === "rescan" && event.path === dir);
+    // The batch that held the event loop, at most the limit after it, then the rescan.
+    assert.ok(seen.length - firstBatch - 1 <= 1024, `${seen.length - firstBatch - 1} events`);
+    writeFileSync(join(dir, "after.rs"), "after");
+    await heard.until((event) => event.path === join(dir, "after.rs"));
+    watched.value();
+  });
+
+  it("restarts delivery with a rescan when its worker exits", async () => {
+    const dir = realpathSync(tree("watch-restart", { "a.txt": "a\n" }));
+    const finder = await open(dir);
+    const heard = collector();
+    const watched = await finder.watch(heard.callback);
+    assert.ok(watched.ok, JSON.stringify(watched));
+    exitDeliveryWorkerForTest();
+    // The rescan follows once a new worker took over the instance's callback.
+    await heard.until((event) => event.kind === "rescan" && event.path === dir);
+    writeFileSync(join(dir, "after.txt"), "after");
+    await heard.until((event) => event.path === join(dir, "after.txt"));
+    watched.value();
+  });
+
+  it("ends a subscription whose directory is removed with a failed event", async () => {
+    const dir = realpathSync(tree("watch-removed", { "a.txt": "a\n" }));
+    const finder = await open(dir);
+    const heard = collector();
+    const watched = await finder.watch(heard.callback);
+    assert.ok(watched.ok, JSON.stringify(watched));
+    rmSync(dir, { recursive: true, force: true });
+    const [failed] = (await heard.until((event) => event.kind === "failed")).slice(-1);
+    assert.equal(failed.path, dir);
+    assert.equal(failed.code, ErrorCode.scopeUnavailable, failed.error);
+    // The subscription already ended; unsubscribing changes nothing.
+    watched.value();
+  });
+
+  it("subscribes without holding the native workers searches need", async () => {
+    const stoppedNamespace = disposableNamespace();
+    let stopped = null;
+    try {
+      const waiting = [];
+      for (let n = 0; n < 6; n++) {
+        const created = await FileFinder.create({
+          basePath: tree(`watch-waiting-${n}`, { "a.txt": "a\n" }),
+          ...stoppedNamespace.options,
+          timeoutMs: 10_000,
+        });
+        assert.ok(created.ok, created.error);
+        waiting.push(created.value);
+      }
+      [{ pid: stopped }] = stoppedNamespace.status().services;
+      process.kill(stopped, "SIGSTOP");
+      let settled = 0;
+      const watches = waiting.map((finder) =>
+        finder.watch(() => {}).then((result) => {
+          settled++;
+          return result;
+        }),
+      );
+      // Six subscriptions wait on a service that does not answer; another instance
+      // still opens and searches.
+      const finder = await open(tree("watch-not-waiting", { "b.txt": "b\n" }));
+      assert.deepEqual(paths(await finder.fileSearch("")), ["b.txt"]);
+      assert.equal(settled, 0, "a subscription settled before the search");
+      process.kill(stopped, "SIGCONT");
+      stopped = null;
+      for (const result of await Promise.all(watches)) {
+        if (result.ok) result.value();
+      }
+      for (const each of waiting) await each.destroy();
+    } finally {
+      if (stopped !== null) process.kill(stopped, "SIGCONT");
+      stoppedNamespace.cleanup();
+    }
+  });
+
+  it("ends subscriptions with destroy, and refuses watch without watching", async () => {
+    const dir = realpathSync(tree("watch-destroy", { "a.txt": "a\n" }));
+    const created = await FileFinder.create({ basePath: dir, ...namespace.options });
+    assert.ok(created.ok, created.error);
+    const finder = created.value;
+    const heard = collector();
+    const watched = await finder.watch(heard.callback);
+    assert.ok(watched.ok, JSON.stringify(watched));
+    const watchSessions = () =>
+      namespace
+        .status()
+        .services.flatMap((s) => s.sessions)
+        .filter((s) => s.kind === "watch" && s.scope === dir);
+    assert.equal(watchSessions().length, 1);
+    await finder.destroy();
+    // The service ends the session once it sees the connection close.
+    const deadline = Date.now() + 15_000;
+    while (watchSessions().length > 0) {
+      assert.ok(Date.now() < deadline, "the subscription's session outlived the instance");
+      await new Promise((resolve) => setTimeout(resolve, 50));
+    }
+    assert.equal(heard.events.length, 0, JSON.stringify(heard.events));
+    const after = await finder.watch(() => {});
+    assert.equal(after.code, ErrorCode.destroyed);
+
+    const snapshot = await open(tree("watch-disabled", { "a.txt": "a\n" }), { disableWatch: true });
+    const refused = await snapshot.watch(() => {});
+    assert.equal(refused.ok, false);
+    assert.equal(refused.code, ErrorCode.unavailable, refused.error);
+  });
+
+  it("lets a process with a subscription exit", async () => {
+    const dir = tree("watch-exit", { "a.txt": "a\n" });
+    const child = spawn(
+      process.execPath,
+      [join(__dirname, "watch-and-return.mjs"), dir, join(namespace.root, "exit.log")],
+      {
+        env: { ...process.env, FFF_MCP_SERVICE_DIR: namespace.dir },
+        stdio: ["ignore", "pipe", "inherit"],
+      },
+    );
+    let output = "";
+    child.stdout.on("data", (chunk) => {
+      output += chunk;
+    });
+    const [code] = await once(child, "exit");
+    assert.equal(code, 0);
+    assert.equal(output.trim(), "watching");
   });
 
   it("loads through CommonJS require as the same module", () => {

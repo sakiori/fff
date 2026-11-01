@@ -133,7 +133,9 @@ have been replaced, as by `rm -r d && mkdir d` or `mv d d.bak && mv new d`. The
 watcher walks it and replaces the entries below it in the same update as the
 rest of the batch: a file present before and after the replacement stays
 searchable throughout, files the new directory lacks leave the index, and a file
-moved out of it in the same batch is reported as renamed. A replaced directory
+moved out of it in the same batch is reported as renamed. A file the batch's own
+events name is reported as created or modified even when the walk finds it as
+the index holds it, as when a scan read the directory after it was replaced. A replaced directory
 that the ignore rules now exclude leaves the index, as it would after a scan.
 A directory the walk cannot read is left out as a full scan leaves it out;
 granting access to one again is an attribute change on it, which walks it again.
@@ -178,8 +180,8 @@ coexist, and a changed index binding invalidates the old ones.
 
 Programs reach the shared service through the `fff-service` library. A program
 session is opened like an MCP session, for a directory and index options, and
-follows the same index reuse rules; service status marks each session as `mcp`
-or `program`. After the service accepts it, the connection carries one request
+follows the same index reuse rules; service status marks each session as `mcp`,
+`program` or `watch`. After the service accepts it, the connection carries one request
 at a time as a big-endian 32-bit length followed by a MessagePack body, and the
 service answers each with one frame. Requests are file, directory and mixed
 fuzzy search, glob, grep and multi-grep, a readiness wait with a timeout of at
@@ -251,6 +253,95 @@ A write to a service that died fails the call instead of raising `SIGPIPE` in
 the host. A host program that starts a service collects it when it exits,
 without leaving a zombie process.
 
+A watch subscription is a session of its own: the program opens a connection
+with a watch hello naming its directory, index options, a pattern, ignore rules
+and whether it wants repository state, and the service answers `ready` once the
+session's index is ready and the subscription is registered with its watcher,
+so every change after the reply is delivered. The hello waits for the index
+without the handshake's limit, bounded by the caller's connect timeout. The
+service then only sends frames, each a batch of at most 128 events or a last
+one that ends the subscription with an error, and the program closing the
+connection ends the subscription and its session. An index without a watcher
+refuses the hello (`InvalidRequest`). A watch session binds only to an index
+whose watcher runs or is starting, and moves only to one whose watcher is
+ready. The service ends a subscription with an error when its directory is
+removed or its index's watcher stopped, which it checks every second, and when
+it cannot follow its session to another index. Events are those the
+index's watcher delivers to in-process subscribers, with the pattern and
+ignore rules relative to the subscription's directory, as
+`SharedFilePicker::watch_within` of the core applies them: created, modified,
+removed, renamed with the previous path, and rescan. Paths are relative to the
+subscription's directory; a rescan has an empty path. A rename across the
+directory's boundary arrives as a creation or a removal. A subscription that
+asks for repository state also receives a repository event when the watcher
+sees a change of the git state of a repository inside its directory or
+containing it that affects file status (the index, HEAD, its log, or a merge,
+cherry-pick or revert in progress), as the core's
+`SharedFilePicker::subscribe_repository_state` reports it for the index's own
+work tree and for every repository nested in the index that its ignore rules
+keep; its path is that work tree, relative when inside the directory and
+absolute when above it. Files under `.git` are never file events. A
+subscription at the root of a nested repository has an index of its own, as
+every session's index belongs to the repository containing its directory, so
+it hears only that repository and the ones nested in it.
+
+The core reads a repository's git state from its git dir: its `.git`
+directory, or the one its `.git` file names, as a linked worktree's and a
+submodule's do, which may lie outside the indexed tree. The index's own
+repository's git dir and its `logs` are watched; walks skip `.git`, so each
+walk also records the git dir of every repository it reaches, at the cost of
+one metadata read per walked directory, and watches it and its `logs` where the
+tree's watch does not cover it: always on backends that watch directory by
+directory, as on Linux, and outside the tree on recursive ones. A change in a
+`.git` directory names the repository whose git dir holds it, found among the
+recorded ones or by its shape (a `HEAD` beside `objects` or `commondir`), so
+the git dirs of linked worktrees and submodules inside a main repository's
+`.git` name their own work trees. A `.git` entry that appears in a directory
+the walk had already reached, as `git init` makes, gets the same watches at
+once. Each recorded git dir keeps its identity (device, inode and, where the
+file system records one, birth time): a git dir the walk meets for the first
+time, or that is another directory than the recorded one, as after a fresh
+clone or a worktree added anew, also within one batch, is watched again and
+gets a repository event once its watches are in place, since its state may
+have changed before them, as after a `git init` followed at once by
+`git add`. A known one is not watched again, which the polling backend would
+answer with a new snapshot that loses what changed since its last poll. A
+removal event of a recorded git dir, its work tree or a directory above them
+forgets the record, also when the path is back by the time the batch is read,
+so a file system that gives the new directory the old one's inode and records
+no birth time cannot hide it; the identity only decides when no removal was
+seen. A git dir's `logs`, which a fresh repository gains with the first update
+of HEAD, is watched when it appears, and its repository then gets a repository
+event. Repository events are collected from the whole
+batch before it is applied and delivered whatever becomes of its index
+update, also when it starts a rescan.
+
+The core calls every subscriber of an index on one thread, so the service's
+callback only queues: each subscription holds at most 4096 distinct paths,
+coalescing later changes of a queued path (a created or moved-in file that is
+modified afterwards stays created or renamed) and moving a replaced change to
+the end of the queue, so no path reads as present after a later change made it
+go, and a writer task sends them.
+A rename frees its source's slot, so later changes of the source follow it,
+and a removal of a queued rename's destination becomes a removal of its source
+in the rename's place followed by the destination's, so saving as editors do,
+moving the file aside and writing a new one, keeps its order.
+When a program reads slower than its files change, the queue is replaced by one
+rescan event, which also covers changes until it is sent, and the service keeps
+serving every other client. A rescan event also follows a rescan a program
+requests, the watcher's own rescans and a move of the session to another index,
+whose watcher the subscription then follows.
+
+`fff_service::watch::Subscription` is the client. Starting it returns at once;
+on a thread of the subscription it delivers `Ready` once the service answered
+`ready`, then batches, or `Failed` when it cannot be opened or ends for good.
+When its connection breaks, it reopens it with backoff from 100 milliseconds to
+5 seconds, starting the service when none runs, as opening a session does, and
+delivers a rescan event once subscribed again; a reconnect the service refuses,
+rather than one that cannot reach it, ends it with `Failed`. Dropping it ends
+the subscription; once the drop returns, nothing is delivered, unless it runs
+inside the delivery itself.
+
 ### C library and Node package
 
 `fff_create_service_instance` in the C library opens a program session for the
@@ -275,10 +366,29 @@ kind follows from the error the session or the service returns, which the
 program protocol already distinguishes. Search, glob, grep, scan, wait, scan progress, base path and health
 functions work on both kinds of instance and return the same result structs;
 the health check reports the git work tree from the session's repository state.
-Watching, query tracking and history, git status refresh and a restart in
-another directory fail on a service-backed instance with an error naming the
-call as unavailable over the shared service; a restart in the same directory is
-a rescan. Searches and greps have `_ex` variants (`_ex2` for the greps) that
+Query tracking and history, git status refresh and a restart in another
+directory fail on a service-backed instance with an error naming the call as
+unavailable over the shared service; a restart in the same directory is a
+rescan. `fff_set_watch_callback`, `fff_watch`, `fff_watch_args` and
+`fff_unwatch` open and end watch subscriptions of a service-backed instance's
+directory, one connection each, and deliver their batches with absolute paths
+through the instance's callback, from each subscription's thread; ids come from
+the core's sequence, so they never collide with in-process subscriptions.
+`fff_watch` returns at once; a batch of one event of kind
+`FFF_WATCH_EVENT_READY` (7) follows once the subscription is ready, or of kind
+`FFF_WATCH_EVENT_FAILED` (6) when it ends for good, whose
+`fff_watch_events_get_error` and `fff_watch_events_get_error_code` tell why;
+both name the instance's directory. The batch struct appends `error` and
+`error_code` for them, as it appended `rename_sources` before. On an instance
+created without `watch`, `fff_watch` fails with `FFF_ERROR_UNAVAILABLE`. Version 2 of `FffWatchOptions` appends `repository`
+in the struct's former tail padding, and `fff_watch_args_ex` takes it for
+bindings that pass flat arguments; repository events have the kind
+`FFF_WATCH_EVENT_REPOSITORY` (5), and an in-process instance refuses
+`repository` with `FFF_ERROR_UNAVAILABLE`. Version 1 options, the other kinds and every
+layout stay as they are. Once `fff_unwatch` returns on a service-backed
+instance, the callback is not called for that subscription again, unless
+`fff_unwatch` runs inside the callback; `fff_destroy` ends the instance's
+subscriptions before it returns. Searches and greps have `_ex` variants (`_ex2` for the greps) that
 exclude frecency per call, for either kind of instance. On a service-backed
 instance the integer offset of the grep functions continues only the
 instance's last grep page. `fff_service_call` sends one program request as
@@ -337,9 +447,39 @@ so importing it on a platform ffi-rs has no binary for still works and
 `notifyChanged(paths)` reports files the program changed, so that a search
 after it resolves sees them without the watcher or a rescan.
 `fileSearch`, `directorySearch`, `mixedSearch`, `glob`, `grep` and `multiGrep`
-take `excludeFrecency`. Searches, greps, scan state and waits go through
+take `excludeFrecency`. `watch(pattern?, callback, options?)` returns a
+Promise of the `Result` that upstream's synchronous `watch` returned, which
+resolves once the library reports the subscription ready, or to the error it
+failed with. Starting and ending a subscription are native calls that need no
+service and run on the calling thread, so a subscription waiting for its index
+holds none of the package's workers. The unsubscribe function it resolves to is
+synchronous: once it returns, the callback is not called again. A subscription
+that ends for good afterwards delivers a `failed` event carrying `error` and
+`code`. `destroy` ends every subscription of the instance, resolves pending
+ones as destroyed and calls no callback once it is called. `options.repository` asks for
+`repository` events, whose kind and options are the Node package's own
+`ServiceWatchEvent` and `ServiceWatchOptions`, so the API shared with fff-bun
+keeps its kinds. On an instance created with `disableWatch`, `watch` fails with
+`unavailable`. The library's callback is upstream's process-wide ffi-rs
+trampoline, but it lives on a worker thread of its own, which starts without
+the host's flags as the call workers do and which the package unrefs: an ffi-rs threadsafe function keeps its thread's event loop alive, so
+on the main thread a subscription would keep the process from exiting. That
+worker reads and frees each batch and posts its events to the main thread,
+where they reach the subscription's callback on the event loop; neither the
+worker nor a ready subscription keeps the process alive, while a subscription
+waiting to be ready does, as a call in flight does. The library never waits for
+the callback, so the worker bounds what waits on the event loop: past 1024
+events of one subscription that the main thread has not handled, it drops the
+subscription's events and, once the main thread has handled the rest, delivers
+one `rescan` in their place. When the worker exits, a new one takes over the
+instances' callbacks, and then every subscription hears a `rescan`, and one not
+ready yet fails. Tests make the worker exit through
+`exitDeliveryWorkerForTest` of `dist/watch-delivery.js`, a second bundle entry
+that shares its module state with the package's entry, which does not export
+it.
+Searches, greps, scan state and waits go through
 `fff_service_call`; `waitForScan`, `waitForIndexReady` and `getScanProgress`
-return the error of a service that went away. `watch`, `trackQuery`,
+return the error of a service that went away. `trackQuery`,
 `getHistoricalQuery` and `refreshGitStatus` return an error naming them as
 unavailable over the shared service, `reindex` rescans the instance's own
 directory, and `historyDbPath` is refused. `serviceDir`, or `FFF_MCP_SERVICE_DIR`, selects the namespace, and
@@ -354,14 +494,22 @@ other. It ships as an ES module whose CommonJS `require` entry is the same
 module, which needs Node 20.19 or 22.12 and later.
 
 `make prepare-node` builds the executable and the library in separate cargo
-invocations and stages them for the package's development build;
-`make test-node` runs the package's tests, each against a service in a
+invocations and stages them for the package's development
+build, each under a temporary name renamed over the old file, as
+`make stage-node-platform` does: on macOS, copying over a binary a running
+service maps gets the new one killed; `make test-node` runs the package's tests, each against a service in a
 disposable namespace with a temporary state directory, including overlapping
-calls on one and on several instances and a service stopped with `SIGSTOP`,
+calls on one and on several instances, watch subscriptions (delivery on the
+event loop, patterns and ignore rules, unsubscribing, repository state, the
+end of subscriptions with `destroy`, `unavailable` with `disableWatch`, a
+process that exits while subscribed, repository state below the work tree, a
+callback that falls behind, which gets at most 1024 events and then a rescan, a
+delivery worker that exits, a removed directory's `failed` event, delivery in
+a program run under `node --watch` or with `--input-type=module`, and searches
+that still run while six subscriptions wait on a stopped service), and a service stopped with `SIGSTOP`,
 whose calls fail within their bound while a timer keeps firing and, with more
-instances than workers, file reads keep their latency.
-`make stage-node-platform` copies the same build into the host's platform
-package.
+instances than workers, file reads keep their latency. `make stage-node-platform`
+copies the same build into the host's platform package.
 
 ### Building and running
 
@@ -483,7 +631,18 @@ spelled two ways, rescans and repository state, searches while the index
 builds, scan state while a search holds the index, a watched request beside a
 snapshot index, a build tag collision, a session that starts the service
 itself, a call that times out and the reconnect after it, a reconnect to a
-stopped service within the call's bound, and a namespace whose socket path
+stopped service within the call's bound, watch subscriptions (changes of the
+subscription's directory only, ignored and outside files, a rescan after a
+program's rescan, repository state only when asked, also below the work tree,
+a consumer that reads nothing while thousands of files change, which alone
+gets a rescan while one that reads keeps every change, the move to a broader
+index, a resubscription to a new service after the old one was killed, the end
+of a subscription whose directory is removed or whose reconnect is refused,
+the session's end with the subscription, repositories nested in another
+repository or a plain folder, each heard by its own subscription and the
+enclosing one, one initialised after the scan, one removed and created again,
+and linked worktrees, one removed and added again, and a submodule, whose
+`.git` is a file), and a namespace whose socket path
 exceeds the platform limit. In debug builds, `FFF_MCP_TEST_RUNTIME_DIR` replaces
 the runtime directories, so tests never write to the shared ones. In debug builds, indexes stay building
 while the file named by `FFF_MCP_TEST_HOLD_READINESS` exists, and program searches

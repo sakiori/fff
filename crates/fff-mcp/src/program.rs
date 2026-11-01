@@ -66,7 +66,7 @@ pub(crate) async fn serve(
 }
 
 // Resolves once the connection ends or fails, without consuming a request.
-async fn closed(recv: &mut BufReader<RecvHalf>) {
+pub(crate) async fn closed(recv: &mut BufReader<RecvHalf>) {
     match recv.fill_buf().await {
         Ok([]) | Err(_) => {}
         Ok(_) => std::future::pending().await,

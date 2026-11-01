@@ -30,13 +30,13 @@
 
 use crate::FFFStringStorage;
 use crate::constants::{MAX_OVERFLOW_FILES, PATH_BUF_SIZE};
-use crate::coverage::CoverageListeners;
 use crate::error::Error;
 use crate::frecency::{FrecencyReader, FrecencyTracker};
 use crate::git::{GitDiscovery, GitStatusCache};
 use crate::git_recency::{self, GitRecencyConfig};
 use crate::grep::{GrepResult, GrepSearchOptions, grep_search, multi_grep_search};
 use crate::index::{BigramFilter, BigramOverlay};
+use crate::listeners::CoverageListeners;
 use crate::query_tracker::QueryTracker;
 use crate::scan::{ScanConfig, ScanJob, ScanSignals};
 use crate::scope::{ResolvedScope, ScopeBase, ScopeCache, SearchScope};
@@ -1040,7 +1040,7 @@ impl FilePicker {
             *guard = Some(picker);
             // dropping old picker flips its `cancelled` flag → bg threads exit cleanly
         }
-        shared_picker.coverage_listeners().notify();
+        shared_picker.coverage_listeners().notify(&());
 
         ScanJob::new_initial(
             shared_picker,
@@ -1095,7 +1095,7 @@ impl FilePicker {
         )?;
 
         self.replace_sync(sync);
-        self.coverage.notify();
+        self.coverage.notify(&());
 
         if !self.has_explicit_cache_budget {
             let file_count = self.sync_data.files().len();
@@ -1615,7 +1615,7 @@ impl FilePicker {
         }
         self.replace_sync(sync);
         self.cache_budget.reset();
-        self.coverage.notify();
+        self.coverage.notify(&());
     }
 
     // Applies a dir-table change and reports it when the set of live dirs changed.
@@ -1623,7 +1623,7 @@ impl FilePicker {
         let live_dirs = self.sync_data.live_dirs_count;
         let result = update(&mut self.sync_data);
         if self.sync_data.live_dirs_count != live_dirs {
-            self.coverage.notify();
+            self.coverage.notify(&());
         }
         result
     }

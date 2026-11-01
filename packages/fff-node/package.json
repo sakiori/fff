@@ -20,7 +20,7 @@
   ],
   "scripts": {
     "build": "npm run build:bundle && npm run build:types",
-    "build:bundle": "tsup src/index.ts --format esm --platform node --target node20 --external ffi-rs --sourcemap",
+    "build:bundle": "tsup src/index.ts src/watch-delivery.ts --format esm --platform node --target node20 --external ffi-rs --sourcemap",
     "build:types": "tsc -p tsconfig.build.json",
     "test": "node --test --test-concurrency=1 test/e2e.mjs test/service.mjs",
     "typecheck": "tsc --noEmit"

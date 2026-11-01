@@ -89,4 +89,11 @@ export {
   getServiceExecutableFilename,
   getTriple,
 } from "./platform.js";
-export type { FrecencyOptions, ServiceInitOptions } from "./service-options.js";
+export type {
+  FrecencyOptions,
+  ServiceInitOptions,
+  ServiceWatchBatchCallback,
+  ServiceWatchEvent,
+  ServiceWatchEventKind,
+  ServiceWatchOptions,
+} from "./service-options.js";

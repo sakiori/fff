@@ -11,6 +11,7 @@ mod scope;
 mod server;
 mod service;
 mod shared_index;
+mod subscription;
 mod update_check;
 mod view;
 

@@ -462,7 +462,7 @@ impl Context {
             Ok(request) => request,
             Err(error) => return send_message(&mut send, &Reply::Error { error }).await,
         };
-        let (scope, options, kind) = match request {
+        let (scope, options, kind, subscription) = match request {
             Request::Status => return send_message(&mut send, &Reply::Status(self.status())).await,
             Request::Stop => {
                 let reply = match self.stop().await {
@@ -471,8 +471,21 @@ impl Context {
                 };
                 return send_message(&mut send, &reply).await;
             }
-            Request::Session { scope, options } => (scope, options, SessionKind::Mcp),
-            Request::Program { scope, options } => (scope, options, SessionKind::Program),
+            Request::Session { scope, options } => (scope, options, SessionKind::Mcp, None),
+            Request::Program { scope, options } => (scope, options, SessionKind::Program, None),
+            Request::Watch {
+                scope,
+                options,
+                subscription,
+            } => {
+                if !options.watch {
+                    let error = ServiceError::InvalidRequest {
+                        reason: "a watch subscription needs an index with a watcher".into(),
+                    };
+                    return send_message(&mut send, &Reply::Error { error }).await;
+                }
+                (scope, options, SessionKind::Watch, Some(subscription))
+            }
         };
         let registered = match self.activity.try_lease() {
             Ok(lease) => self.registry.register(scope, options, kind, lease).await,
@@ -482,6 +495,9 @@ impl Context {
             Ok(session) => session,
             Err(error) => return send_message(&mut send, &Reply::Error { error }).await,
         };
+        if let Some(subscription) = subscription {
+            return crate::subscription::serve(session, subscription, recv, send).await;
+        }
         let warnings = session.snapshot().index.warnings.clone();
         send_message(&mut send, &Reply::Ready { warnings }).await?;
         if kind == SessionKind::Program {

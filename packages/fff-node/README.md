@@ -117,13 +117,26 @@ await finder.notifyChanged(["src/new.ts", "src/old.ts"]);
 
 Paths are absolute or relative to the instance's directory and must lie inside it (`outsideScope` otherwise). When the Promise resolves, every reported file that exists is in the index unless ignored, and every one that no longer exists is gone. Report files rather than directories: only an index with a watcher walks a new directory, and later. A changed `.gitignore` or `.ignore` triggers a rescan. No rescan runs otherwise. While the index is still scanning, the changes are applied when the scan finishes.
 
+## Watching for changes
+
+`watch` subscribes to the changes the service's watcher sees under the instance's directory, without a watcher of your own. Its Promise resolves once every later change is delivered, to a function that ends the subscription:
+
+```typescript
+const watched = await finder.watch("src/**", (events) => {
+  for (const event of events) console.log(event.kind, event.path);
+}, { ignore: ["src/generated"], repository: true });
+if (watched.ok) watched.value(); // unsubscribe
+```
+
+The pattern and the `ignore` entries are globs, exact paths or directories relative to the instance's directory; without a pattern the whole directory is watched. Ignored files never produce events. Batches reach the callback on the event loop with absolute paths and the kinds `created`, `modified`, `removed`, `renamed` (with `from`) and `rescan`. A `rescan`, naming the instance's directory, replaces changes that could not be delivered: when the callback falls behind, after a rescan of the index, or after the connection to the service broke, which the subscription reopens by itself. Re-read whatever you derive from the directory when one arrives. With `repository: true`, a `repository` event names the work tree whenever the git state of a repository inside the instance's directory, or containing it, changes, as `git add`, a commit or a checkout do; files under `.git` never appear as file events. A callback that falls behind by more than 1024 events gets one `rescan` for what it missed. A `failed` event, carrying `error` and `code`, ends a subscription the service can no longer serve, as after its directory was removed. Once the unsubscribe function returns, or `destroy` was called, the callback is not called again. A ready subscription does not keep the process alive, and a pending one holds none of the package's workers. On an instance created with `disableWatch`, `watch` fails with `unavailable`.
+
 ## Timeouts
 
 A service that does not answer makes `FileFinder.create` fail after 90 seconds and each call after 30 seconds, plus the time a call asks for itself, such as a grep's `timeBudgetMs`. `timeoutMs` in `FileFinder.create` replaces both bounds. A bound starts when one of the package's four native workers runs the call, so with more instances waiting on an unresponsive service a call can first wait for a free worker; `healthCheck` makes two calls and can take up to twice the bound. A call that times out, or finds the service gone, fails with the reason, and so do the calls already waiting behind it on the same instance; the instance's next call opens a new session, starting the service again if needed, within its own bound. A busy service cannot be told from a hung one, so give a grep that may take longer than the bound a `timeBudgetMs`. `destroy` always frees the instance, also after its service was lost.
 
 ## Unavailable methods
 
-`watch`, `trackQuery`, `getHistoricalQuery` and `refreshGitStatus` have no shared service equivalent and return an error naming them as unavailable over the shared service; the service keeps the index and git status current itself. `reindex` rescans the instance's own directory; create a new instance for another directory. `historyDbPath` is not supported.
+`trackQuery`, `getHistoricalQuery` and `refreshGitStatus` have no shared service equivalent and return an error naming them as unavailable over the shared service; the service keeps the index and git status current itself. `reindex` rescans the instance's own directory; create a new instance for another directory. `historyDbPath` is not supported.
 
 ## API Reference
 

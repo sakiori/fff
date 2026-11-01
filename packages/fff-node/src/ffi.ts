@@ -31,6 +31,12 @@ import type { FieldType, JsExternal } from "ffi-rs";
 import { findNativeFiles, type NativeFiles } from "./binary.js";
 import { ErrorCode, err, nativeErrorCode, type Result } from "./errors.js";
 import { closeNativePool, type NativeReply, type NativeSetup, runNative } from "./native-pool.js";
+import {
+  closeWatchDelivery,
+  type DeliverySetup,
+  forgetWatchCallback,
+  registerWatchCallback,
+} from "./watch-delivery.js";
 
 const LIBRARY_KEY = "fff_c";
 
@@ -224,6 +230,36 @@ function callStringSync(
 }
 
 /**
+ * Call a function returning FffResult with its value in `int_value`, on the
+ * calling thread, for calls that need no service.
+ */
+function callIntSync(
+  funcName: string,
+  paramsType: FieldType[],
+  paramsValue: unknown[],
+): Result<number> {
+  const library = loadLibrary();
+  if (!library.ok) return library;
+  const rawPtr = ffi().load({
+    library: LIBRARY_KEY,
+    funcName,
+    retType: ffi().DataType.External,
+    paramsType,
+    paramsValue,
+    freeResultMemory: false,
+  }) as JsExternal;
+  const [struct] = ffi().restorePointer({
+    retType: [resultStruct()],
+    paramsValue: ffi().wrapPointer([rawPtr]),
+  }) as unknown as [FffResultRaw];
+  const failed = struct.success === 0;
+  const error = failed ? readCString(struct.error) : null;
+  const value = Number(struct.int_value);
+  freeWith("fff_free_result", rawPtr);
+  return failed ? err(error || "Unknown error", nativeErrorCode(value)) : { ok: true, value };
+}
+
+/**
  * Convert snake_case keys to camelCase recursively
  */
 function snakeToCamel(obj: unknown): unknown {
@@ -301,7 +337,10 @@ export async function ffiCreate(
  */
 export async function ffiDestroy(handle: NativeHandle): Promise<void> {
   const destroyed = await runOnWorker("destroy", [handle]);
-  if (destroyed.ok) liveInstances--;
+  if (destroyed.ok) {
+    liveInstances--;
+    forgetWatchCallback(handle);
+  }
 }
 
 /**
@@ -320,6 +359,52 @@ export async function ffiServiceCall<T>(
   } catch (error) {
     return err(`Cannot decode the service reply: ${String(error)}`);
   }
+}
+
+/**
+ * Point the instance's watch callback at the delivery worker.
+ */
+export function ffiRegisterWatchCallback(handle: NativeHandle): Promise<Result<void>> {
+  const library = loadLibrary();
+  if (!library.ok) return Promise.resolve(library);
+  return registerWatchCallback(deliverySetup, handle);
+}
+
+/**
+ * Start a subscription to the changes under an instance's directory, on the
+ * calling thread: the library returns its watch id at once and reports
+ * readiness through the callback. No call on the instance may free it meanwhile.
+ */
+export function ffiWatchStart(
+  handle: NativeHandle,
+  pattern: string,
+  ignore: string[],
+  repository: boolean,
+): Result<number> {
+  const { DataType } = ffi();
+  return callIntSync(
+    "fff_watch_args_ex",
+    [DataType.BigInt, DataType.String, DataType.StringArray, DataType.U32, DataType.Boolean],
+    [handle, pattern, ignore, ignore.length, repository],
+  );
+}
+
+/**
+ * End a subscription on the calling thread; the library stops delivering to it first.
+ *
+ * The library joins the subscription's thread before it returns, which cannot hold up
+ * the event loop for long: that thread waits only where the end of the subscription
+ * interrupts it (reading the service, backing off, reconnecting), and its delivery
+ * into the callback queues a batch for the delivery worker without waiting for it.
+ */
+export function ffiUnwatch(handle: NativeHandle, watchId: number): Result<number> {
+  const { DataType } = ffi();
+  return callIntSync("fff_unwatch", [DataType.BigInt, DataType.U64], [handle, watchId]);
+}
+
+function deliverySetup(): DeliverySetup {
+  const { ffiPath, library } = nativeSetup();
+  return { ffiPath, library };
 }
 
 /**
@@ -396,10 +481,12 @@ export function isAvailable(): boolean {
 }
 
 /**
- * Close the library and stop the worker threads that call it. Call this when
- * completely done with the library; instances must have been destroyed.
+ * Close the library and stop the worker threads that call it and deliver watch
+ * events. Call this when completely done with the library; instances must have
+ * been destroyed.
  */
 export async function closeLibrary(): Promise<void> {
+  await closeWatchDelivery();
   await closeNativePool();
   if (loaded) {
     ffi().close(LIBRARY_KEY);
