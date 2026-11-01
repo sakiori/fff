@@ -114,10 +114,35 @@ admitted rescan satisfies it. A file that disappears before it is indexed does
 not trigger a rescan. When the watcher walks a directory that is already
 indexed, which happens after an event for the directory itself, subscribers
 receive `Created` for files that were not indexed, `Modified` for indexed files
-whose size or modification time changed, and nothing for unchanged files;
-upstream reported every file of the walk as created. Files of a directory
+whose size or modification time changed, also to an older time, and nothing for
+unchanged files; upstream reported every file of the walk as created and kept
+the newest modification time it had seen. A walk leaves a file as it is when its
+inode, size and modification time match the index, so the index holds what it
+read from that very file; a file in a replaced directory is usually a new inode
+and is read again. Filesystems such as ext4 and xfs reuse freed inode numbers
+quickly, so a file regenerated within the same second with the same size can
+keep the content the index read before until it changes again. Upstream read
+every file of the walk again. On platforms without inode numbers every file of
+the walk is read again. Files of a directory
 created while a scan runs are indexed by that scan, so the walk that follows
 does not report them again, as with the events the scan holds.
+
+An indexed directory, the index's root included, that is reported as removed,
+created or renamed and is a directory when the watcher applies the event may
+have been replaced, as by `rm -r d && mkdir d` or `mv d d.bak && mv new d`. The
+watcher walks it and replaces the entries below it in the same update as the
+rest of the batch: a file present before and after the replacement stays
+searchable throughout, files the new directory lacks leave the index, and a file
+moved out of it in the same batch is reported as renamed. A replaced directory
+that the ignore rules now exclude leaves the index, as it would after a scan.
+A directory the walk cannot read is left out as a full scan leaves it out;
+granting access to one again is an attribute change on it, which walks it again.
+One removed while the walk runs gets no files, and its own entry leaves with its
+removal event. A file replaced by a
+directory, and a directory replaced by a file, leave the index with their
+entries. Upstream emptied the subtree on a removal and indexed it again
+afterwards, so searches in between found none of its files, and on a rename only
+added the new directory's files, so the old ones stayed.
 
 Changes made while an index scans are not lost. Every scan subscribes to
 filesystem events before it walks the tree, holds the events that arrive during

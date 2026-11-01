@@ -39,7 +39,7 @@ pub(crate) fn walk_collect_files(
         .options(flags)
         .threads(threads)
         // Bulk-fetch the only metadata FileItem needs; zlob never stats more.
-        .metadata(WalkMetadata::SIZE | WalkMetadata::MTIME);
+        .metadata(WalkMetadata::SIZE | WalkMetadata::MTIME | WalkMetadata::INODE);
 
     if !is_git_repo && let Err(e) = builder.extra_ignore(&ignored_dir_globs().collect::<Vec<_>>()) {
         // Interior NUL in one of the extra_ignore patterns would fail
@@ -107,13 +107,14 @@ pub(crate) fn walk_collect_files(
         let is_binary = is_known_binary_extension_basename(basename)
             && (!is_ambiguous_binary_name(basename) || starts_with_binary_content(entry.path()));
 
-        let (size, modified) = match target {
+        let (size, modified, ino) = match target {
             Some(meta) => (
                 meta.len(),
                 meta.modified()
                     .ok()
                     .and_then(|t| t.duration_since(SystemTime::UNIX_EPOCH).ok())
                     .map_or(0, |d| d.as_secs()),
+                crate::types::inode_bits(&meta),
             ),
             // zlob reports mtime in ns since the Unix epoch; FileItem wants secs.
             None => (
@@ -122,10 +123,12 @@ pub(crate) fn walk_collect_files(
                     .modified_ns()
                     .map(|ns| (ns / 1_000_000_000).max(0) as u64)
                     .unwrap_or(0),
+                entry.inode().map_or(0, |ino| ino as u32),
             ),
         };
 
         let mut item = FileItem::new_raw(basename_offset as u16, size, modified, None, is_binary);
+        item.ino = ino;
         item.mark_definition_language(basename);
 
         let mut guard = collected.lock();

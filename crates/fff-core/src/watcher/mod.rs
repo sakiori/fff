@@ -1,6 +1,8 @@
 mod background_watcher;
 pub use background_watcher::*;
 
+mod dir_walk;
+
 mod held_events;
 pub(crate) use held_events::{EventHold, Released};
 

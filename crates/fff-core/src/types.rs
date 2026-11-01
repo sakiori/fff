@@ -267,6 +267,8 @@ pub struct FileItem {
     pub git_status: Option<git2::Status>,
     pub(crate) path: crate::simd_path::ChunkedString,
     pub(crate) parent_dir_index: u32,
+    // Low bits of the inode the metadata came from, 0 where unknown; fits the padding.
+    pub(crate) ino: u32,
     flags: AtomicU8,
     /// Lazy mmap cache (boxed, set once). Only populated by the actual file
     /// read, controlled by the budget. Null while empty.
@@ -286,6 +288,7 @@ impl Clone for FileItem {
         Self {
             path: self.path.clone(),
             parent_dir_index: self.parent_dir_index,
+            ino: self.ino,
             size: self.size,
             modified: self.modified,
             access_frecency_score: self.access_frecency_score,
@@ -331,6 +334,7 @@ impl FileItem {
         Self {
             path,
             parent_dir_index: u32::MAX,
+            ino: 0,
             size,
             modified,
             access_frecency_score: 0,
@@ -390,12 +394,6 @@ impl FileItem {
 
     pub(crate) fn relative_path_eq(&self, arena: ArenaPtr, other: &str) -> bool {
         self.path.equals(arena, other)
-    }
-
-    pub(crate) fn relative_path_starts_with(&self, arena: ArenaPtr, prefix: &str) -> bool {
-        let mut buf = [0u8; PATH_BUF_SIZE];
-        let path = self.path.read_to_buf(arena, &mut buf);
-        path.starts_with(prefix)
     }
 
     /// Write `base_path + '/' + relative_path` into `buf` and return it
@@ -720,9 +718,8 @@ impl FileItem {
         modified_secs: Option<u64>,
         new_size: Option<u64>,
     ) {
-        if let Some(modified) = modified_secs
-            && self.modified < modified
-        {
+        // As on disk, also when older: a file replaced by an older copy is a change too.
+        if let Some(modified) = modified_secs {
             self.modified = modified;
         }
 
@@ -1140,6 +1137,19 @@ impl ContentCacheBudget {
 impl Default for ContentCacheBudget {
     fn default() -> Self {
         Self::new_for_repo(30_000)
+    }
+}
+
+// The low bits of a file's inode number, or 0 where the platform has none.
+pub(crate) fn inode_bits(metadata: &std::fs::Metadata) -> u32 {
+    #[cfg(unix)]
+    {
+        std::os::unix::fs::MetadataExt::ino(metadata) as u32
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = metadata;
+        0
     }
 }
 

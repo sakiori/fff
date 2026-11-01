@@ -523,6 +523,7 @@ impl FileItem {
             .unwrap_or(0) as u16;
 
         let mut item = Self::new_raw(filename_start, size, modified, git_status, is_binary);
+        item.ino = metadata.map_or(0, crate::types::inode_bits);
         item.mark_definition_language(&relative_path);
         (item, relative_path)
     }
@@ -551,7 +552,10 @@ impl FileItem {
             None => (0, 0),
         };
 
-        Self::new_from_walk_parts(path, base_path, git_status, size, modified)
+        let (mut item, rel) =
+            Self::new_from_walk_parts(path, base_path, git_status, size, modified);
+        item.ino = metadata.map_or(0, crate::types::inode_bits);
+        (item, rel)
     }
 
     /// Like [`Self::new_from_walk`] but takes already-extracted size and
@@ -691,6 +695,7 @@ pub struct FilePicker {
     pub mode: FFFMode,
     pub base_path: PathBuf,
     sync_data: FileSync,
+    sync_generation: u64,
     coverage: Arc<CoverageListeners>,
     pub(crate) signals: ScanSignals,
     pub(crate) background_watcher: Option<BackgroundWatcher>,
@@ -962,6 +967,7 @@ impl FilePicker {
             mode: options.mode,
             scanned_files_count: Arc::new(AtomicUsize::new(0)),
             sync_data: FileSync::new(),
+            sync_generation: next_sync_generation(),
             coverage: Arc::default(),
             enable_mmap_cache: options.enable_mmap_cache,
             enable_content_indexing: options.enable_content_indexing,
@@ -1088,7 +1094,7 @@ impl FilePicker {
             None,
         )?;
 
-        self.sync_data = sync;
+        self.replace_sync(sync);
         self.coverage.notify();
 
         if !self.has_explicit_cache_budget {
@@ -1607,7 +1613,7 @@ impl FilePicker {
         if self.enable_content_indexing {
             sync.bigram_overlay = Some(new_bigram_overlay(sync.indexable_count));
         }
-        self.sync_data = sync;
+        self.replace_sync(sync);
         self.cache_budget.reset();
         self.coverage.notify();
     }
@@ -1826,6 +1832,7 @@ impl FilePicker {
             .map(|d| d.as_secs());
 
         file.update_metadata(&self.cache_budget, modified_time, Some(size));
+        file.ino = crate::types::inode_bits(&metadata);
 
         // Re-classify binary status from current content (chunked, fixed
         // buffer). Already-binary files are left alone.
@@ -2018,37 +2025,95 @@ impl FilePicker {
     fn remove_all_files_in_dirs_inner<'a>(
         &mut self,
         dirs: impl IntoIterator<Item = &'a Path>,
+        callback: Option<&mut dyn FnMut(&Path)>,
+    ) -> usize {
+        let prefixes = dirs
+            .into_iter()
+            .enumerate()
+            .filter_map(|(owner, dir)| Some((self.dir_prefix(dir)?, owner)))
+            .collect();
+        self.tombstone_under(prefixes, |_, _| false, |_, _| false, callback)
+    }
+
+    // Tombstones what the index holds in each of `dirs`, them included, that the keep
+    // predicates reject, in one pass. They get the position of the owning dir in `dirs` and
+    // a '/'-canonical relative path, dirs ending with '/'. `dirs` must not nest.
+    pub(crate) fn retain_in_dirs(
+        &mut self,
+        dirs: &[&Path],
+        keep_file: impl Fn(usize, &str) -> bool,
+        keep_dir: impl Fn(usize, &str) -> bool,
+        mut on_removed: impl FnMut(&Path),
+    ) -> usize {
+        let prefixes = dirs
+            .iter()
+            .enumerate()
+            .filter_map(|(owner, dir)| Some((self.dir_prefix(dir)?, owner)))
+            .collect();
+        self.tombstone_under(prefixes, keep_file, keep_dir, Some(&mut on_removed))
+    }
+
+    // Whether `dir` has a live entry, so the index may hold files below it.
+    pub(crate) fn knows_dir(&self, dir: &Path) -> bool {
+        match self.dir_prefix(dir) {
+            Some(prefix) if prefix.is_empty() => true,
+            Some(prefix) => self
+                .sync_data
+                .find_dir_index(&prefix)
+                .and_then(|index| self.sync_data.dirs.get(index))
+                .is_some_and(|dir| !dir.is_deleted()),
+            None => false,
+        }
+    }
+
+    // Identifies the snapshot the index was built from; every scan's commit changes it.
+    pub(crate) fn sync_generation(&self) -> u64 {
+        self.sync_generation
+    }
+
+    fn replace_sync(&mut self, sync: FileSync) {
+        self.sync_data = sync;
+        self.sync_generation = next_sync_generation();
+    }
+
+    fn dir_prefix(&self, dir: &Path) -> Option<String> {
+        let relative = self.to_relative_path(dir)?;
+        // Stored relative paths are '/'-canonical on every platform.
+        Some(if relative.is_empty() {
+            String::new()
+        } else {
+            format!("{relative}/")
+        })
+    }
+
+    fn tombstone_under(
+        &mut self,
+        mut prefixes: Vec<(String, usize)>,
+        keep_file: impl Fn(usize, &str) -> bool,
+        keep_dir: impl Fn(usize, &str) -> bool,
         mut callback: Option<&mut dyn FnMut(&Path)>,
     ) -> usize {
-        let mut dir_prefixes = Vec::new();
-        for dir_path in dirs {
-            let Some(relative_dir) = self
-                .to_relative_path(dir_path)
-                .map(|path| path.into_owned())
-            else {
-                continue;
-            };
-
-            if relative_dir.is_empty() {
-                dir_prefixes.push(String::new());
-            } else {
-                // Stored relative paths are '/'-canonical on every platform.
-                dir_prefixes.push(format!("{relative_dir}/"));
-            }
-        }
-
-        if dir_prefixes.is_empty() {
+        if prefixes.is_empty() {
             return 0;
         }
+        // Sorted and not nested, the greatest prefix not above a path is the only one
+        // that can own it.
+        prefixes.sort_unstable();
+        prefixes.dedup_by(|nested, outer| nested.0.starts_with(outer.0.as_str()));
+        let owner = |rel: &str| {
+            let index = prefixes.partition_point(|(prefix, _)| prefix.as_str() <= rel);
+            let (prefix, owner) = prefixes.get(index.checked_sub(1)?)?;
+            rel.starts_with(prefix.as_str()).then_some(*owner)
+        };
 
         let base_path = self.base_path.clone();
         let cache_budget = &self.cache_budget;
+        let mut rel_buf = [0u8; crate::simd_path::PATH_BUF_SIZE];
         let mut path_buf = [0u8; crate::simd_path::PATH_BUF_SIZE];
         let tombstoned = self.sync_data.tombstone_files_with_arena(
             |file, arena| {
-                dir_prefixes
-                    .iter()
-                    .any(|prefix| file.relative_path_starts_with(arena, prefix))
+                let rel = file.path.read_to_buf(arena, &mut rel_buf);
+                owner(rel).is_some_and(|owner| !keep_file(owner, rel))
             },
             |file, arena| {
                 file.invalidate_mmap(cache_budget);
@@ -2058,13 +2123,12 @@ impl FilePicker {
             },
         );
 
-        // The whole subtree is gone: tombstone the dirs too so directory
-        // search stops surfacing them.
+        // Dirs follow their files out so directory search stops surfacing them.
         let mut dir_buf = [0u8; crate::simd_path::PATH_BUF_SIZE];
         self.update_dirs(|sync| {
             sync.tombstone_dirs_with_arena(|dir, arena| {
                 let rel = dir.read_relative_path(arena, &mut dir_buf);
-                dir_prefixes.iter().any(|prefix| rel.starts_with(prefix))
+                owner(rel).is_some_and(|owner| !keep_dir(owner, rel))
             })
         });
 
@@ -2295,6 +2359,7 @@ impl FileSync {
             dirs: mut walked_dirs,
             mut pairs,
             ignore_rules,
+            ..
         } = crate::walk::walk_collect_files(
             base_path,
             None,
@@ -2667,6 +2732,12 @@ pub(crate) fn hint_allocator_collect() {
         // Main thread too.
         unsafe { libmimalloc_sys::mi_collect(true) };
     }
+}
+
+// Unique across pickers, so a picker that replaced another never repeats its value.
+fn next_sync_generation() -> u64 {
+    static GENERATION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    GENERATION.fetch_add(1, Ordering::Relaxed) + 1
 }
 
 fn new_bigram_overlay(indexable_count: usize) -> Arc<parking_lot::RwLock<BigramOverlay>> {

@@ -1,3 +1,4 @@
+use super::dir_walk::{DirWalk, ReplacedDirs};
 use crate::constants::MAX_OVERFLOW_FILES;
 use crate::error::Error;
 use crate::file_picker::{FFFMode, FilePicker, IndexUpdateError};
@@ -9,7 +10,7 @@ use crate::sort_buffer::sort_with_buffer;
 use crate::walk::DirHook;
 use crate::watch::{RawWatchEvent, WatchEventKind};
 use git2::Repository;
-use notify::event::{AccessKind, AccessMode, ModifyKind, RenameMode};
+use notify::event::{AccessKind, AccessMode, ModifyKind, RemoveKind, RenameMode};
 use notify::{Config, EventKind, EventKindMask, RecursiveMode};
 use notify_debouncer_full::{DebounceEventResult, DebouncedEvent, NoCache, new_debouncer_opt};
 use parking_lot::Mutex;
@@ -447,10 +448,11 @@ pub(crate) fn handle_debounced_events(
     let repo = git_workdir.as_ref().and_then(|p| Repository::open(p).ok());
     // Prefer the walker's own ignore rules (zlob); grab a cheap Arc clone once
     // per batch so we don't hold the picker lock during filtering.
-    let walker_rules = shared_picker
+    let (walker_rules, follow_symlinks) = shared_picker
         .read()
         .ok()
-        .and_then(|g| g.as_ref().and_then(|p| p.ignore_rules()));
+        .and_then(|g| g.as_ref().map(|p| (p.ignore_rules(), p.follows_symlinks())))
+        .unwrap_or((None, false));
     let filter = IgnoreFilter::new(base_path, walker_rules, repo.as_ref());
     let mut need_full_git_rescan = false;
     let mut batch_overflow_attempted = false;
@@ -458,11 +460,28 @@ pub(crate) fn handle_debounced_events(
     let mut dirs_to_remove: Vec<PathBuf> = Vec::new();
     let mut paths_to_add_or_modify = Vec::new();
     let mut new_dirs_to_watch = Vec::new();
+    let mut dirs_to_reconcile: Vec<PathBuf> = Vec::new();
     let mut affected_paths_count = 0usize;
     let mut explicit_renames: Vec<(PathBuf, PathBuf)> = Vec::new();
 
     let watch_registry = shared_picker.watch_registry();
     let need_events_propagation = watch_registry.is_active();
+
+    // Whether the index holds `path` as a directory, and as a live file.
+    let indexed_as = |path: &Path| {
+        shared_picker
+            .read()
+            .ok()
+            .and_then(|guard| {
+                guard.as_ref().map(|picker| {
+                    let file = picker
+                        .get_file_by_path(path)
+                        .is_some_and(|file| !file.is_deleted());
+                    (picker.knows_dir(path), file)
+                })
+            })
+            .unwrap_or((false, false))
+    };
 
     let try_trigger_full_rescan = |reason: RescanReason| -> bool {
         request_rescan(shared_picker, shared_frecency, base_path, reason)
@@ -548,53 +567,71 @@ pub(crate) fn handle_debounced_events(
                 continue;
             }
 
-            // Use a combination of event kind and filesystem state to decide
-            // whether a path is an addition/modification or a removal.
+            // The event kind says which path changed, the filesystem what it is now.
             //
-            // We cannot rely on `path.exists()` alone because:
-            //   - A freshly created file might not be visible yet (race).
-            //   - macOS FSEvents uses Modify(Name(Any)) for both rename-in
-            //     and rename-out, so we must stat the path to disambiguate.
-            //
-            // We cannot rely on event kind alone because:
-            //   - Remove events are not always emitted (macOS often sends
-            //     Modify(Name(Any)) instead of Remove).
-            let is_removal = matches!(debounced_event.event.kind, EventKind::Remove(_));
-
-            // Directory-level remove: both fsevents and inotify delivers a single
-            // `Remove(Folder)` event for a whole directory tree (e.g.
-            // after `git reset --hard` wipes a dir full of staged-but-
-            // uncommitted files).
-            let is_folder_removal = matches!(
-                debounced_event.event.kind,
-                EventKind::Remove(notify::event::RemoveKind::Folder)
-            );
-
-            let is_removed = is_folder_removal || is_removal || !path.exists();
-
-            let (is_dir, is_ignored) = if is_removed {
-                (false, true)
+            // We cannot rely on the filesystem alone because a freshly created file might
+            // not be visible yet, and not on the kind alone because macOS often sends
+            // Modify(Name(Any)) instead of Remove and for both sides of a rename.
+            let kind = debounced_event.event.kind;
+            let is_removal = matches!(kind, EventKind::Remove(_));
+            // A file removal drops at most that entry, so it needs no stat; on `rm -rf`
+            // those are nearly all of the batch.
+            let state = if matches!(kind, EventKind::Remove(RemoveKind::File)) {
+                PathState::Gone
             } else {
-                (path.is_dir(), filter.is_ignored(path))
+                PathState::of(path, follow_symlinks)
             };
 
-            if is_folder_removal {
-                dirs_to_remove.push(path.to_path_buf());
-            } else if is_removed {
-                // best effort but doesn't require a stat and generally correct
-                let maybe_directory = !matches!(
-                    debounced_event.event.kind,
-                    EventKind::Remove(notify::event::RemoveKind::File)
-                );
-
-                paths_to_remove.push((path.as_path(), maybe_directory));
-            } else if is_dir {
-                if !is_ignored {
-                    new_dirs_to_watch.push(path.to_path_buf());
+            match state {
+                // A known directory removed, created or renamed may have been replaced: a
+                // walk below reconciles its subtree with the disk.
+                PathState::Dir { walkable: true }
+                    if matches!(
+                        kind,
+                        EventKind::Remove(_)
+                            | EventKind::Create(_)
+                            | EventKind::Modify(ModifyKind::Name(_))
+                    ) =>
+                {
+                    let (known_dir, known_file) = indexed_as(path);
+                    if known_dir {
+                        dirs_to_reconcile.push(path.to_path_buf());
+                    } else {
+                        // A file the directory replaced leaves with its entry.
+                        if known_file {
+                            paths_to_remove.push((path.as_path(), false));
+                        }
+                        if !filter.is_ignored(path) {
+                            new_dirs_to_watch.push(path.to_path_buf());
+                        }
+                    }
                 }
-            } else if !is_ignored {
-                // For additions/modifications, still filter gitignored files.
-                paths_to_add_or_modify.push(path.as_path());
+                PathState::Dir { .. } if !is_removal => {
+                    if !filter.is_ignored(path) {
+                        new_dirs_to_watch.push(path.to_path_buf());
+                    }
+                }
+                // Directory-level remove: both fsevents and inotify deliver a single
+                // `Remove(Folder)` for a whole tree (e.g. `git reset --hard` wiping a dir).
+                _ if matches!(kind, EventKind::Remove(RemoveKind::Folder)) => {
+                    dirs_to_remove.push(path.to_path_buf());
+                }
+                PathState::Gone | PathState::Dir { .. } => {
+                    // best effort but doesn't require a stat and generally correct
+                    let maybe_directory = !matches!(kind, EventKind::Remove(RemoveKind::File));
+                    paths_to_remove.push((path.as_path(), maybe_directory));
+                }
+                // A directory a file replaced is not a file entry: it expands to its subtree.
+                PathState::File if is_removal => {
+                    let maybe_directory = !matches!(kind, EventKind::Remove(RemoveKind::File));
+                    paths_to_remove.push((path.as_path(), maybe_directory));
+                }
+                PathState::File => {
+                    // For additions/modifications, still filter gitignored files.
+                    if !filter.is_ignored(path) {
+                        paths_to_add_or_modify.push(path.as_path());
+                    }
+                }
             }
         }
 
@@ -613,6 +650,40 @@ pub(crate) fn handle_debounced_events(
         }
     }
 
+    let replaced = ReplacedDirs::walk(
+        dirs_to_reconcile,
+        base_path,
+        repo.is_some(),
+        follow_symlinks,
+        shared_picker,
+    );
+    // The walks supersede the batch's other changes inside them; those still name
+    // rename candidates.
+    let mut covered_removals = Vec::new();
+    let mut covered_additions = Vec::new();
+    if !replaced.is_empty() {
+        paths_to_remove.retain(|&(path, may_be_dir)| {
+            let covered = replaced.covers(path);
+            if covered && replaced.drops(path, base_path) {
+                covered_removals.push((path, may_be_dir));
+            }
+            !covered
+        });
+        paths_to_add_or_modify.retain(|path| {
+            let covered = replaced.covers(path);
+            if covered {
+                covered_additions.push(*path);
+            }
+            !covered
+        });
+        dirs_to_remove.retain(|dir| !replaced.covers(dir));
+        new_dirs_to_watch.retain(|dir| !replaced.covers(dir));
+    }
+
+    // Backends repeat a path within a batch; each new directory is walked once.
+    new_dirs_to_watch.sort_unstable();
+    new_dirs_to_watch.dedup();
+
     // It's important to get the allocated sort
     sort_with_buffer(paths_to_add_or_modify.as_mut_slice(), |a, b| {
         a.as_os_str().cmp(b.as_os_str())
@@ -620,16 +691,18 @@ pub(crate) fn handle_debounced_events(
     paths_to_add_or_modify.dedup_by(|a, b| a.as_os_str().eq(b.as_os_str()));
 
     info!(
-        "Event processing summary: {} to remove, {} dirs to remove, {} to add/modify, {} new dirs",
+        "Event processing summary: {} to remove, {} dirs to remove, {} to add/modify, {} new dirs, {} dirs to reconcile",
         paths_to_remove.len(),
         dirs_to_remove.len(),
         paths_to_add_or_modify.len(),
-        new_dirs_to_watch.len()
+        new_dirs_to_watch.len(),
+        replaced.len(),
     );
 
     if paths_to_remove.is_empty()
         && dirs_to_remove.is_empty()
         && paths_to_add_or_modify.is_empty()
+        && replaced.is_empty()
         && !need_full_git_rescan
     {
         debug!("No file index changes to apply");
@@ -650,12 +723,14 @@ pub(crate) fn handle_debounced_events(
     if !paths_to_remove.is_empty()
         || !dirs_to_remove.is_empty()
         || !paths_to_add_or_modify.is_empty()
+        || !replaced.is_empty()
     {
         debug!(
-            "Applying file index changes: {} to remove, {} dirs to remove, {} to add/modify",
+            "Applying file index changes: {} to remove, {} dirs to remove, {} to add/modify, {} dirs to reconcile",
             paths_to_remove.len(),
             dirs_to_remove.len(),
             paths_to_add_or_modify.len(),
+            replaced.len(),
         );
 
         let Ok(mut guard) = shared_picker.write() else {
@@ -669,11 +744,22 @@ pub(crate) fn handle_debounced_events(
 
         // Must run before the removals below, while the vanished files still
         // carry their indexed size/mtime.
+        // Files a reconciliation removes or adds are rename candidates too.
+        let rename_removals: Vec<(&Path, bool)> = paths_to_remove
+            .iter()
+            .chain(&covered_removals)
+            .copied()
+            .collect();
+        let rename_additions: Vec<&Path> = paths_to_add_or_modify
+            .iter()
+            .chain(&covered_additions)
+            .copied()
+            .collect();
         renames.extend(detect_renames(
             picker,
             base_path,
-            &paths_to_remove,
-            &paths_to_add_or_modify,
+            &rename_removals,
+            &rename_additions,
             &explicit_renames,
         ));
 
@@ -727,39 +813,62 @@ pub(crate) fn handle_debounced_events(
             }
         }
 
+        // In the same update as the batch's removals, so files kept by a replaced
+        // directory never leave the index.
+        let mut reconciled_events = Vec::new();
+        if replaced
+            .apply(
+                picker,
+                base_path,
+                |path| {
+                    if need_events_propagation {
+                        watch_events.insert(path.to_path_buf(), (WatchEventKind::Removed, None));
+                    }
+                },
+                &mut reconciled_events,
+                &mut files_to_update_git_status,
+            )
+            .is_err()
+        {
+            index_update_rejected = true;
+        }
+        if need_events_propagation {
+            for (path, kind) in reconciled_events {
+                watch_events.insert(path, (kind, None));
+            }
+        }
+
         files_to_update_git_status.reserve(paths_to_add_or_modify.len());
-        let mut landed_renames = ahash::AHashSet::with_capacity(renames.len());
         for (position, path) in paths_to_add_or_modify.iter().enumerate() {
+            if index_update_rejected {
+                // The rescan picks up this path and every later one.
+                break;
+            }
             let existed = live_before.get(position).copied().unwrap_or(false);
 
             let applied = picker.apply_create_or_modify(path);
             if applied.is_ok() {
                 files_to_update_git_status.push(path.to_path_buf());
-                if renames.contains_key(*path) {
-                    landed_renames.insert(path.to_path_buf());
-                }
                 if need_events_propagation {
-                    let event = match renames.get(*path) {
-                        Some(from) => (WatchEventKind::Renamed, Some(from.clone())),
-                        None if existed => (WatchEventKind::Modified, None),
-                        None => (WatchEventKind::Created, None),
+                    let kind = if existed {
+                        WatchEventKind::Modified
+                    } else {
+                        WatchEventKind::Created
                     };
-
-                    watch_events.insert(path.to_path_buf(), event);
+                    watch_events.insert(path.to_path_buf(), (kind, None));
                 }
             } else if matches!(applied, Err(IndexUpdateError::CapacityExhausted)) {
-                // The rescan picks up this path and every later one.
                 index_update_rejected = true;
-                break;
             }
         }
 
         // A destination the picker rejected is not a rename: its source stays
         // Removed and no history is carried. For the rest, the move is one event.
-        renames.retain(|to, _| landed_renames.contains(to));
+        renames.retain(|to, _| is_live(picker, to));
         if need_events_propagation {
-            for from in renames.values() {
+            for (to, from) in &renames {
                 watch_events.remove(from);
+                watch_events.insert(to.clone(), (WatchEventKind::Renamed, Some(from.clone())));
             }
         }
 
@@ -976,39 +1085,16 @@ pub(super) fn index_new_directory(
         return;
     }
 
-    let walk = match crate::walk::walk_collect_files(
-        &base_path,
-        Some(dir),
-        repo.is_some(),
-        follow_symlinks,
-        1,
-        &Arc::new(std::sync::atomic::AtomicUsize::new(0)),
-        dir_hook,
-    ) {
-        Ok(walk) => walk,
-        Err(e) => {
-            warn!(?e, dir = %dir.display(), "Failed to walk new directory");
-            return;
-        }
+    let Some(walk) = DirWalk::new(dir, &base_path, repo.is_some(), follow_symlinks, dir_hook)
+    else {
+        return;
     };
 
-    let files_to_add: Vec<PathBuf> = walk
-        .pairs
-        .iter()
-        .map(|(_, path)| base_path.join(path))
-        .collect();
-    let subdirs: Vec<PathBuf> = walk
-        .dirs
-        .iter()
-        .map(|path| base_path.join(path.trim_end_matches('/')))
-        .collect();
-
-    let mut update_rejected = false;
-    let mut indexed_files = Vec::with_capacity(files_to_add.len().min(MAX_OVERFLOW_FILES));
+    let mut indexed_files = Vec::new();
     // A directory already known can be walked again: its indexed files are
     // reported only when the walk changed them.
     let mut file_events = Vec::new();
-    {
+    let update_rejected = {
         let Ok(mut guard) = shared_picker.write() else {
             return;
         };
@@ -1018,41 +1104,9 @@ pub(super) fn index_new_directory(
         };
 
         // Once capacity runs out the rescan covers the rest of the subtree.
-        for path in &subdirs {
-            if picker.handle_create_directory(path) == Err(IndexUpdateError::CapacityExhausted) {
-                update_rejected = true;
-                break;
-            }
-        }
-        if !update_rejected {
-            for path in files_to_add {
-                let before = picker
-                    .get_file_by_path(&path)
-                    .filter(|file| !file.is_deleted())
-                    .map(|file| (file.size, file.modified));
-                match picker.apply_create_or_modify(&path) {
-                    Ok(file) => {
-                        let kind = match before {
-                            None => Some(WatchEventKind::Created),
-                            Some(identity) if identity != (file.size, file.modified) => {
-                                Some(WatchEventKind::Modified)
-                            }
-                            Some(_) => None,
-                        };
-                        if let Some(kind) = kind {
-                            file_events.push((path.clone(), kind));
-                        }
-                        indexed_files.push(path);
-                    }
-                    Err(IndexUpdateError::CapacityExhausted) => {
-                        update_rejected = true;
-                        break;
-                    }
-                    Err(IndexUpdateError::Vanished | IndexUpdateError::OutsideIndex) => {}
-                }
-            }
-        }
-    }
+        walk.apply(picker, &base_path, &mut file_events, &mut indexed_files)
+            .is_err()
+    };
     // The lock is released before the rescan is requested. A started rescan
     // replaces the accepted prefix, so its events are not replayed; a deferred
     // one leaves them to be reported now.
@@ -1389,6 +1443,36 @@ fn pair_renames_by_identity(
             Some((source.to_path_buf(), target.to_path_buf()))
         })
         .collect()
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum PathState {
+    Gone,
+    File,
+    // `walkable` when the index's walk descends into it, a symlink only when following them.
+    Dir { walkable: bool },
+}
+
+impl PathState {
+    // One lstat, and a stat of the target only for a symlink.
+    fn of(path: &Path, follow_symlinks: bool) -> Self {
+        let Ok(meta) = std::fs::symlink_metadata(path) else {
+            return Self::Gone;
+        };
+        if meta.is_dir() {
+            return Self::Dir { walkable: true };
+        }
+        if !meta.file_type().is_symlink() {
+            return Self::File;
+        }
+        match std::fs::metadata(path) {
+            Ok(target) if target.is_dir() => Self::Dir {
+                walkable: follow_symlinks,
+            },
+            Ok(_) => Self::File,
+            Err(_) => Self::Gone,
+        }
+    }
 }
 
 /// Requests the rescan that recovers changes dropped by the watcher; a throttled
