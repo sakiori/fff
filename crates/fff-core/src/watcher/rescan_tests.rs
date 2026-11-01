@@ -47,6 +47,84 @@ fn new_empty_directories_are_indexed_without_rescanning() {
 }
 
 #[test]
+fn walking_a_known_directory_again_reports_only_new_files() {
+    let f = Fixture::new();
+    f.write("known/indexed.rs", "fn indexed() {}");
+    f.index();
+    let events = f.subscribe("");
+    let index_dir = |rel: &str| {
+        super::background_watcher::index_new_directory(
+            &f.path(rel),
+            &f.picker,
+            &f.frecency,
+            &f.git_workdir,
+            &f.git_worker,
+            None,
+        )
+    };
+
+    // A known directory can be walked again, e.g. after an event for the directory itself.
+    index_dir("known");
+    f.write("fresh/added.rs", "fn added() {}");
+    index_dir("fresh");
+
+    // Events arrive in order, so the first batch shows whether the known file was reported.
+    let received = events.recv_timeout(Duration::from_secs(1)).unwrap();
+    assert_eq!(received.len(), 1, "{received:?}");
+    assert_eq!(received[0].path, f.path("fresh/added.rs"));
+    assert_eq!(received[0].kind, WatchEventKind::Created);
+}
+
+#[test]
+fn a_swapped_in_directory_reports_its_changed_files() {
+    let f = Fixture::new();
+    f.write("d/changed.rs", "fn old() {}");
+    f.write("d/same.rs", "fn same() {}");
+    f.index();
+    let events = f.subscribe("");
+
+    // `mv d d.bak && mv d.new d`: a new directory takes the indexed path.
+    std::fs::rename(f.path("d"), f.path("d.bak")).unwrap();
+    f.write("d.new/changed.rs", "fn new_and_longer() {}");
+    f.write("d.new/same.rs", "fn same() {}");
+    let same_mtime = std::fs::metadata(f.path("d.bak/same.rs"))
+        .unwrap()
+        .modified()
+        .unwrap();
+    std::fs::File::options()
+        .write(true)
+        .open(f.path("d.new/same.rs"))
+        .unwrap()
+        .set_modified(same_mtime)
+        .unwrap();
+    std::fs::rename(f.path("d.new"), f.path("d")).unwrap();
+    f.feed([
+        event(
+            EventKind::Modify(ModifyKind::Name(RenameMode::Any)),
+            f.path("d"),
+        ),
+        event(
+            EventKind::Modify(ModifyKind::Name(RenameMode::Any)),
+            f.path("d.new"),
+        ),
+    ]);
+    // The handler queues the directory for a walk; run it here.
+    super::background_watcher::index_new_directory(
+        &f.path("d"),
+        &f.picker,
+        &f.frecency,
+        &f.git_workdir,
+        &f.git_worker,
+        None,
+    );
+
+    let received = events.recv_timeout(Duration::from_secs(1)).unwrap();
+    assert_eq!(received.len(), 1, "{received:?}");
+    assert_eq!(received[0].path, f.path("d/changed.rs"));
+    assert_eq!(received[0].kind, WatchEventKind::Modified);
+}
+
+#[test]
 fn recreated_empty_directories_reuse_and_revive_entries() {
     let f = Fixture::new();
     std::fs::create_dir_all(f.path("empty/nested")).unwrap();
@@ -131,6 +209,89 @@ fn new_empty_directories_overflow_recovers_with_a_rescan() {
     assert_eq!(f.all_rescans().count(RescanReason::IndexUpdateRejected), 1);
     assert!(f.picker.wait_for_indexing_complete(Duration::from_secs(10)));
     assert_eq!(f.indexed_dirs().len(), MAX_OVERFLOW_FILES + 2);
+}
+
+#[test]
+fn a_deferred_rescan_still_reports_the_files_a_new_directory_added() {
+    let f = Fixture::new();
+    f.write("src/main.rs", "fn main() {}");
+    // A cooldown no test outlasts, so the rescan below is deferred whatever the timing.
+    let cooldown = Duration::from_secs(24 * 60 * 60);
+    f.index_with_rescan_cooldown(cooldown);
+    // An explicit scan starts the cooldown.
+    f.picker.trigger_full_rescan_async(&f.frecency).unwrap();
+    assert!(f.picker.wait_for_indexing_complete(Duration::from_secs(10)));
+    assert_eq!(
+        f.picker.read().unwrap().as_ref().unwrap().rescan_cooldown(),
+        cooldown
+    );
+    let events = f.subscribe("**");
+    let before = f.all_rescans();
+
+    // More files than the overflow region takes: the rest needs a rescan.
+    let files: Vec<String> = (0..=MAX_OVERFLOW_FILES)
+        .map(|i| format!("new/file{i}.rs"))
+        .collect();
+    for rel in &files {
+        f.write(rel, "");
+    }
+    super::background_watcher::index_new_directory(
+        &f.path("new"),
+        &f.picker,
+        &f.frecency,
+        &f.git_workdir,
+        &f.git_worker,
+        None,
+    );
+
+    let delta = f.all_rescans().since(&before);
+    assert_eq!(
+        delta.total, 0,
+        "the rescan must wait for the cooldown, got {delta}"
+    );
+    assert_eq!(delta.count_throttled(RescanReason::IndexUpdateRejected), 1);
+    assert!(
+        f.picker.deferred_rescan_due().is_some(),
+        "the rescan must stay deferred"
+    );
+    assert_eq!(
+        f.picker.due_deferred_rescan(),
+        None,
+        "the cooldown has not ended"
+    );
+
+    // The files the walk added before capacity ran out are reported now: no rescan
+    // replaces them yet.
+    let accepted: Vec<PathBuf> = files
+        .iter()
+        .filter(|rel| f.is_indexed(rel))
+        .map(|rel| f.path(rel))
+        .collect();
+    assert!(
+        !accepted.is_empty() && accepted.len() < files.len(),
+        "the walk must add a prefix of the directory, added {}",
+        accepted.len()
+    );
+    // Every batch the walk dispatched has reached the subscriber once the dispatcher
+    // is drained; nothing arrives later.
+    f.picker.watch_registry().wait_for_dispatch();
+    let reported: Vec<WatchEvent> = events.try_iter().flatten().collect();
+    assert!(
+        reported.iter().all(|e| e.kind == WatchEventKind::Created),
+        "{reported:?}"
+    );
+    let mut reported: Vec<PathBuf> = reported.into_iter().map(|e| e.path).collect();
+    reported.sort();
+    let mut accepted = accepted;
+    accepted.sort();
+    assert_eq!(reported, accepted);
+
+    // The deferred rescan keeps the reason it was requested for.
+    f.picker.end_rescan_cooldown();
+    assert_eq!(
+        f.picker.due_deferred_rescan(),
+        Some(RescanReason::IndexUpdateRejected)
+    );
 }
 
 #[test]
@@ -884,9 +1045,18 @@ impl Fixture {
     }
 
     fn index(&self) {
+        self.index_with(None);
+    }
+
+    fn index_with_rescan_cooldown(&self, cooldown: Duration) {
+        self.index_with(Some(cooldown));
+    }
+
+    fn index_with(&self, rescan_cooldown: Option<Duration>) {
         let mut picker = FilePicker::new(FilePickerOptions {
             base_path: self.base.to_string_lossy().into_owned(),
             watch: false,
+            rescan_cooldown,
             ..Default::default()
         })
         .unwrap();

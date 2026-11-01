@@ -97,7 +97,7 @@ impl Default for SharedPickerInner {
             picker: parking_lot::RwLock::new(None),
             watchers: Arc::new(WatchRegistry::default()),
             coverage: Arc::default(),
-            rescans: RescanCounters::default(),
+            rescans: Default::default(),
             rescan_throttle: RescanThrottle::default(),
             held_events: EventHold::default(),
             git_status_paused: Arc::new(AtomicBool::new(false)),
@@ -336,6 +336,19 @@ impl SharedFilePicker {
             .deferred()
             .filter(|deferred| deferred.due <= Instant::now())
             .map(|deferred| deferred.reason)
+    }
+
+    /// Test control: ends the rescan cooldown, so a deferred rescan runs now
+    /// instead of when the cooldown would have ended. Debug builds only.
+    #[cfg(debug_assertions)]
+    #[doc(hidden)]
+    pub fn end_rescan_cooldown(&self) {
+        self.0.rescan_throttle.end_cooldown();
+        if let Ok(guard) = self.read()
+            && let Some(watcher) = guard.as_ref().and_then(|p| p.background_watcher.as_ref())
+        {
+            watcher.wake_for_deferred_rescan();
+        }
     }
 
     pub(crate) fn cancel_deferred_rescan(&self) {

@@ -84,17 +84,19 @@ test-setup:
 	fi
 
 .PHONY: build-mcp test-mcp lint-mcp
+# Extra test harness arguments for test-mcp and test-rust, e.g. TEST_ARGS="--exact --skip name".
+TEST_ARGS ?=
 build-mcp:
 	cargo build --release -p fff-mcp
 
 test-mcp:
-	cargo test -p fff-mcp -p fff-search
+	cargo test -p fff-mcp -p fff-search -- $(TEST_ARGS)
 
 lint-mcp:
 	cargo clippy -p fff-mcp -p fff-search --all-targets -- -D warnings
 
 test-rust:
-	cargo test --workspace --no-default-features --features zlob --exclude fff-nvim --exclude fff-python
+	cargo test --workspace --no-default-features --features zlob --exclude fff-nvim --exclude fff-python -- $(TEST_ARGS)
 
 bench-search:
 	cargo bench -p fff-search --no-default-features --features zlob --bench fuzzy_search_bench -- $(BENCH_ARGS)

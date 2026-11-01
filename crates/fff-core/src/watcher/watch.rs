@@ -450,6 +450,14 @@ impl WatchRegistry {
         self.dispatcher.drain();
     }
 
+    /// Test control: waits until every batch dispatched so far has reached its
+    /// subscribers. Unlike [`Self::shutdown_and_wait`], the subscriptions stay
+    /// active, so queued batches are delivered rather than skipped.
+    #[cfg(test)]
+    pub(crate) fn wait_for_dispatch(&self) {
+        self.dispatcher.drain();
+    }
+
     pub(crate) fn rebase(&self, base_path: &Path) {
         let mut state = self.state.lock();
         if state.base_path.as_deref() == Some(base_path) {
@@ -817,6 +825,55 @@ mod tests {
         assert!(registry.unsubscribe(id));
         assert!(!registry.is_active());
         assert!(!registry.unsubscribe(id));
+    }
+
+    // A subscriber hears about a move whether its pattern matches the
+    // destination or only the source of the rename.
+    #[test]
+    fn renames_reach_subscribers_of_either_side() {
+        let base = Path::new("/repo");
+        let registry = registry(base);
+        let (cb, collected) = collector();
+        registry
+            .subscribe(base, "src/**", WatchOptions::default(), cb)
+            .unwrap();
+        let renamed = |from: &str, to: &str| RawWatchEvent {
+            path: PathBuf::from(to),
+            kind: WatchEventKind::Renamed,
+            is_ignored: false,
+            from: Some(PathBuf::from(from)),
+        };
+
+        registry.dispatch(
+            base,
+            vec![
+                renamed("/repo/src/leaving.rs", "/repo/vendor/leaving.rs"),
+                renamed("/repo/vendor/arriving.rs", "/repo/src/arriving.rs"),
+                renamed("/repo/lib/a.rs", "/repo/vendor/a.rs"),
+            ],
+        );
+        registry.dispatcher.drain();
+
+        let got = collected.lock();
+        let moves: Vec<_> = got
+            .iter()
+            .map(|event| (event.kind, event.from.as_deref(), event.path.as_path()))
+            .collect();
+        assert_eq!(
+            moves,
+            [
+                (
+                    WatchEventKind::Renamed,
+                    Some(Path::new("/repo/src/leaving.rs")),
+                    Path::new("/repo/vendor/leaving.rs"),
+                ),
+                (
+                    WatchEventKind::Renamed,
+                    Some(Path::new("/repo/vendor/arriving.rs")),
+                    Path::new("/repo/src/arriving.rs"),
+                ),
+            ]
+        );
     }
 
     #[test]

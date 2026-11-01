@@ -19,6 +19,9 @@ use serde_json::{Value, json};
 
 const BIN: &str = env!("CARGO_BIN_EXE_fff-mcp");
 const EVENTUAL: Duration = Duration::from_secs(15);
+// Services watch through the polling backend, so watcher tests do not depend on
+// the OS event service delivering events.
+const POLL_WATCHER: (&str, &str) = ("FFF_TEST_POLL_WATCHER_MS", "25");
 
 struct Client {
     child: Child,
@@ -162,7 +165,8 @@ fn client_command(
         .arg(service)
         .arg("--log-file")
         .arg(service.with_extension("log"))
-        .env("FFF_MCP_TEST_WATCHDOG_INTERVAL_MS", "100");
+        .env("FFF_MCP_TEST_WATCHDOG_INTERVAL_MS", "100")
+        .env(POLL_WATCHER.0, POLL_WATCHER.1);
     command
 }
 
@@ -277,6 +281,7 @@ fn start_daemon(service: &Path, idle: &str) -> Daemon {
             .arg(service)
             .arg("--log-file")
             .arg(service.with_extension("log"))
+            .env(POLL_WATCHER.0, POLL_WATCHER.1)
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::inherit())

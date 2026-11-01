@@ -97,6 +97,17 @@ impl RescanThrottle {
         state.deferred = None;
     }
 
+    /// Test control: ends the current cooldown, so a deferred rescan is due now
+    /// and the next request is admitted.
+    #[cfg(debug_assertions)]
+    pub(crate) fn end_cooldown(&self) {
+        let mut state = self.state.lock();
+        state.last_admitted = None;
+        if let Some(deferred) = state.deferred.as_mut() {
+            deferred.due = Instant::now();
+        }
+    }
+
     pub(crate) fn deferred(&self) -> Option<DeferredRescan> {
         self.state.lock().deferred
     }

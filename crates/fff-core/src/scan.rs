@@ -777,6 +777,8 @@ mod tests {
     }
 
     fn start(shared: &SharedFilePicker, root: &Path, content_indexing: bool) -> SharedFrecency {
+        // These tests check how scans and watcher events interleave, not OS event delivery.
+        crate::watch::poll_watcher_for(root);
         let frecency = SharedFrecency::default();
         FilePicker::new_with_shared_state(
             shared.clone(),

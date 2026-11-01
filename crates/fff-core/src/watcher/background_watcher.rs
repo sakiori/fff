@@ -20,7 +20,27 @@ use std::sync::mpsc;
 use std::time::{Duration, Instant};
 use tracing::{Level, debug, error, info, warn};
 
-type Debouncer = notify_debouncer_full::Debouncer<notify::RecommendedWatcher, NoCache>;
+// The OS-native backend; test and debug builds can poll instead (see `test_poll_interval`).
+enum Debouncer {
+    Native(notify_debouncer_full::Debouncer<notify::RecommendedWatcher, NoCache>),
+    Poll(notify_debouncer_full::Debouncer<notify::PollWatcher, NoCache>),
+}
+
+impl Debouncer {
+    fn watch(&mut self, path: &Path, mode: RecursiveMode) -> notify::Result<()> {
+        match self {
+            Debouncer::Native(debouncer) => debouncer.watch(path, mode),
+            Debouncer::Poll(debouncer) => debouncer.watch(path, mode),
+        }
+    }
+
+    fn stop_nonblocking(self) {
+        match self {
+            Debouncer::Native(debouncer) => debouncer.stop_nonblocking(),
+            Debouncer::Poll(debouncer) => debouncer.stop_nonblocking(),
+        }
+    }
+}
 
 /// Owns the file-system watcher and guarantees that all background threads
 /// are fully joined before `stop()` / `Drop` returns.
@@ -99,16 +119,33 @@ impl BackgroundWatcher {
         let owner_frecency = shared_frecency.clone();
         let owner_base_path = base_path.clone();
 
-        let debouncer = Self::create_debouncer(
-            base_path,
-            git,
-            shared_picker,
-            shared_frecency,
-            mode,
-            use_recursive,
-            watch_tx_for_debouncer,
-            git_status_worker,
-        )?;
+        let debouncer = match test_poll_interval(&base_path) {
+            None => Debouncer::Native(Self::create_debouncer(
+                base_path,
+                git,
+                shared_picker,
+                shared_frecency,
+                mode,
+                use_recursive,
+                watch_tx_for_debouncer,
+                git_status_worker,
+                None,
+            )?),
+            Some(interval) => {
+                info!(?interval, "File watcher uses the polling backend");
+                Debouncer::Poll(Self::create_debouncer(
+                    base_path,
+                    git,
+                    shared_picker,
+                    shared_frecency,
+                    mode,
+                    use_recursive,
+                    watch_tx_for_debouncer,
+                    git_status_worker,
+                    Some(interval),
+                )?)
+            }
+        };
 
         info!("Background file watcher initialized successfully");
 
@@ -187,7 +224,7 @@ impl BackgroundWatcher {
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn create_debouncer(
+    fn create_debouncer<W: notify::Watcher>(
         base_path: PathBuf,
         git: Option<GitDiscovery>,
         shared_picker: SharedFilePicker,
@@ -196,8 +233,12 @@ impl BackgroundWatcher {
         use_recursive: bool,
         watch_tx: mpsc::Sender<WatchTask>,
         git_status_worker: Arc<GitStatusWorker>,
-    ) -> Result<Debouncer, Error> {
-        let config = Config::default()
+        poll_interval: Option<Duration>,
+    ) -> Result<notify_debouncer_full::Debouncer<W, NoCache>, Error> {
+        let config = poll_interval
+            .map_or_else(Config::default, |interval| {
+                Config::default().with_poll_interval(interval)
+            })
             .with_follow_symlinks(false)
             // only the actual modification events, ignore the open syscals that we can generate by
             // our own grep calls and preview window rendering
@@ -311,7 +352,7 @@ impl BackgroundWatcher {
     }
 
     // The owner thread runs deferred rescans once due.
-    fn wake_for_deferred_rescan(&self) -> bool {
+    pub(crate) fn wake_for_deferred_rescan(&self) -> bool {
         self.send(WatchTask::RescanDeferred)
     }
 
@@ -812,6 +853,43 @@ fn hold_dir_indexing() {
     }
 }
 
+// Test seam: watchers use notify's polling backend instead of the OS event service, so
+// tests check the event handling without depending on how promptly the OS delivers
+// events. Tests set `FFF_TEST_POLL_WATCHER_MS` to an interval in milliseconds or
+// register their roots with `poll_watcher_for`. Release builds outside tests always
+// use the native backend.
+#[cfg(any(test, debug_assertions))]
+fn test_poll_interval(base_path: &Path) -> Option<Duration> {
+    if POLLED_ROOTS.lock().iter().any(|root| root == base_path) {
+        return Some(Duration::from_millis(25));
+    }
+    let interval = std::env::var("FFF_TEST_POLL_WATCHER_MS").ok()?;
+    match interval.parse() {
+        Ok(millis) => Some(Duration::from_millis(millis)),
+        Err(e) => {
+            warn!(?e, %interval, "Ignoring FFF_TEST_POLL_WATCHER_MS");
+            None
+        }
+    }
+}
+
+#[cfg(not(any(test, debug_assertions)))]
+fn test_poll_interval(_base_path: &Path) -> Option<Duration> {
+    None
+}
+
+#[cfg(any(test, debug_assertions))]
+static POLLED_ROOTS: Mutex<Vec<PathBuf>> = Mutex::new(Vec::new());
+
+/// Test seam: watchers started later for `root` in this process poll instead of
+/// using OS events. Debug and test builds only.
+#[cfg(any(test, debug_assertions))]
+#[doc(hidden)]
+pub fn poll_watcher_for(root: &Path) {
+    let root = crate::path_utils::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
+    POLLED_ROOTS.lock().push(root);
+}
+
 /// Indexes a directory created after the scan.
 pub(super) fn index_new_directory(
     dir: &Path,
@@ -863,6 +941,9 @@ pub(super) fn index_new_directory(
 
     let mut update_rejected = false;
     let mut indexed_files = Vec::with_capacity(files_to_add.len().min(MAX_OVERFLOW_FILES));
+    // A directory already known can be walked again: its indexed files are
+    // reported only when the walk changed them.
+    let mut file_events = Vec::new();
     {
         let Ok(mut guard) = shared_picker.write() else {
             return;
@@ -881,8 +962,24 @@ pub(super) fn index_new_directory(
         }
         if !update_rejected {
             for path in files_to_add {
+                let before = picker
+                    .get_file_by_path(&path)
+                    .filter(|file| !file.is_deleted())
+                    .map(|file| (file.size, file.modified));
                 match picker.apply_create_or_modify(&path) {
-                    Ok(_) => indexed_files.push(path),
+                    Ok(file) => {
+                        let kind = match before {
+                            None => Some(WatchEventKind::Created),
+                            Some(identity) if identity != (file.size, file.modified) => {
+                                Some(WatchEventKind::Modified)
+                            }
+                            Some(_) => None,
+                        };
+                        if let Some(kind) = kind {
+                            file_events.push((path.clone(), kind));
+                        }
+                        indexed_files.push(path);
+                    }
                     Err(IndexUpdateError::CapacityExhausted) => {
                         update_rejected = true;
                         break;
@@ -906,11 +1003,11 @@ pub(super) fn index_new_directory(
 
     let watch_registry = shared_picker.watch_registry();
     if !rescan_started && watch_registry.is_active() {
-        let events = indexed_files
-            .iter()
-            .map(|path| RawWatchEvent {
-                path: path.clone(),
-                kind: WatchEventKind::Created,
+        let events = file_events
+            .into_iter()
+            .map(|(path, kind)| RawWatchEvent {
+                path,
+                kind,
                 is_ignored: false,
                 from: None,
             })
@@ -1078,7 +1175,10 @@ fn is_dotgit_change_affecting_status(changed: &Path, repo: &Option<Repository>) 
 }
 
 // `git_dir` is `.git/worktrees/<name>` for linked worktrees, whose `.git` is a file.
-fn watch_git_status_paths(debouncer: &mut Debouncer, git_dir: Option<&Path>) {
+fn watch_git_status_paths<W: notify::Watcher>(
+    debouncer: &mut notify_debouncer_full::Debouncer<W, NoCache>,
+    git_dir: Option<&Path>,
+) {
     let Some(git_dir) = git_dir.filter(|git_dir| git_dir.is_dir()) else {
         return;
     };

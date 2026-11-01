@@ -91,7 +91,13 @@ still apply through the original root's traversal policy. An update rejected
 because incremental capacity is exhausted requests a rescan; a request delayed
 by rate limiting stays pending and runs when the cooldown ends, and any
 admitted rescan satisfies it. A file that disappears before it is indexed does
-not trigger a rescan.
+not trigger a rescan. When the watcher walks a directory that is already
+indexed, which happens after an event for the directory itself, subscribers
+receive `Created` for files that were not indexed, `Modified` for indexed files
+whose size or modification time changed, and nothing for unchanged files;
+upstream reported every file of the walk as created. Files of a directory
+created while a scan runs are indexed by that scan, so the walk that follows
+does not report them again, as with the events the scan holds.
 
 Changes made while an index scans are not lost. Every scan subscribes to
 filesystem events before it walks the tree, holds the events that arrive during
@@ -117,12 +123,13 @@ coexist, and a changed index binding invalidates the old ones.
 
 ### Building and running
 
-Run `make build-mcp` to build the downstream executable in `target/release`.
-The build needs the Zig version pinned in `mise.toml`; with mise, run
-`mise trust` and `mise install` in the checkout once.
-Configure each MCP client to launch that executable, passing its desired search
-directory as the positional argument. The upstream install scripts and package
-manager releases do not contain these downstream changes.
+Run `make build-mcp` to build the downstream executable from a checkout in
+`target/release`. That build uses the default walker and needs no Zig; builds
+with zlob, as `make test-rust` uses, need the Zig version pinned in `mise.toml`;
+with mise, run `mise trust` and `mise install` in the checkout once. Configure
+each MCP client to launch that executable, passing its desired search directory
+as the positional argument. The upstream install scripts and package manager
+releases do not contain these downstream changes.
 
 The first client starts the service automatically. A client completes MCP
 initialization as soon as its session is registered; the index keeps scanning in
@@ -191,3 +198,30 @@ the services of its namespace when it ends, also when it fails. In debug
 builds, watchers leave new directories unindexed while the file named by
 `FFF_TEST_HOLD_DIR_INDEXING` exists, so the watcher consolidation test orders
 its steps without timing.
+
+In test and debug builds, watchers use notify's polling backend instead of the
+OS event service when `FFF_TEST_POLL_WATCHER_MS` sets an interval in
+milliseconds, or for roots a test registered with `watch::poll_watcher_for`;
+release builds always use the native backend. The polled events take the same
+debouncer and handler, so tests check how fff handles watcher events without
+depending on how promptly the OS delivers them. The shared-service tests and the
+downstream core tests of scans and overflow recovery always poll, and
+`git intake verify` sets the variable for `make test-rust` and `make test-mcp`,
+so upstream's watcher tests poll there too. Verify skips five tests by exact
+name. The three `fs_delete_handler_test` tests
+(`raw_notify_nonrecursive_detects_deletion`,
+`raw_notify_multi_nonrecursive_detects_deletion` and
+`debounced_nonrecursive_detects_deletion`) build notify's native watcher
+themselves and test OS and notify event delivery, not fff code, so polling
+cannot reach them. The two `watch_subscription_test` tests
+`renaming_out_of_a_watched_subtree_still_notifies` and
+`renaming_into_a_watched_subtree_still_notifies` assert that a rename arrives
+as one paired event, which native backends deliver; a polling walk is not an
+atomic snapshot, so it can report the two sides in separate batches; how fff
+delivers a rename to subscribers of either side is checked with injected events
+in the watch registry's unit tests. Native
+event delivery is covered by `make test-rust` and `make test-mcp` run without
+the variable and without skips, these tests included, and by upstream's CI. `make test-rust`
+and `make test-mcp` pass `TEST_ARGS` to the test harness. In debug builds,
+`SharedFilePicker::end_rescan_cooldown` lets a test end the rescan cooldown
+instead of waiting for it.

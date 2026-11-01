@@ -1,7 +1,7 @@
 use fff_search::file_picker::{FFFMode, FilePicker};
 use fff_search::{
     DirSearchConfig, FilePickerOptions, FuzzySearchOptions, PaginationArgs, QueryParser,
-    RescanReason, SharedFilePicker, SharedFrecency,
+    SharedFilePicker, SharedFrecency,
 };
 use std::fs;
 use std::path::Path;
@@ -308,54 +308,81 @@ fn empty_directory_at_scan_is_searchable_and_watched() {
     assert_eq!(commands_dirs, 1, "no duplicate DirItem for the empty dir");
 }
 
+// Uses the debug-only rescan controls and counters.
+#[cfg(debug_assertions)]
 #[test]
 fn repeated_empty_directory_overflow_eventually_recovers() {
-    // Each wave moves in a prepared tree, so it overflows in one event. The
-    // second wave lands inside the cooldown and must wait for the deferred rescan.
-    const COOLDOWN: Duration = Duration::from_secs(2);
+    // Each wave moves in a prepared tree that overflows the index, and one
+    // rescan recovers it. The cooldown never ends on its own: the test ends it.
+    const COOLDOWN: Duration = Duration::from_secs(3600);
+    const GUARD: Duration = Duration::from_secs(60);
     let tmp = TempDir::new().unwrap();
     let staging = TempDir::new().unwrap();
     let base = fff_search::path_utils::canonicalize(tmp.path()).unwrap();
+    // The test checks overflow recovery, not OS event delivery.
+    fff_search::watch::poll_watcher_for(&base);
     let (picker, _frecency) = make_watched_picker_with_cooldown(&base, Some(COOLDOWN));
-    for wave in ["first", "second"] {
+    let reason = fff_search::RescanReason::IndexUpdateRejected;
+    let covered = |wave: &str| {
+        let guard = picker.read().unwrap();
+        let p = guard.as_ref().unwrap();
+        p.get_dirs()
+            .iter()
+            .filter(|d| !d.is_deleted() && d.relative_path(p).starts_with(&format!("{wave}/")))
+            .count()
+    };
+    let move_in = |wave: &str| {
         let incoming = staging.path().join(wave);
         for i in 0..1200 {
             fs::create_dir_all(incoming.join(format!("dir{i}"))).unwrap();
         }
-        let before = picker.rescan_stats();
         fs::rename(&incoming, base.join(wave)).unwrap();
-        assert!(
-            wait_until(
-                || {
-                    let guard = picker.read().unwrap();
-                    let p = guard.as_ref().unwrap();
-                    p.get_dirs()
-                        .iter()
-                        .filter(|d| {
-                            !d.is_deleted() && d.relative_path(p).starts_with(&format!("{wave}/"))
-                        })
-                        .count()
-                        == 1201
-                },
-                COOLDOWN * 5,
-            ),
-            "coverage was lost for {wave} overflow"
-        );
+    };
 
-        if !fff_search::RESCAN_STATS_ENABLED {
-            continue;
-        }
-        let after = picker.rescan_stats();
-        let reason = RescanReason::IndexUpdateRejected;
-        assert_eq!(
-            after.count(reason),
-            before.count(reason) + 1,
-            "{wave} overflow must be recovered by one rescan"
-        );
-        let throttled = after.count_throttled(reason) - before.count_throttled(reason);
-        match wave {
-            "first" => assert_eq!(throttled, 0, "the first rescan is admitted at once"),
-            _ => assert_eq!(throttled, 1, "the second rescan runs deferred"),
-        }
-    }
+    // Outside a cooldown, the first rejected update starts the rescan at once.
+    let before = picker.rescan_stats();
+    move_in("first");
+    assert!(
+        wait_until(|| covered("first") == 1201, GUARD),
+        "coverage was lost for the first overflow"
+    );
+    assert_eq!(
+        picker.rescan_stats().count(reason),
+        before.count(reason) + 1,
+        "the first overflow must be recovered by one rescan"
+    );
+
+    // An explicit rescan settles anything the first wave left and restarts the cooldown.
+    picker
+        .trigger_full_rescan_async(&SharedFrecency::noop())
+        .unwrap();
+    assert!(picker.wait_for_indexing_complete(GUARD));
+
+    // Inside the cooldown, the second wave's rescan waits.
+    let before = picker.rescan_stats();
+    move_in("second");
+    assert!(
+        wait_until(
+            || picker.rescan_stats().count_throttled(reason) > before.count_throttled(reason),
+            GUARD
+        ),
+        "the second overflow never requested a rescan"
+    );
+    assert!(
+        covered("second") < 1201,
+        "no rescan may run inside the cooldown"
+    );
+    assert_eq!(picker.rescan_stats().count(reason), before.count(reason));
+
+    // Once the cooldown ends, the deferred rescan recovers the second wave.
+    picker.end_rescan_cooldown();
+    assert!(
+        wait_until(|| covered("second") == 1201, GUARD),
+        "coverage was lost for the second overflow"
+    );
+    assert_eq!(
+        picker.rescan_stats().count(reason),
+        before.count(reason) + 1,
+        "the deferred rescan must run once"
+    );
 }
