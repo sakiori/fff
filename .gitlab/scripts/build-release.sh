@@ -155,7 +155,8 @@ if [[ "$target" == x86_64-apple-darwin && "$host" == aarch64-apple-darwin ]] && 
   run=(arch -x86_64)
 fi
 if [[ "$target" == "$host" || "$target" == "${host%-gnu}-musl" || ${#run[@]} -gt 0 ]]; then
-  reported=$("${run[@]}" "$stage/fff-mcp" --version)
+  # bash 3.2 on macOS counts an empty array as unbound under set -u.
+  reported=$(${run[@]+"${run[@]}"} "$stage/fff-mcp" --version)
   [[ "$reported" == "fff-mcp $version ("* ]] || {
     echo "the binary reports '$reported', not version $version" >&2
     exit 1
