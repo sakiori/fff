@@ -1,9 +1,12 @@
 use super::types::GrepSearchOptions;
 use crate::index::BigramFilter;
 use crate::index::constraints::{ConstraintPlan, ConstraintsBuffers};
+use crate::scope::ResolvedScope;
+use crate::simd_path::Arenas;
 use crate::sort_buffer::sort_with_buffer;
 use crate::types::FileItem;
 use fff_query_parser::Constraint;
+use smallvec::{SmallVec, smallvec};
 use std::cmp::Ordering;
 use std::ops::Range;
 
@@ -68,15 +71,14 @@ impl<'a> RankedFiles<'a> {
 /// Prefilter with a FilePath-constraint fallback: when constraints yield 0
 /// files and the query had FilePath constraints, retry without them (the path
 /// token was likely part of the search text).
-#[allow(clippy::too_many_arguments)]
 pub(super) fn prefilter_with_filepath_retry<'a>(
     files: &'a [FileItem],
     constraints: &[Constraint<'_>],
     bigram_candidates: Option<&[u64]>,
     base_count: usize,
     options: &GrepSearchOptions,
-    arena: crate::simd_path::ArenaPtr,
-    overflow_arena: crate::simd_path::ArenaPtr,
+    arenas: Arenas,
+    scope: Option<&ResolvedScope>,
 ) -> (RankedFiles<'a>, usize) {
     let (files_to_search, filtered_file_count) = prefilter_files(
         files,
@@ -84,8 +86,8 @@ pub(super) fn prefilter_with_filepath_retry<'a>(
         bigram_candidates,
         base_count,
         options,
-        arena,
-        overflow_arena,
+        arenas,
+        scope,
     );
 
     if !files_to_search.is_empty()
@@ -104,39 +106,32 @@ pub(super) fn prefilter_with_filepath_retry<'a>(
         bigram_candidates,
         base_count,
         options,
-        arena,
-        overflow_arena,
+        arenas,
+        scope,
     )
 }
 
 /// Single pass prefilter that doesn't involve file reading
 /// allocates only amount of memory required for storing references of the FileItems have to be
 /// opened for grepping unaviodably, in the worst case allocates N * <word> memory if no prefilter needed
+///
+/// A scope limits the pass to the index ranges that can hold its files.
 pub(super) fn prefilter_files<'a>(
     files: &'a [FileItem],
     constraints: &[Constraint<'_>],
     bigram_candidates: Option<&[u64]>,
     base_count: usize,
     options: &GrepSearchOptions,
-    arena: crate::simd_path::ArenaPtr,
-    overflow_arena: crate::simd_path::ArenaPtr,
+    arenas: Arenas,
+    scope: Option<&ResolvedScope>,
 ) -> (RankedFiles<'a>, usize) {
     let max_file_size = options.max_file_size;
     let definition_only = options.classify_definitions == super::DefinitionMode::DefinitionOnly;
     let candidate_count = bigram_candidates.map(BigramFilter::count_candidates);
-    let plan = if constraints.is_empty() {
-        None
-    } else {
-        // Sparse content candidates need only inline glob checks, not a full-index path pass.
-        let sparse = candidate_count.is_some_and(|count| count < files.len() / 2);
-        Some(ConstraintPlan::build_with_prefilter(
-            constraints,
-            files,
-            arena,
-            overflow_arena,
-            sparse,
-        ))
-    };
+    // Sparse content candidates need only inline glob checks, not a full-index path pass.
+    let sparse = candidate_count.is_some_and(|count| count < files.len() / 2);
+    let plan = (!constraints.is_empty() || scope.is_some())
+        .then(|| ConstraintPlan::build_with_prefilter(constraints, files, arenas, scope, sparse));
 
     let mut scratch = ConstraintsBuffers::new();
 
@@ -149,97 +144,82 @@ pub(super) fn prefilter_files<'a>(
             && (!definition_only || file.supports_definitions())
     }
 
+    // Files below the boundary are covered by the bigram index; the rest
+    // (non-bigrammable and watcher-appended files) are always checked in order.
+    let boundary = base_count.min(files.len());
+    let spans: SmallVec<[Range<usize>; 3]> = match scope {
+        Some(scope) => scope.file_spans(files.len()).into_iter().collect(),
+        None => smallvec![0..files.len()],
+    };
+
     // squeeze as much prefilters into a single loop as possible
-    let prefiltered: Vec<&FileItem> = match bigram_candidates {
-        Some(candidates) => {
-            let boundary = base_count.min(files.len());
-            let (indexed, tail) = files.split_at(boundary);
-
-            let cap = candidate_count.unwrap_or(0) + tail.len();
-            let mut out: Vec<&FileItem> = Vec::with_capacity(cap);
-
-            let full_words = boundary / 64;
-            let last_word_bits = boundary % 64;
-
-            // we need this because we already had a regression of the wrong bit
-            // has been set for the very last word based on the overlay, it's pretty cheap
-            macro_rules! evaluate_bigram_match_word {
-                ($word:expr, $base:expr) => {{
-                    let mut bits: u64 = $word;
-                    while bits != 0 {
-                        let bit = bits.trailing_zeros() as usize;
-                        let file_idx = $base + bit;
-                        bits &= bits - 1;
-
-                        let f = unsafe { indexed.get_unchecked(file_idx) };
-                        if !basic_prefilter(f, max_file_size, definition_only) {
-                            continue;
-                        }
-                        if let Some(plan) = plan.as_ref()
-                            && !plan.matches(f, file_idx, arena, overflow_arena, &mut scratch)
-                        {
-                            continue;
-                        }
-                        out.push(f);
-                    }
-                }};
-            }
-
-            // Full words: every set bit guaranteed `< boundary`.
-            for (word_idx, &word) in candidates.iter().take(full_words).enumerate() {
-                if word != 0 {
-                    evaluate_bigram_match_word!(word, word_idx * 64);
-                }
-            }
-
-            // Last partial word: mask bits past `boundary` once at word load.
-            if last_word_bits != 0 {
-                // this will get only (mod 64) bits from the last word guarantee that it's 0 padded
-                let last_mask: u64 = (1u64 << last_word_bits) - 1;
-                let word = candidates[full_words] & last_mask;
-                if word != 0 {
-                    evaluate_bigram_match_word!(word, full_words * 64);
-                }
-            }
-
-            // Sequential processing for non-bigrammable files: they are always in the end
-            for (offset, f) in tail.iter().enumerate() {
-                if !basic_prefilter(f, max_file_size, definition_only) {
-                    continue;
-                }
-                if let Some(ref p) = plan
-                    && !p.matches(f, boundary + offset, arena, overflow_arena, &mut scratch)
-                {
-                    continue;
-                }
-                out.push(f);
-            }
-
-            out
-        }
+    let mut prefiltered: Vec<&FileItem> = match bigram_candidates {
+        Some(_) => Vec::with_capacity(candidate_count.unwrap_or(0) + (files.len() - boundary)),
         // this will be executed if there is no bigram, in the worst case it will allocate
         // whole array of files but probability in the real repo of NO preflter working is so
         // low that we just ignore that, usually there would be at least a few files excluded
-        None => {
-            let mut out: Vec<&FileItem> = Vec::new();
-            for (idx, f) in files.iter().enumerate() {
-                if !basic_prefilter(f, max_file_size, definition_only) {
-                    continue;
-                }
-                if let Some(ref p) = plan
-                    && !p.matches(f, idx, arena, overflow_arena, &mut scratch)
-                {
-                    continue;
-                }
-                out.push(f);
-            }
-            out
-        }
+        None => Vec::new(),
     };
+    let mut consider = |file_idx: usize| {
+        let f = &files[file_idx];
+        if !basic_prefilter(f, max_file_size, definition_only) {
+            return;
+        }
+        if let Some(plan) = plan.as_ref()
+            && !plan.matches(f, file_idx, arenas, &mut scratch)
+        {
+            return;
+        }
+        prefiltered.push(f);
+    };
+
+    for span in spans {
+        let linear_start = match bigram_candidates {
+            Some(candidates) => {
+                let indexed_end = span.end.min(boundary);
+                if span.start < indexed_end {
+                    for_each_candidate(candidates, span.start..indexed_end, &mut consider);
+                }
+                span.start.max(indexed_end)
+            }
+            None => span.start,
+        };
+        for file_idx in linear_start..span.end {
+            consider(file_idx);
+        }
+    }
 
     let total_count = prefiltered.len();
 
     (RankedFiles::new(prefiltered, options), total_count)
+}
+
+/// Calls `f` with every candidate bit set inside `range`. Bits outside the
+/// range are masked off at word load, so a partial word never leaks files the
+/// bigram index does not cover.
+fn for_each_candidate(candidates: &[u64], range: Range<usize>, f: &mut impl FnMut(usize)) {
+    let first_word = range.start / 64;
+    let last_word = (range.end - 1) / 64;
+    for (word_idx, &word) in candidates
+        .iter()
+        .enumerate()
+        .take(last_word + 1)
+        .skip(first_word)
+    {
+        let mut bits = word;
+        if word_idx == first_word {
+            bits &= !0u64 << (range.start % 64);
+        }
+        let word_end = range.end - word_idx * 64;
+        if word_end < 64 {
+            bits &= (1u64 << word_end) - 1;
+        }
+        while bits != 0 {
+            let bit = bits.trailing_zeros() as usize;
+            bits &= bits - 1;
+            f(word_idx * 64 + bit);
+        }
+    }
 }
 
 fn strip_file_path_constraint_if_present<'a>(
@@ -357,8 +337,8 @@ mod tests {
                         candidates,
                         65,
                         &options,
-                        ArenaPtr::null(),
-                        ArenaPtr::null(),
+                        Arenas::single(ArenaPtr::null()),
+                        None,
                     );
                     assert_eq!(count, expected.len());
                     assert_eq!(

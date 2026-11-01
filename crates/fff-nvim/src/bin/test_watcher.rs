@@ -169,6 +169,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         offset: 0,
                         limit: 5,
                     },
+                    scope: Default::default(),
                 },
             );
 

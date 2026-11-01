@@ -1,9 +1,9 @@
 use crate::file_picker::{
     is_ambiguous_binary_name, is_known_binary_extension_basename, starts_with_binary_content,
 };
-use crate::ignore::IGNORED_DIRS;
+use crate::ignore::ignored_dir_globs;
 use crate::types::FileItem;
-use crate::walk::{WalkIgnoreRules, WalkOutput};
+use crate::walk::{DirHook, WalkIgnoreRules, WalkOutput};
 use parking_lot::Mutex;
 use std::path::Path;
 use std::sync::Arc;
@@ -16,10 +16,12 @@ const PROGRESS_STEP: usize = 13;
 #[tracing::instrument(skip_all, name = "zlob walker", level = "info")]
 pub(crate) fn walk_collect_files(
     base_path: &Path,
+    subtree: Option<&Path>,
     is_git_repo: bool,
     follow_symlinks: bool,
     threads: usize,
     synced_files_count: &Arc<AtomicUsize>,
+    on_dir: Option<&DirHook>,
 ) -> crate::Result<WalkOutput> {
     // gitignore on; skip hidden on non-git roots (so `~/` doesn't recurse into
     // ~/.cache, ~/.config, etc.); optionally follow symlinks.
@@ -39,10 +41,7 @@ pub(crate) fn walk_collect_files(
         // Bulk-fetch the only metadata FileItem needs; zlob never stats more.
         .metadata(WalkMetadata::SIZE | WalkMetadata::MTIME);
 
-    if !is_git_repo
-        && !IGNORED_DIRS.is_empty()
-        && let Err(e) = builder.extra_ignore(IGNORED_DIRS)
-    {
+    if !is_git_repo && let Err(e) = builder.extra_ignore(&ignored_dir_globs().collect::<Vec<_>>()) {
         // Interior NUL in one of the extra_ignore patterns would fail
         // here — treat as if no extras were supplied rather than
         // aborting the whole walk.
@@ -53,7 +52,22 @@ pub(crate) fn walk_collect_files(
     // dir, so this keeps one mutex acquisition per entry.
     let collected = Mutex::new((Vec::new(), Vec::new()));
 
+    let subtree = subtree
+        .map(|subtree| super::subtree_relative(base_path, subtree))
+        .transpose()?;
     let outcome = match builder.run(|entry| {
+        let relative_path = entry.relative_path_lossy();
+        if let Some(subtree) = subtree {
+            let path = Path::new(relative_path.as_ref());
+            if !path.starts_with(subtree) {
+                // Descend only into the ancestors leading to the subtree.
+                return if subtree.starts_with(path) {
+                    WalkState::Continue
+                } else {
+                    WalkState::SkipDir
+                };
+            }
+        }
         // Followed links keep the Symlink kind and lstat metadata, so stat
         // the target to index the ones resolving to files (#912).
         let target = if entry.is_file() {
@@ -65,13 +79,14 @@ pub(crate) fn walk_collect_files(
             }
         } else {
             // unlike ripgrep walker zlob doesnt show .git files
-            if entry.is_dir() {
-                let relative_path = entry.relative_path_lossy();
-                if !relative_path.is_empty() {
-                    let mut relative_path = relative_path.into_owned();
-                    relative_path.push('/');
-                    collected.lock().1.push(relative_path);
+            if entry.is_dir() && !relative_path.is_empty() {
+                // Reported while the parent is listed, so before this directory is read.
+                if let Some(on_dir) = on_dir {
+                    on_dir(&base_path.join(relative_path.as_ref()));
                 }
+                let mut relative_path = relative_path.into_owned();
+                relative_path.push('/');
+                collected.lock().1.push(relative_path);
             }
 
             return WalkState::Continue;
@@ -82,7 +97,7 @@ pub(crate) fn walk_collect_files(
         let basename_offset = entry.basename_offset_in_relative_lossy();
         // zlob emits '/'-separated relative paths, which is fff's canonical
         // internal form on every platform — store them verbatim.
-        let relative_path = entry.relative_path_lossy().into_owned();
+        let relative_path = relative_path.into_owned();
 
         // `basename()` returns `&str` for files only.
         let basename = match target {

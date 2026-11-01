@@ -1,6 +1,9 @@
 mod background_watcher;
 pub use background_watcher::*;
 
+mod held_events;
+pub(crate) use held_events::{EventHold, Released};
+
 mod watch;
 pub use watch::*;
 

@@ -22,6 +22,118 @@ use crate::watch::{WatchEvent, WatchEventKind, WatchOptions};
 use std::sync::mpsc;
 
 #[test]
+fn new_empty_directories_are_indexed_without_rescanning() {
+    let f = Fixture::new();
+    f.write("existing.rs", "fn existing() {}");
+    f.index();
+    std::fs::create_dir_all(f.path("new/empty/nested")).unwrap();
+
+    super::background_watcher::index_new_directory(
+        &f.path("new"),
+        &f.picker,
+        &f.frecency,
+        &f.git_workdir,
+        &f.git_worker,
+        None,
+    );
+
+    for path in ["new/", "new/empty/", "new/empty/nested/"] {
+        assert!(
+            f.indexed_dirs().contains(&path.to_owned()),
+            "missing {path}"
+        );
+    }
+    f.assert_no_rescan(&f.all_rescans(), "indexing empty directories");
+}
+
+#[test]
+fn recreated_empty_directories_reuse_and_revive_entries() {
+    let f = Fixture::new();
+    std::fs::create_dir_all(f.path("empty/nested")).unwrap();
+    f.index();
+    let original = f.indexed_dirs();
+    std::fs::remove_dir_all(f.path("empty")).unwrap();
+    f.feed([event(
+        EventKind::Remove(RemoveKind::Folder),
+        f.path("empty"),
+    )]);
+    assert!(!f.indexed_dirs().contains(&"empty/".to_owned()));
+
+    std::fs::create_dir_all(f.path("empty/nested")).unwrap();
+    for _ in 0..2 {
+        super::background_watcher::index_new_directory(
+            &f.path("empty"),
+            &f.picker,
+            &f.frecency,
+            &f.git_workdir,
+            &f.git_worker,
+            None,
+        );
+    }
+    assert_eq!(f.indexed_dirs(), original);
+    f.assert_no_rescan(&f.all_rescans(), "recreating empty directories");
+}
+
+#[test]
+fn new_empty_directories_preserve_ignore_rules() {
+    let f = Fixture::with_git();
+    f.write(".gitignore", "ignored/\n");
+    f.index();
+    std::fs::create_dir_all(f.path("new/kept/empty")).unwrap();
+    std::fs::create_dir_all(f.path("new/ignored/empty")).unwrap();
+    super::background_watcher::index_new_directory(
+        &f.path("new"),
+        &f.picker,
+        &f.frecency,
+        &f.git_workdir,
+        &f.git_worker,
+        None,
+    );
+    let dirs = f.indexed_dirs();
+    assert!(dirs.contains(&"new/kept/empty/".to_owned()));
+    assert!(!dirs.iter().any(|p| p.contains("ignored")), "{dirs:?}");
+}
+
+#[test]
+fn new_empty_directories_preserve_ignore_file_and_hidden_policy() {
+    let f = Fixture::new();
+    f.write(".ignore", "excluded/\n");
+    f.index();
+    for path in ["excluded/empty", ".hidden/empty", "included/empty"] {
+        std::fs::create_dir_all(f.path(path)).unwrap();
+        super::background_watcher::index_new_directory(
+            f.path(path).parent().unwrap(),
+            &f.picker,
+            &f.frecency,
+            &f.git_workdir,
+            &f.git_worker,
+            None,
+        );
+    }
+    assert_eq!(f.indexed_dirs(), vec!["included/", "included/empty/"]);
+}
+
+#[test]
+fn new_empty_directories_overflow_recovers_with_a_rescan() {
+    let f = Fixture::new();
+    f.index();
+    for i in 0..=MAX_OVERFLOW_FILES {
+        std::fs::create_dir_all(f.path(&format!("new/dir{i}"))).unwrap();
+    }
+    super::background_watcher::index_new_directory(
+        &f.path("new"),
+        &f.picker,
+        &f.frecency,
+        &f.git_workdir,
+        &f.git_worker,
+        None,
+    );
+    assert_eq!(f.all_rescans().count(RescanReason::IndexUpdateRejected), 1);
+    assert!(f.picker.wait_for_indexing_complete(Duration::from_secs(10)));
+    assert_eq!(f.indexed_dirs().len(), MAX_OVERFLOW_FILES + 2);
+}
+
+#[test]
 fn saving_an_indexed_file_stays_incremental() {
     let f = Fixture::new();
     f.write("src/main.rs", "fn main() {}");
@@ -637,6 +749,15 @@ fn ambiguous_batch_falls_back_to_remove_and_create() {
     let f = Fixture::new();
     f.write("src/a.rs", "same");
     f.write("src/b.rs", "same");
+    // Identical mtimes make the pair ambiguous even if the writes straddle a second.
+    let mtime = std::fs::metadata(f.path("src/a.rs"))
+        .unwrap()
+        .modified()
+        .unwrap();
+    std::fs::File::open(f.path("src/b.rs"))
+        .unwrap()
+        .set_modified(mtime)
+        .unwrap();
     f.index();
     let events = f.subscribe("**");
 
@@ -813,6 +934,19 @@ impl Fixture {
             .as_ref()
             .and_then(|p| p.get_file_by_path(self.path(rel)))
             .is_some_and(|file| !file.is_deleted())
+    }
+
+    fn indexed_dirs(&self) -> Vec<String> {
+        let guard = self.picker.read().unwrap();
+        let picker = guard.as_ref().unwrap();
+        let mut dirs: Vec<_> = picker
+            .get_dirs()
+            .iter()
+            .filter(|dir| !dir.is_deleted())
+            .map(|dir| dir.relative_path(picker).to_owned())
+            .collect();
+        dirs.sort();
+        dirs
     }
 
     fn all_rescans(&self) -> RescanStats {

@@ -1,21 +1,27 @@
 use crate::{
     git::is_modified_status,
-    index::constraints::apply_constraints,
+    index::constraints::{ConstraintPlan, ConstraintsBuffers},
     match_offsets::char_indices_to_byte_offsets,
+    parallelism::SearchBlocks,
     path_utils::DirectoryDistance,
-    simd_path::{ArenaPtr, MAX_PATH_CHUNKS},
+    scope::{ResolvedScope, ScopedPaths},
+    simd_path::{ArenaPtr, Arenas, ChunkedString, MAX_PATH_CHUNKS},
     sort_buffer::sort_with_buffer,
     types::{DirItem, FileItem, Score, ScoringContext},
 };
 use fff_query_parser::{FFFQuery, FuzzyQuery};
 use neo_frizbee::Scoring;
-use rayon::prelude::*;
 use smallvec::SmallVec;
 use std::{borrow::Cow, path::MAIN_SEPARATOR};
 
+// A slice of index files, whole or narrowed to the positions that passed the
+// scope and query constraints.
 enum FileItems<'a> {
     All(&'a [FileItem]),
-    Filtered(Vec<&'a FileItem>),
+    Selected {
+        files: &'a [FileItem],
+        positions: Vec<u32>,
+    },
 }
 
 impl<'a> FileItems<'a> {
@@ -23,7 +29,16 @@ impl<'a> FileItems<'a> {
     fn len(&self) -> usize {
         match self {
             FileItems::All(s) => s.len(),
-            FileItems::Filtered(v) => v.len(),
+            FileItems::Selected { positions, .. } => positions.len(),
+        }
+    }
+
+    // Position of a working item in the underlying slice.
+    #[inline]
+    fn position(&self, index: usize) -> usize {
+        match self {
+            FileItems::All(_) => index,
+            FileItems::Selected { positions, .. } => positions[index] as usize,
         }
     }
 
@@ -31,33 +46,146 @@ impl<'a> FileItems<'a> {
     fn index(&self, index: usize) -> &'a FileItem {
         match self {
             FileItems::All(s) => &s[index],
-            FileItems::Filtered(v) => v[index],
+            FileItems::Selected { files, positions } => &files[positions[index] as usize],
         }
     }
 }
 
-/// Resolve a FileItem's chunked path into frizbee's pointer buffer.
-/// Returns `Some((chunk_count, byte_len))` or `None` for deleted files.
-#[inline]
-fn resolve_file_chunks(
-    file: &FileItem,
-    arena: ArenaPtr,
-    buf: &mut [*const u8; MAX_PATH_CHUNKS],
-) -> Option<(usize, u16)> {
-    if file.is_deleted() {
-        return None;
+// Where the matcher reads a working file's path: the index path, or a
+// scope-relative copy aligned with the working slice.
+#[derive(Clone, Copy)]
+enum Haystacks<'h> {
+    Index(ArenaPtr),
+    Scoped {
+        arena: ArenaPtr,
+        paths: &'h [ChunkedString],
+        prefix_len: u16,
+    },
+}
+
+impl<'h> Haystacks<'h> {
+    fn scoped(scope: &ResolvedScope, arena: ArenaPtr, paths: &'h [ChunkedString]) -> Self {
+        Haystacks::Scoped {
+            arena,
+            paths,
+            prefix_len: scope.prefix_len() as u16,
+        }
     }
-    let ptrs = file.path.resolve_ptrs(arena, buf);
-    Some((ptrs.len(), file.path.byte_len))
+
+    /// Resolves into frizbee's pointer buffer; `None` for deleted files.
+    #[inline]
+    fn resolve(
+        &self,
+        files: &FileItems<'_>,
+        index: usize,
+        buf: &mut [*const u8; MAX_PATH_CHUNKS],
+    ) -> Option<(usize, u16)> {
+        let file = files.index(index);
+        if file.is_deleted() {
+            return None;
+        }
+        let (path, arena) = match self {
+            Haystacks::Index(arena) => (&file.path, *arena),
+            Haystacks::Scoped { arena, paths, .. } => (&paths[files.position(index)], *arena),
+        };
+        Some((path.resolve_ptrs(arena, buf).len(), path.byte_len))
+    }
+
+    // Match columns are haystack offsets, so filename bounds are compared there too.
+    #[inline]
+    fn filename_start(&self, file: &FileItem) -> u16 {
+        match self {
+            Haystacks::Index(_) => file.path.filename_offset,
+            Haystacks::Scoped { prefix_len, .. } => file.path.filename_offset - prefix_len,
+        }
+    }
+}
+
+// How a slice relates to the search scope.
+#[derive(Clone, Copy)]
+enum SliceScope<'s> {
+    Unscoped,
+    // Every file is under the scope; only the prefix is stripped for constraints.
+    Covered(&'s ResolvedScope),
+    // Files still need a membership check.
+    Mixed(&'s ResolvedScope),
+}
+
+impl<'s> SliceScope<'s> {
+    fn resolved(self) -> Option<&'s ResolvedScope> {
+        match self {
+            SliceScope::Unscoped => None,
+            SliceScope::Covered(scope) | SliceScope::Mixed(scope) => Some(scope),
+        }
+    }
+}
+
+// A contiguous run of index files read through one arena.
+struct Slice<'a, 's> {
+    files: &'a [FileItem],
+    arena: ArenaPtr,
+    scope: SliceScope<'s>,
+}
+
+impl<'a, 's> Slice<'a, 's> {
+    // Watcher-appended files come first: newly added files are more likely to
+    // be relevant and win score ties.
+    fn split(
+        files: &'a [FileItem],
+        base_count: usize,
+        arenas: Arenas,
+        scope: Option<&'s ResolvedScope>,
+    ) -> SmallVec<[Self; 3]> {
+        let base_count = base_count.min(files.len());
+        let overflow = Slice {
+            files: &files[base_count..],
+            arena: arenas.overflow,
+            scope: scope.map_or(SliceScope::Unscoped, SliceScope::Mixed),
+        };
+        let mut slices = SmallVec::new();
+        slices.push(overflow);
+        match scope {
+            None => slices.push(Slice {
+                files: &files[..base_count],
+                arena: arenas.base,
+                scope: SliceScope::Unscoped,
+            }),
+            Some(scope) => slices.extend(scope.base_files().into_iter().map(|range| Slice {
+                files: &files[range],
+                arena: arenas.base,
+                scope: SliceScope::Covered(scope),
+            })),
+        }
+        slices
+    }
+
+    // None when nothing in the slice passes.
+    fn select(&self, context: &ScoringContext) -> Option<FileItems<'a>> {
+        let constraints = &context.query.constraints;
+        if self.files.is_empty() {
+            return None;
+        }
+        if constraints.is_empty() && !matches!(self.scope, SliceScope::Mixed(_)) {
+            return Some(FileItems::All(self.files));
+        }
+        let arenas = Arenas::single(self.arena);
+        let positions =
+            ConstraintPlan::build(constraints, self.files, arenas, self.scope.resolved())
+                .select(self.files, arenas);
+        (!positions.is_empty()).then_some(FileItems::Selected {
+            files: self.files,
+            positions,
+        })
+    }
 }
 
 #[inline]
 fn match_fuzzy_parts(
     fuzzy_parts: &[&str],
     working_files: &FileItems<'_>,
+    haystacks: Haystacks<'_>,
     options: &neo_frizbee::Config,
     max_threads: usize,
-    arena: ArenaPtr,
 ) -> Vec<neo_frizbee::Match> {
     let valid_parts: SmallVec<[&str; 4]> = fuzzy_parts
         .iter()
@@ -80,11 +208,11 @@ fn match_fuzzy_parts(
     }
 
     // Narrow two-part queries with the longer part before scoring the shorter part.
-    let first_part_matches = match_file_range(
+    let first_part_matches = match_paths(
         valid_parts[first_part],
         working_files.len(),
         &|index, buf: &mut [*const u8; MAX_PATH_CHUNKS]| {
-            resolve_file_chunks(working_files.index(index as usize), arena, buf)
+            haystacks.resolve(working_files, index as usize, buf)
         },
         &first_options,
         max_threads,
@@ -109,12 +237,11 @@ fn match_fuzzy_parts(
         // Match only the files that survived the previous round, addressed
         // through the previous matches without collecting a subset.
         let survivors = &matches;
-        let sub_matches = match_file_range(
+        let sub_matches = match_paths(
             part,
             survivors.len(),
             &|index, buf: &mut [*const u8; MAX_PATH_CHUNKS]| {
-                let file = working_files.index(survivors[index as usize].index as usize);
-                resolve_file_chunks(file, arena, buf)
+                haystacks.resolve(working_files, survivors[index as usize].index as usize, buf)
             },
             &part_options,
             max_threads,
@@ -150,72 +277,69 @@ fn match_fuzzy_parts(
 }
 
 /// Match + score across base and overflow files, each with their own arena.
+/// A scope limits the search to its files, matched by scope-relative paths.
 #[tracing::instrument(skip_all, level = tracing::Level::DEBUG)]
 pub(crate) fn fuzzy_match_and_score_files<'a>(
     files: &'a [FileItem],
     context: &ScoringContext,
     base_count: usize,
-    base_arena: ArenaPtr,
-    overflow_arena: ArenaPtr,
+    arenas: Arenas,
+    scope: Option<&ResolvedScope>,
 ) -> (Vec<&'a FileItem>, Vec<Score>, usize) {
+    let slices = Slice::split(files, base_count, arenas, scope);
     if fuzzy_parts(context.query).is_none() {
-        return rank_by_frecency(files, context, base_count, base_arena, overflow_arena);
+        return rank_by_frecency(&slices, context, arenas);
     }
 
-    // Process overflow files first: newly added files (created after the
-    // initial scan) live in the overflow arena and are more likely to be
-    // relevant to the current search. Exact ties are broken by index order.
-    let results = if files.len() > base_count {
-        let mut results = match_and_score_in_arena(&files[base_count..], context, overflow_arena);
-
-        results.extend(match_and_score_in_arena(
-            &files[..base_count],
-            context,
-            base_arena,
-        ));
-
-        results
-    } else {
-        match_and_score_in_arena(files, context, base_arena)
-    };
+    // Overflow files (created after the initial scan) come first: they are
+    // more likely to be relevant to the current search. Exact ties are broken
+    // by index order.
+    let mut results = Vec::new();
+    let mut base_offset = 0;
+    for slice in slices.iter().filter(|slice| !slice.files.is_empty()) {
+        let matched = match slice.scope {
+            SliceScope::Unscoped => {
+                match_and_score_slice(slice, Haystacks::Index(slice.arena), context)
+            }
+            // Watcher-appended files are few and change between queries.
+            SliceScope::Mixed(scope) => {
+                let paths = ScopedPaths::for_files(scope, slice.files.iter(), slice.arena);
+                let haystacks = Haystacks::scoped(scope, paths.arena(), paths.paths());
+                match_and_score_slice(slice, haystacks, context)
+            }
+            // Scan-built files share one layout per scan and scope.
+            SliceScope::Covered(scope) => {
+                let paths = scope.base_file_paths(files, arenas.base);
+                let aligned = &paths.paths()[base_offset..][..slice.files.len()];
+                base_offset += slice.files.len();
+                let haystacks = Haystacks::scoped(scope, paths.arena(), aligned);
+                match_and_score_slice(slice, haystacks, context)
+            }
+        };
+        results.extend(matched);
+    }
 
     sort_and_paginate(results, context, |score| score.total)
 }
 
 // Ranks on a 16-byte (file, total) pair and builds the full Score only for the page.
 fn rank_by_frecency<'a>(
-    files: &'a [FileItem],
+    slices: &[Slice<'a, '_>],
     context: &ScoringContext,
-    base_count: usize,
-    base_arena: ArenaPtr,
-    overflow_arena: ArenaPtr,
+    arenas: Arenas,
 ) -> (Vec<&'a FileItem>, Vec<Score>, usize) {
-    let base_count = base_count.min(files.len());
     let mut totals: Vec<(&FileItem, i32)> = Vec::new();
-    for (slice, arena) in [
-        (&files[base_count..], overflow_arena),
-        (&files[..base_count], base_arena),
-    ] {
-        if slice.is_empty() {
-            continue;
-        }
-        let Some(working_files) = filter_by_constraints(slice, context, arena) else {
+    for slice in slices {
+        let Some(working_files) = slice.select(context) else {
             continue;
         };
-        frecency_totals(&working_files, context, arena, &mut totals);
+        frecency_totals(&working_files, context, slice.arena, &mut totals);
     }
 
     let (items, _, total_matched) = sort_and_paginate(totals, context, |total| *total);
     let scores = items
         .iter()
-        .map(|file| {
-            let arena = if file.is_overflow() {
-                overflow_arena
-            } else {
-                base_arena
-            };
-            frecency_score(file, context, arena)
-        })
+        .map(|file| frecency_score(file, context, arenas.select(file.is_overflow())))
         .collect();
     (items, scores, total_matched)
 }
@@ -228,29 +352,14 @@ fn fuzzy_parts<'q>(query: &'q FFFQuery<'q>) -> Option<&'q [&'q str]> {
     }
 }
 
-// None when constraints exclude every file.
-fn filter_by_constraints<'a>(
-    files: &'a [FileItem],
-    context: &ScoringContext,
-    arena: ArenaPtr,
-) -> Option<FileItems<'a>> {
-    let constraints = &context.query.constraints;
-    if constraints.is_empty() {
-        return Some(FileItems::All(files));
-    }
-    match apply_constraints(files, constraints, arena, arena) {
-        Some(filtered) if !filtered.is_empty() => Some(FileItems::Filtered(filtered)),
-        Some(_) => None,
-        None => Some(FileItems::All(files)),
-    }
-}
-
+/// Highlight ranges for a result page, as byte offsets into each item's path
+/// relative to the searched scope.
 pub(crate) fn fuzzy_match_byte_offsets_for_page<'q>(
     query: &'q FFFQuery<'q>,
     items: &[&FileItem],
     max_typos: u16,
-    base_arena: ArenaPtr,
-    overflow_arena: ArenaPtr,
+    arenas: Arenas,
+    scope: Option<&ResolvedScope>,
 ) -> Vec<SmallVec<[(u32, u32); 4]>> {
     let parts: SmallVec<[&str; 4]> = match &query.fuzzy_query {
         FuzzyQuery::Text(text) if text.len() >= 2 => smallvec::smallvec![*text],
@@ -265,12 +374,8 @@ pub(crate) fn fuzzy_match_byte_offsets_for_page<'q>(
 
     let mut paths = String::with_capacity(items.iter().map(|item| item.relative_path_len()).sum());
     for item in items {
-        let arena = if item.is_overflow() {
-            overflow_arena
-        } else {
-            base_arena
-        };
-        item.path.append_to_string(arena, &mut paths);
+        item.path
+            .append_to_string(arenas.select(item.is_overflow()), &mut paths);
     }
 
     let mut start = 0;
@@ -280,7 +385,7 @@ pub(crate) fn fuzzy_match_byte_offsets_for_page<'q>(
             let end = start + item.relative_path_len();
             let path = &paths[start..end];
             start = end;
-            path
+            scope.map_or(path, |scope| scope.relative(path))
         })
         .collect();
 
@@ -350,32 +455,67 @@ fn merge_byte_offsets(mut ranges: SmallVec<[(u32, u32); 4]>) -> SmallVec<[(u32, 
     ranges
 }
 
-/// Resolve a DirItem's chunked path into frizbee's pointer buffer.
-#[inline]
-fn resolve_dir_chunks(
-    dir: &DirItem,
-    arena: ArenaPtr,
-    overflow_arena: ArenaPtr,
-    buf: &mut [*const u8; MAX_PATH_CHUNKS],
-) -> Option<(usize, u16)> {
-    let arena = if dir.is_overflow() {
-        overflow_arena
-    } else {
-        arena
-    };
-    let ptrs = dir.path.resolve_ptrs(arena, buf);
-    Some((ptrs.len(), dir.path.byte_len))
+// Where the matcher reads a dir path: the index path, or scope-relative copies
+// for the scan-built run and the watcher-appended region of the dir table.
+enum DirHaystacks<'h> {
+    Index(Arenas),
+    Scoped {
+        base: &'h ScopedPaths,
+        base_start: u32,
+        overflow: ScopedPaths,
+        base_dirs_count: usize,
+        prefix_len: u16,
+    },
+}
+
+impl DirHaystacks<'_> {
+    #[inline]
+    fn resolve(
+        &self,
+        dirs: &[DirItem],
+        index: u32,
+        buf: &mut [*const u8; MAX_PATH_CHUNKS],
+    ) -> Option<(usize, u16)> {
+        let (path, arena) = match self {
+            DirHaystacks::Index(arenas) => {
+                let dir = &dirs[index as usize];
+                (&dir.path, arenas.select(dir.is_overflow()))
+            }
+            DirHaystacks::Scoped {
+                base,
+                base_start,
+                overflow,
+                base_dirs_count,
+                ..
+            } => match (index as usize).checked_sub(*base_dirs_count) {
+                Some(overflow_index) => (&overflow.paths()[overflow_index], overflow.arena()),
+                None => (&base.paths()[(index - base_start) as usize], base.arena()),
+            },
+        };
+        Some((path.resolve_ptrs(arena, buf).len(), path.byte_len))
+    }
+
+    // The scope dir itself is the empty haystack, whose last segment starts at 0.
+    #[inline]
+    fn last_segment_start(&self, dir: &DirItem) -> u16 {
+        match self {
+            DirHaystacks::Index(_) => dir.last_segment_offset(),
+            DirHaystacks::Scoped { prefix_len, .. } => {
+                dir.last_segment_offset().saturating_sub(*prefix_len)
+            }
+        }
+    }
 }
 
 /// Run SIMD fuzzy match across directory items, narrowing the candidate set
 /// through each query part — same pipeline as file matching.
 fn match_fuzzy_parts_dirs(
     fuzzy_parts: &[&str],
-    working_dirs: &[&DirItem],
+    dirs: &[DirItem],
+    working_dirs: &[u32],
+    haystacks: &DirHaystacks<'_>,
     options: &neo_frizbee::Config,
     max_threads: usize,
-    arena: ArenaPtr,
-    overflow_arena: ArenaPtr,
 ) -> Vec<neo_frizbee::Match> {
     let valid_parts: SmallVec<[&str; 4]> = fuzzy_parts
         .iter()
@@ -387,11 +527,11 @@ fn match_fuzzy_parts_dirs(
         return vec![];
     }
 
-    let first_part_matches = neo_frizbee::match_range_parallel_resolved(
+    let first_part_matches = match_paths(
         valid_parts[0],
         working_dirs.len(),
         &|index, buf: &mut [*const u8; MAX_PATH_CHUNKS]| {
-            resolve_dir_chunks(working_dirs[index as usize], arena, overflow_arena, buf)
+            haystacks.resolve(dirs, working_dirs[index as usize], buf)
         },
         options,
         max_threads,
@@ -410,12 +550,12 @@ fn match_fuzzy_parts_dirs(
         // Match only the dirs that survived the previous round, addressed
         // through the previous matches without collecting a subset.
         let survivors = &matches;
-        let sub_matches = neo_frizbee::match_range_parallel_resolved(
+        let sub_matches = match_paths(
             part,
             survivors.len(),
             &|index, buf: &mut [*const u8; MAX_PATH_CHUNKS]| {
                 let dir = working_dirs[survivors[index as usize].index as usize];
-                resolve_dir_chunks(dir, arena, overflow_arena, buf)
+                haystacks.resolve(dirs, dir, buf)
             },
             &part_options,
             max_threads,
@@ -446,38 +586,57 @@ fn match_fuzzy_parts_dirs(
     matches
 }
 
+// Dir table indices of live dirs that pass the scope and query constraints.
+fn select_dirs(
+    dirs: &[DirItem],
+    context: &ScoringContext,
+    arenas: Arenas,
+    scope: Option<&ResolvedScope>,
+) -> Vec<u32> {
+    let constraints = &context.query.constraints;
+    let plan = (!constraints.is_empty() || scope.is_some())
+        .then(|| ConstraintPlan::build(constraints, dirs, arenas, scope));
+    let live = |&index: &u32| !dirs[index as usize].is_deleted();
+    match (scope, plan) {
+        (None, None) => (0..dirs.len() as u32).filter(live).collect(),
+        (None, Some(plan)) => plan.select(dirs, arenas).into_iter().filter(live).collect(),
+        (Some(scope), plan) => {
+            let mut scratch = ConstraintsBuffers::new();
+            scope
+                .dir_indices()
+                .filter(live)
+                .filter(|&index| {
+                    plan.as_ref().is_none_or(|plan| {
+                        plan.matches(&dirs[index as usize], index as usize, arenas, &mut scratch)
+                    })
+                })
+                .collect()
+        }
+    }
+}
+
 /// Match + score directories against a fuzzy query.
 /// Scoring: base_score, frecency_boost, distance_penalty, dirname_bonus.
 #[tracing::instrument(skip_all, level = tracing::Level::DEBUG)]
 pub(crate) fn fuzzy_match_and_score_dirs<'a>(
     dirs: &'a [DirItem],
+    base_dirs_count: usize,
     context: &ScoringContext,
-    arena: ArenaPtr,
-    overflow_arena: ArenaPtr,
+    arenas: Arenas,
+    scope: Option<&ResolvedScope>,
 ) -> (Vec<&'a DirItem>, Vec<Score>, usize) {
-    if dirs.is_empty() {
+    // Ghost dirs (all files tombstoned) never surface in search results.
+    let working_dirs = select_dirs(dirs, context, arenas, scope);
+    if working_dirs.is_empty() {
         return (vec![], vec![], 0);
     }
 
     let parsed_query = context.query;
-    // Ghost dirs (all files tombstoned) never surface in search results.
-    let working_dirs: Vec<&DirItem> = if parsed_query.constraints.is_empty() {
-        dirs.iter().filter(|d| !d.is_deleted()).collect()
-    } else {
-        match apply_constraints(dirs, &parsed_query.constraints, arena, overflow_arena) {
-            Some(filtered) if !filtered.is_empty() => {
-                filtered.into_iter().filter(|d| !d.is_deleted()).collect()
-            }
-            Some(_) => return (vec![], vec![], 0),
-            None => dirs.iter().filter(|d| !d.is_deleted()).collect(),
-        }
-    };
-
     let fuzzy_parts: &[&str] = match &parsed_query.fuzzy_query {
         FuzzyQuery::Text(t) if t.len() >= 2 => std::slice::from_ref(t),
         FuzzyQuery::Parts(parts) if !parts.is_empty() => parts.as_slice(),
         _ => {
-            return score_dirs_by_frecency(&working_dirs, context);
+            return score_dirs_by_frecency(dirs, &working_dirs, context);
         }
     };
 
@@ -488,7 +647,7 @@ pub(crate) fn fuzzy_match_and_score_dirs<'a>(
         .collect();
 
     if valid_parts.is_empty() {
-        return score_dirs_by_frecency(&working_dirs, context);
+        return score_dirs_by_frecency(dirs, &working_dirs, context);
     }
 
     let has_uppercase = valid_parts
@@ -506,13 +665,28 @@ pub(crate) fn fuzzy_match_and_score_dirs<'a>(
         ..Default::default()
     };
 
+    let base_dirs_count = base_dirs_count.min(dirs.len());
+    let haystacks = match scope {
+        None => DirHaystacks::Index(arenas),
+        Some(scope) => DirHaystacks::Scoped {
+            base: scope.base_dir_paths(dirs, arenas.base),
+            base_start: scope.base_dirs_start(),
+            overflow: ScopedPaths::for_dirs(
+                scope,
+                (base_dirs_count..dirs.len()).map(|index| (index as u32, &dirs[index])),
+                arenas.overflow,
+            ),
+            base_dirs_count,
+            prefix_len: scope.prefix_len() as u16,
+        },
+    };
     let path_matches = match_fuzzy_parts_dirs(
         fuzzy_parts,
+        dirs,
         &working_dirs,
+        &haystacks,
         &options,
         context.max_threads,
-        arena,
-        overflow_arena,
     );
 
     let main_needle = valid_parts[0].as_bytes();
@@ -525,12 +699,8 @@ pub(crate) fn fuzzy_match_and_score_dirs<'a>(
     let results: Vec<(&DirItem, Score)> = path_matches
         .into_iter()
         .map(|path_match| {
-            let dir = working_dirs[path_match.index as usize];
-            let dir_arena = if dir.is_overflow() {
-                overflow_arena
-            } else {
-                arena
-            };
+            let dir = &dirs[working_dirs[path_match.index as usize] as usize];
+            let dir_arena = arenas.select(dir.is_overflow());
             let base_score = path_match.score as i32;
             let frecency_boost = base_score.saturating_mul(dir.max_access_frecency()) / 100;
 
@@ -543,7 +713,7 @@ pub(crate) fn fuzzy_match_and_score_dirs<'a>(
             };
 
             // Dirname bonus: if the match is in the last path segment.
-            let last_seg_offset = dir.last_segment_offset();
+            let last_seg_offset = haystacks.last_segment_start(dir);
             let match_start_approx = path_match.end_col.saturating_sub(main_needle_len - 1);
             let is_dirname_match = match_start_approx >= last_seg_offset;
 
@@ -598,12 +768,14 @@ pub(crate) fn fuzzy_match_and_score_dirs<'a>(
 }
 
 fn score_dirs_by_frecency<'a>(
-    dirs: &[&'a DirItem],
+    dirs: &'a [DirItem],
+    working_dirs: &[u32],
     context: &ScoringContext,
 ) -> (Vec<&'a DirItem>, Vec<Score>, usize) {
-    let results: Vec<(&DirItem, Score)> = dirs
+    let results: Vec<(&DirItem, Score)> = working_dirs
         .iter()
-        .map(|&dir| {
+        .map(|&index| {
+            let dir = &dirs[index as usize];
             let score = Score {
                 total: dir.max_access_frecency(),
                 frecency_boost: dir.max_access_frecency(),
@@ -659,33 +831,30 @@ fn sort_and_paginate_dirs<'a>(
     (items, scores, total_matched)
 }
 
-fn match_and_score_in_arena<'a>(
-    files: &'a [FileItem],
+fn match_and_score_slice<'a>(
+    slice: &Slice<'a, '_>,
+    haystacks: Haystacks<'_>,
     context: &ScoringContext,
-    arena: ArenaPtr,
 ) -> Vec<(&'a FileItem, Score)> {
+    let Some(working_files) = slice.select(context) else {
+        return vec![];
+    };
     if context.current_file.is_some() {
-        match_and_score_in_arena_inner::<true>(files, context, arena)
+        match_and_score_working_files::<true>(&working_files, haystacks, context, slice.arena)
     } else {
-        match_and_score_in_arena_inner::<false>(files, context, arena)
+        match_and_score_working_files::<false>(&working_files, haystacks, context, slice.arena)
     }
 }
 
-fn match_and_score_in_arena_inner<'a, const WITH_CURRENT_FILE: bool>(
-    files: &'a [FileItem],
+fn match_and_score_working_files<'a, const WITH_CURRENT_FILE: bool>(
+    working_files: &FileItems<'a>,
+    haystacks: Haystacks<'_>,
     context: &ScoringContext,
     arena: ArenaPtr,
 ) -> Vec<(&'a FileItem, Score)> {
-    if files.is_empty() {
-        return vec![];
-    }
-
-    let Some(working_files) = filter_by_constraints(files, context, arena) else {
-        return vec![];
-    };
     let Some(fuzzy_parts) = fuzzy_parts(context.query) else {
         // Frecency-only queries are ranked by `rank_by_frecency` before reaching here.
-        return frecency_scores(&working_files, context, arena);
+        return frecency_scores(working_files, context, arena);
     };
     let has_uppercase = fuzzy_parts
         .iter()
@@ -709,10 +878,10 @@ fn match_and_score_in_arena_inner<'a, const WITH_CURRENT_FILE: bool>(
 
     let path_matches = match_fuzzy_parts(
         fuzzy_parts,
-        &working_files,
+        working_files,
+        haystacks,
         &options,
         context.max_threads,
-        arena,
     );
 
     let main_needle = fuzzy_parts[0].as_bytes(); // safe
@@ -727,7 +896,7 @@ fn match_and_score_in_arena_inner<'a, const WITH_CURRENT_FILE: bool>(
 
         for (i, path_match) in path_matches.iter().enumerate() {
             let file = working_files.index(path_match.index as usize);
-            let filename_start = file.filename_offset_in_relative_path() as u16;
+            let filename_start = haystacks.filename_start(file);
             let match_start_approx = path_match.end_col.saturating_sub(main_needle_len - 1);
 
             if match_start_approx < filename_start {
@@ -742,14 +911,7 @@ fn match_and_score_in_arena_inner<'a, const WITH_CURRENT_FILE: bool>(
             // Match on `&str` so frizbee reuses the instantiation its index
             // resolver already emits instead of a separate `Cow<str>` copy.
             let filename_strs: Vec<&str> = fallback_filenames.iter().map(Cow::as_ref).collect();
-            neo_frizbee::Matcher::new(fuzzy_parts[0], &options).match_list_parallel(
-                &filename_strs,
-                if path_matches.len() > 4096 {
-                    context.max_threads.div_ceil(2048)
-                } else {
-                    1
-                },
-            )
+            neo_frizbee::Matcher::new(fuzzy_parts[0], &options).match_list(&filename_strs)
         }
     };
 
@@ -807,7 +969,7 @@ fn match_and_score_in_arena_inner<'a, const WITH_CURRENT_FILE: bool>(
                 0
             };
 
-            let filename_start = file.filename_offset_in_relative_path() as u16;
+            let filename_start = haystacks.filename_start(file);
             let match_start_approx = path_match.end_col.saturating_sub(main_needle_len - 1);
 
             let end_col_filename_match = match_start_approx >= filename_start;
@@ -947,28 +1109,17 @@ fn match_and_score_in_arena_inner<'a, const WITH_CURRENT_FILE: bool>(
             (file, score)
         };
 
-    // Scoring is a pure per-match function; only the scratch buffers are per-thread.
-    let results: Vec<_> =
-        if path_matches.len() >= PARALLEL_SCORING_MIN_MATCHES && context.max_threads > 1 {
-            path_matches
-                .par_iter()
-                .enumerate()
-                .with_min_len((path_matches.len() / context.max_threads).max(4096))
-                .map_init(ScoreBuffers::new, score_match)
-                .collect()
-        } else {
-            let mut bufs = ScoreBuffers::new();
-            path_matches
-                .iter()
-                .enumerate()
-                .map(|item| score_match(&mut bufs, item))
-                .collect()
-        };
-
-    results
+    // Scoring is a pure per-match function; only the scratch buffers are per-job.
+    SCORING_BLOCKS.max_jobs(context.max_threads).filter_map(
+        &path_matches,
+        ScoreBuffers::new,
+        |bufs, match_idx, path_match| Some(score_match(bufs, (match_idx, path_match))),
+    )
 }
 
-const PARALLEL_SCORING_MIN_MATCHES: usize = 8192;
+const SCORING_BLOCKS: SearchBlocks = SearchBlocks::new(8192, 16_384);
+const FRECENCY_BLOCKS: SearchBlocks = SearchBlocks::new(32_768, 65_536);
+const PATH_MATCH_BLOCKS: SearchBlocks = SearchBlocks::new(2048, 16_384);
 
 struct ScoreBuffers {
     dir_buf: String,
@@ -1055,17 +1206,21 @@ fn frecency_totals<'a>(
 ) {
     let total = |file: &'a FileItem| (file, frecency_total(file, context, arena));
     match files {
-        // Small indexes cannot amortize Rayon scheduling for this cheap scoring pass.
-        FileItems::All(s) if s.len() >= 32_768 && context.max_threads > 1 => out.par_extend(
-            s.par_iter()
-                .with_min_len(4096)
+        FileItems::All(s) => FRECENCY_BLOCKS
+            .max_jobs(context.max_threads)
+            .extend_filter_map(
+                out,
+                s,
+                || (),
+                |_, _, file| (!file.is_deleted()).then(|| total(file)),
+            ),
+        FileItems::Selected { files, positions } => out.extend(
+            positions
+                .iter()
+                .map(|&position| &files[position as usize])
                 .filter(|f| !f.is_deleted())
                 .map(total),
         ),
-        FileItems::All(s) => out.extend(s.iter().filter(|f| !f.is_deleted()).map(total)),
-        FileItems::Filtered(v) => {
-            out.extend(v.iter().copied().filter(|f| !f.is_deleted()).map(total))
-        }
     }
 }
 
@@ -1155,7 +1310,8 @@ fn sort_and_paginate<'a, S>(
     (items, scores, total_matched)
 }
 
-fn match_file_range<F>(
+// Matches come back in index order; callers rank them.
+fn match_paths<F>(
     needle: &str,
     len: usize,
     resolve: &F,
@@ -1165,55 +1321,19 @@ fn match_file_range<F>(
 where
     F: Fn(u32, &mut [*const u8; MAX_PATH_CHUNKS]) -> Option<(usize, u16)> + Sync,
 {
-    // The rayon path below flattens per-worker results and never sorts, so
-    // any sorted strategy stays on frizbee's own k-merge implementation.
-    let unsorted = matches!(options.sort, neo_frizbee::SortStrategy::Unsorted);
-    if len < 32_768 || !unsorted {
-        return neo_frizbee::match_range_parallel_resolved(
-            needle,
-            len,
-            resolve,
-            options,
-            max_threads,
-        );
-    }
+    debug_assert!(matches!(options.sort, neo_frizbee::SortStrategy::Unsorted));
     assert!(
         len <= u32::MAX as usize,
         "too many files for fuzzy matching"
     );
-    let mut matcher = neo_frizbee::Matcher::new(needle, options);
-    let max_threads = if max_threads == 0 {
-        std::thread::available_parallelism()
-            .map(|n| n.get().saturating_sub(2))
-            .unwrap_or(1)
-    } else {
-        max_threads
-    };
-    let workers = max_threads.max(1).min(len.div_ceil(2000));
-    if workers <= 1 {
-        return matcher.match_range_resolved(len, resolve);
-    }
-    let chunk_size = len.div_ceil(workers * 4).clamp(2048, 16_384);
-    let next = std::sync::atomic::AtomicUsize::new(0);
-    (0..workers)
-        .into_par_iter()
-        .map(|_| {
-            let mut matcher = matcher.clone();
-            let mut matches = Vec::new();
-            loop {
-                let start = next.fetch_add(chunk_size, std::sync::atomic::Ordering::Relaxed);
-                if start >= len {
-                    break;
-                }
-                let end = (start + chunk_size).min(len);
-                matcher.match_range_resolved_into(start as u32..end as u32, resolve, &mut matches);
-            }
-            matches
-        })
-        .collect::<Vec<_>>()
-        .into_iter()
-        .flatten()
-        .collect()
+    let matcher = neo_frizbee::Matcher::new(needle, options);
+    PATH_MATCH_BLOCKS.max_jobs(max_threads).map_ranges(
+        len,
+        || matcher.clone(),
+        |matcher, range, out| {
+            matcher.match_range_resolved_into(range.start as u32..range.end as u32, resolve, out)
+        },
+    )
 }
 
 #[cfg(test)]
@@ -1221,6 +1341,19 @@ mod tests {
     use super::*;
     use crate::types::PaginationArgs;
     use fff_query_parser::QueryParser;
+
+    pub(super) fn match_all_in_arena<'a>(
+        files: &'a [FileItem],
+        context: &ScoringContext,
+        arena: ArenaPtr,
+    ) -> Vec<(&'a FileItem, Score)> {
+        let slice = Slice {
+            files,
+            arena,
+            scope: SliceScope::Unscoped,
+        };
+        match_and_score_slice(&slice, Haystacks::Index(arena), context)
+    }
 
     #[test]
     fn longer_second_part_preserves_matches_and_first_part_positions() {
@@ -1259,10 +1392,17 @@ mod tests {
                     sort: neo_frizbee::SortStrategy::Unsorted,
                     ..Default::default()
                 };
-                let first = match_fuzzy_parts(&parts[..1], &working, &options, 1, arena);
+                let first =
+                    match_fuzzy_parts(&parts[..1], &working, Haystacks::Index(arena), &options, 1);
                 let mut second_options = options;
                 second_options.max_typos = Some(max_typos.min(parts[1].len() as u16));
-                let second = match_fuzzy_parts(&parts[1..], &working, &second_options, 1, arena);
+                let second = match_fuzzy_parts(
+                    &parts[1..],
+                    &working,
+                    Haystacks::Index(arena),
+                    &second_options,
+                    1,
+                );
                 let mut expected: Vec<_> = first
                     .iter()
                     .filter_map(|a| {
@@ -1275,10 +1415,11 @@ mod tests {
                         ))
                     })
                     .collect();
-                let mut actual: Vec<_> = match_fuzzy_parts(&parts, &working, &options, 4, arena)
-                    .iter()
-                    .map(|m| (m.index, m.score, m.end_col, m.exact))
-                    .collect();
+                let mut actual: Vec<_> =
+                    match_fuzzy_parts(&parts, &working, Haystacks::Index(arena), &options, 4)
+                        .iter()
+                        .map(|m| (m.index, m.score, m.end_col, m.exact))
+                        .collect();
                 expected.sort_unstable();
                 actual.sort_unstable();
                 assert_eq!(actual, expected, "{parts:?}, typos={max_typos}");
@@ -1342,9 +1483,9 @@ mod tests {
                     min_combo_count: 3,
                     pagination: PaginationArgs::default(),
                 };
-                let mut parallel = match_and_score_in_arena(&files, &context, arena);
+                let mut parallel = match_all_in_arena(&files, &context, arena);
                 context.max_threads = 1;
-                let mut sequential = match_and_score_in_arena(&files, &context, arena);
+                let mut sequential = match_all_in_arena(&files, &context, arena);
                 parallel.sort_unstable_by_key(|(file, _)| file.modified);
                 sequential.sort_unstable_by_key(|(file, _)| file.modified);
                 assert_eq!(parallel.len(), sequential.len(), "{text}");
@@ -1424,13 +1565,9 @@ mod tests {
             context.max_threads = 4;
             let (expected_items, expected_scores, expected_total) =
                 sort_and_paginate(parallel, &context, |score| score.total);
-            let (items, scores, total) = rank_by_frecency(
-                &files[..count],
-                &context,
-                count / 2,
-                ArenaPtr::null(),
-                ArenaPtr::null(),
-            );
+            let arenas = Arenas::single(ArenaPtr::null());
+            let slices = Slice::split(&files[..count], count / 2, arenas, None);
+            let (items, scores, total) = rank_by_frecency(&slices, &context, arenas);
             assert_eq!(total, expected_total);
             assert_eq!(items.len(), expected_items.len());
             for ((a, a_score), (b, b_score)) in items
@@ -1791,8 +1928,8 @@ mod filename_bonus_tests {
             &query,
             &[&base[0], &overflow[0]],
             0,
-            base_arena,
-            overflow_arena,
+            Arenas::new(base_arena, overflow_arena),
+            None,
         );
         for (path, ranges) in [base_path, overflow_path].into_iter().zip(ranges) {
             let start = path.find("controller").unwrap() as u32;
@@ -1828,7 +1965,7 @@ mod filename_bonus_tests {
                 limit: 50,
             },
         };
-        let results = match_and_score_in_arena(&files, &context, arena);
+        let results = super::tests::match_all_in_arena(&files, &context, arena);
         assert_eq!(results.len(), files.len());
         for (file, score) in results {
             assert_eq!(
@@ -1907,7 +2044,7 @@ mod filename_bonus_tests {
             },
         };
         let (items, scores, _) =
-            fuzzy_match_and_score_files(files, &ctx, files.len(), arena, arena);
+            fuzzy_match_and_score_files(files, &ctx, files.len(), Arenas::single(arena), None);
         items
             .iter()
             .zip(scores.iter())
@@ -2149,7 +2286,7 @@ mod git_recency_scoring_tests {
             },
         };
         let (items, scores, _) =
-            fuzzy_match_and_score_files(files, &ctx, files.len(), arena, arena);
+            fuzzy_match_and_score_files(files, &ctx, files.len(), Arenas::single(arena), None);
         items
             .iter()
             .zip(scores)
@@ -2237,7 +2374,8 @@ mod typo_resistance_tests {
                 limit: 100,
             },
         };
-        let (items, _, _) = fuzzy_match_and_score_files(files, &ctx, files.len(), arena, arena);
+        let (items, _, _) =
+            fuzzy_match_and_score_files(files, &ctx, files.len(), Arenas::single(arena), None);
         items.iter().map(|f| f.relative_path(arena)).collect()
     }
 
@@ -2347,7 +2485,7 @@ mod constraint_only_query_tests {
         };
 
         let (items, _scores, total_matched) =
-            fuzzy_match_and_score_files(&files, &ctx, files.len(), arena, arena);
+            fuzzy_match_and_score_files(&files, &ctx, files.len(), Arenas::single(arena), None);
 
         assert_eq!(
             total_matched, 1,
@@ -2398,7 +2536,7 @@ mod constraint_only_query_tests {
         };
 
         let (items, _scores, total_matched) =
-            fuzzy_match_and_score_files(&files, &ctx, files.len(), arena, arena);
+            fuzzy_match_and_score_files(&files, &ctx, files.len(), Arenas::single(arena), None);
 
         assert_eq!(total_matched, 1);
         assert_eq!(items[0].relative_path(arena), "a.rs");

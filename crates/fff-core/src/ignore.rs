@@ -1,4 +1,5 @@
-use std::path::Path;
+use std::ffi::OsStr;
+use std::path::{Component, Path};
 
 /// Directories excluded when walking a non-git root. Entries are `cfg`-gated
 /// so a single iteration covers standard + platform-specific overrides.
@@ -64,19 +65,54 @@ pub(crate) const IGNORED_DIRS: &[&str] = &[
     "AppData/Roaming",
 ];
 
+/// [`IGNORED_DIRS`] as gitignore globs: directories whose path ends with the
+/// entry, at any depth below the walk root. Every walker backend excludes
+/// exactly these, so the exclusions do not depend on where the root sits.
+pub(crate) fn ignored_dir_globs() -> impl Iterator<Item = String> {
+    IGNORED_DIRS.iter().map(|dir| format!("**/{dir}/"))
+}
+
 #[cfg(all(not(feature = "zlob"), feature = "ripgrep"))]
 pub(crate) fn non_git_repo_overrides(base_path: &Path) -> Option<ignore::overrides::Override> {
     use ignore::overrides::OverrideBuilder;
 
     let mut builder = OverrideBuilder::new(base_path);
-    for dir in IGNORED_DIRS {
-        let pattern = format!("!**/{dir}/");
+    // Overrides are a whitelist, so a leading `!` excludes.
+    for glob in ignored_dir_globs() {
+        let pattern = format!("!{glob}");
         if let Err(e) = builder.add(&pattern) {
             tracing::warn!("failed to add ignore pattern {pattern}: {e}");
         }
     }
 
     builder.build().ok()
+}
+
+/// Whether an index rooted at a non-repository directory excludes the same
+/// entries under `subtree` (relative to that root) as an index rooted at `subtree`.
+pub fn subtree_keeps_ignored_dirs(subtree: &Path) -> bool {
+    let mut parts = Vec::new();
+    for component in subtree.components() {
+        match component {
+            Component::Normal(part) => parts.push(part),
+            Component::CurDir => {}
+            _ => return false,
+        }
+    }
+    parts.is_empty()
+        || IGNORED_DIRS
+            .iter()
+            .all(|pattern| pattern_agrees_under(&parts, pattern))
+}
+
+// A pattern matches dirs whose path ends with it, at any depth (see
+// `ignored_dir_globs`). Disagreement: the subtree lies inside a match, or a
+// match starts above the subtree root and ends below it.
+fn pattern_agrees_under(parts: &[&OsStr], pattern: &str) -> bool {
+    let pattern: Vec<&OsStr> = pattern.split('/').map(OsStr::new).collect();
+    let inside_match = (1..=parts.len()).any(|end| parts[..end].ends_with(&pattern));
+    let spans_root = (1..pattern.len()).any(|len| parts.ends_with(&pattern[..len]));
+    !inside_match && !spans_root
 }
 
 pub(crate) fn is_non_code_directory(path: &Path) -> bool {
@@ -94,6 +130,28 @@ pub(crate) fn is_non_code_directory(path: &Path) -> bool {
         #[cfg(not(target_os = "windows"))]
         path_str.contains(dir)
     })
+}
+
+#[cfg(test)]
+mod subtree_tests {
+    use super::*;
+
+    #[test]
+    fn root_and_subtrees_outside_matches_keep_the_exclusions() {
+        assert!(subtree_keeps_ignored_dirs(Path::new("")));
+        assert!(subtree_keeps_ignored_dirs(Path::new(".")));
+        assert!(!subtree_keeps_ignored_dirs(Path::new("a/node_modules/b")));
+        assert!(!subtree_keeps_ignored_dirs(Path::new("../a")));
+    }
+
+    #[test]
+    fn multi_segment_patterns_match_at_any_depth() {
+        assert!(subtree_keeps_ignored_dirs(Path::new("proj/src")));
+        // `target/debug` would start above `proj/target` and end below it.
+        assert!(!subtree_keeps_ignored_dirs(Path::new("proj/target")));
+        assert!(!subtree_keeps_ignored_dirs(Path::new("go/pkg")));
+        assert!(!subtree_keeps_ignored_dirs(Path::new("x/target/debug/y")));
+    }
 }
 
 #[cfg(all(test, target_os = "macos"))]

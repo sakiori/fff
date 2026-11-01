@@ -3,6 +3,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, RwLock, RwLockReadGuard, RwLockWriteGuard, Weak};
 use std::time::{Duration, Instant};
 
+use crate::coverage::{CoverageListeners, CoverageSubscription};
 use crate::dbs::lmdb::{LmdbStore, spawn_lmdb_gc};
 use crate::error::Error;
 use crate::file_picker::FilePicker;
@@ -12,9 +13,9 @@ use crate::git_recency;
 use crate::git_status_worker::GitStatusWorker;
 use crate::query_tracker::QueryTracker;
 use crate::rescan_stats::{RescanCounters, RescanReason, RescanStats};
-use crate::rescan_throttle::RescanThrottle;
+use crate::rescan_throttle::{Admission, RescanThrottle};
 use crate::scan::ScanJob;
-use crate::watch::{WatchEvent, WatchId, WatchOptions, WatchRegistry};
+use crate::watch::{EventHold, WatchEvent, WatchId, WatchOptions, WatchRegistry};
 use git2::Repository;
 
 /// Poll `<git_dir>/index.lock` until it disappears (git write completed), giving up
@@ -82,8 +83,11 @@ pub struct SharedPickerInner {
     /// Watch subscriptions live outside the picker lock so delivery and
     /// (un)subscribing never contend with searches.
     watchers: Arc<WatchRegistry>,
+    /// Coverage listeners live outside the picker lock and survive picker replacement.
+    coverage: Arc<CoverageListeners>,
     rescans: RescanCounters,
     rescan_throttle: RescanThrottle,
+    held_events: EventHold,
     git_status_paused: Arc<AtomicBool>,
 }
 
@@ -92,10 +96,29 @@ impl Default for SharedPickerInner {
         Self {
             picker: parking_lot::RwLock::new(None),
             watchers: Arc::new(WatchRegistry::default()),
+            coverage: Arc::default(),
             rescans: RescanCounters::default(),
             rescan_throttle: RescanThrottle::default(),
+            held_events: EventHold::default(),
             git_status_paused: Arc::new(AtomicBool::new(false)),
         }
+    }
+}
+
+/// Outcome of a rescan request.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum RescanRequest {
+    /// Started, or queued behind the active scan.
+    Started,
+    /// Throttled; runs once the cooldown ends unless another rescan starts first.
+    Deferred,
+    /// Throttled; incremental updates remain the freshest state.
+    Dropped,
+}
+
+impl RescanRequest {
+    pub(crate) fn started(self) -> bool {
+        self == RescanRequest::Started
     }
 }
 
@@ -139,6 +162,11 @@ impl SharedFilePicker {
         }
     }
 
+    /// Watcher events held while a scan replaces the index they would update.
+    pub(crate) fn event_hold(&self) -> &EventHold {
+        &self.0.held_events
+    }
+
     /// Produce a non-owning handle to the same inner picker.
     /// Use it if you don't need to block internal threads from dropping while owning this ref
     pub(crate) fn weaken(&self) -> WeakFilePicker {
@@ -171,19 +199,20 @@ impl SharedFilePicker {
     }
 
     /// Block until the background file watcher is ready.
-    /// Returns `true` if watcher ready, `false` on timeout.
+    /// Returns `true` if watcher ready, `false` on timeout or when it failed or was stopped.
     pub fn wait_for_watcher(&self, timeout: Duration) -> bool {
-        let watch_ready_signal = {
+        let status = {
             let guard = self.0.picker.read();
             match &*guard {
-                Some(picker) => Arc::clone(&picker.signals.watcher_ready),
+                Some(picker) => picker.background_status(),
                 None => return true,
             }
         };
 
         poll_until(timeout, || {
-            watch_ready_signal.load(std::sync::atomic::Ordering::Acquire)
-        })
+            status.watcher() != crate::WatcherStatus::Starting
+        });
+        status.watcher() == crate::WatcherStatus::Ready
     }
 
     /// Blocks until both the filesystem walk and post-scan indexing are done.
@@ -224,66 +253,93 @@ impl SharedFilePicker {
         self.0.rescans.reset();
     }
 
-    /// Returns `Ok(true)` when a rescan was started (or queued behind an
-    /// active scan) and `Ok(false)` when the request was throttled — the
-    /// caller must then fall back to incremental event processing.
+    /// Requests a rescan. Watcher requests inside the cooldown are throttled;
+    /// see [`RescanRequest`] for what happens to them.
     pub(crate) fn trigger_full_rescan_with_reason(
         &self,
         shared_frecency: &SharedFrecency,
         reason: RescanReason,
-    ) -> Result<bool, Error> {
+    ) -> Result<RescanRequest, Error> {
+        self.trigger_rescan(shared_frecency, reason, reason.defers_when_throttled())
+    }
+
+    /// Requests a rescan for changes the index is known to miss: inside the
+    /// cooldown it stays deferred instead of being dropped.
+    pub(crate) fn trigger_recovery_rescan(
+        &self,
+        shared_frecency: &SharedFrecency,
+        reason: RescanReason,
+    ) -> Result<RescanRequest, Error> {
+        self.trigger_rescan(shared_frecency, reason, true)
+    }
+
+    fn trigger_rescan(
+        &self,
+        shared_frecency: &SharedFrecency,
+        reason: RescanReason,
+        defers: bool,
+    ) -> Result<RescanRequest, Error> {
         // for giant folders we have no other choice other than throttling rescans
         // if user is running application in millions of files with a ton of rescan events
         // we drop / throttle some of requests to avoid constant burst of IO
         if reason == RescanReason::Explicit {
             self.0.rescan_throttle.note_explicit_scan();
-        } else if !self.check_rescan_throttle(reason) {
-            return Ok(false);
+        } else {
+            match self.admit_rescan(reason, defers) {
+                Admission::Admitted => {}
+                Admission::Deferred(_) => return Ok(RescanRequest::Deferred),
+                Admission::Dropped => return Ok(RescanRequest::Dropped),
+            }
         }
 
         self.0.rescans.record(reason);
 
-        match ScanJob::new_rescan(self, shared_frecency)? {
-            Some(job) => {
-                job.spawn();
-            }
-            None => {
-                // we can not abort the ongoing sync, but if the events
-                if let Ok(guard) = self.read()
-                    && let Some(picker) = guard.as_ref()
-                {
-                    picker
-                        .scan_signals()
-                        .rescan_pending
-                        .store(true, std::sync::atomic::Ordering::Release);
-                    tracing::info!(
-                        "Full rescan requested while another scan is active — \
-                         deferred via rescan_pending flag"
-                    );
-                }
-            }
-        }
-        Ok(true)
+        ScanJob::request_rescan(self, shared_frecency)?;
+        Ok(RescanRequest::Started)
     }
 
-    fn check_rescan_throttle(&self, reason: RescanReason) -> bool {
-        let (live_files, has_git) = self
+    fn admit_rescan(&self, reason: RescanReason, defers: bool) -> Admission {
+        let Some(cooldown) = self
             .read()
             .ok()
-            .and_then(|guard| {
-                guard
-                    .as_ref()
-                    .map(|picker| (picker.live_file_count(), picker.has_git_repo()))
-            })
-            .unwrap_or((0, false));
+            .and_then(|guard| guard.as_ref().map(FilePicker::rescan_cooldown))
+        else {
+            // No index left to recover.
+            self.0.rescan_throttle.cancel_deferred();
+            return Admission::Dropped;
+        };
 
-        if self.0.rescan_throttle.admit(live_files, has_git) {
-            return true;
+        let admission = if defers {
+            self.0.rescan_throttle.admit_deferring(reason, cooldown)
+        } else {
+            self.0.rescan_throttle.admit(reason, cooldown)
+        };
+        if admission != Admission::Admitted {
+            self.0.rescans.record_throttled(reason);
+            tracing::debug!(%reason, ?admission, "Rescan throttled");
         }
+        admission
+    }
 
-        self.0.rescans.record_throttled(reason);
-        tracing::debug!(%reason, live_files, "Rescan throttled, skipping");
-        false
+    /// When the pending deferred rescan is due, if there is one.
+    pub(crate) fn deferred_rescan_due(&self) -> Option<Instant> {
+        self.0
+            .rescan_throttle
+            .deferred()
+            .map(|deferred| deferred.due)
+    }
+
+    /// The reason of a deferred rescan whose cooldown has passed.
+    pub(crate) fn due_deferred_rescan(&self) -> Option<RescanReason> {
+        self.0
+            .rescan_throttle
+            .deferred()
+            .filter(|deferred| deferred.due <= Instant::now())
+            .map(|deferred| deferred.reason)
+    }
+
+    pub(crate) fn cancel_deferred_rescan(&self) {
+        self.0.rescan_throttle.cancel_deferred();
     }
 
     /// Subscribe to filesystem changes matching `pattern`.
@@ -349,6 +405,21 @@ impl SharedFilePicker {
 
     pub(crate) fn watch_registry(&self) -> &Arc<WatchRegistry> {
         &self.0.watchers
+    }
+
+    /// Calls `listener` whenever the set of live indexed directories changes: a scan
+    /// result is installed, or the watcher adds, restores or removes directories.
+    /// The listener may run while the picker lock is held: it must return promptly
+    /// and must not access this picker. Dropping the subscription removes it.
+    pub fn subscribe_coverage(
+        &self,
+        listener: impl Fn() + Send + Sync + 'static,
+    ) -> CoverageSubscription {
+        self.0.coverage.subscribe(listener)
+    }
+
+    pub(crate) fn coverage_listeners(&self) -> &Arc<CoverageListeners> {
+        &self.0.coverage
     }
 
     /// Stop background git status updates; the file index and watches keep updating.

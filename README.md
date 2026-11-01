@@ -50,6 +50,10 @@ Pick what you are interested in:
 
 Works with Claude Code, Codex, OpenCode, Cursor, Cline, and any MCP-capable client. A resident Rust index supports file discovery and content search across tool calls.
 
+This downstream branch shares MCP indexes across compatible clients. See
+[CUSTOM.md](./CUSTOM.md#shared-mcp-service) for local builds, scope behavior and
+service lifecycle commands.
+
 ![Measured search time and tokens for FFF MCP versus normal shell search](./chart.png)
 
 The chart compares warm FFF MCP with shell search in the small and big repos. Startup and indexing are excluded.

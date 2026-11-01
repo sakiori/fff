@@ -100,6 +100,7 @@ fn main() {
                         offset: 0,
                         limit: 100,
                     },
+                    scope: Default::default(),
                 },
             );
 

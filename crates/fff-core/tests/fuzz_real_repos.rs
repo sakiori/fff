@@ -223,6 +223,7 @@ fn grep_opts(mode: GrepMode) -> GrepSearchOptions {
         classify_definitions: Default::default(),
         trim_whitespace: false,
         abort_signal: None,
+        scope: Default::default(),
     }
 }
 

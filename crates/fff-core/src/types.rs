@@ -250,6 +250,11 @@ impl Constrainable for DirItem {
     fn is_overflow(&self) -> bool {
         DirItem::is_overflow(self)
     }
+
+    #[inline]
+    fn scope_dir(&self, position: usize) -> u32 {
+        position as u32
+    }
 }
 
 #[derive(Debug)]
@@ -915,6 +920,11 @@ impl Constrainable for FileItem {
     #[inline]
     fn is_overflow(&self) -> bool {
         FileItem::is_overflow(self)
+    }
+
+    #[inline]
+    fn scope_dir(&self, _position: usize) -> u32 {
+        self.parent_dir_index
     }
 }
 

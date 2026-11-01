@@ -100,6 +100,7 @@ impl<'a> GrepBench<'a> {
                 classify_definitions: Default::default(),
                 trim_whitespace: false,
                 abort_signal: None,
+                scope: Default::default(),
             },
         }
     }
@@ -423,6 +424,7 @@ fn main() {
             classify_definitions: Default::default(),
             trim_whitespace: false,
             abort_signal: None,
+            scope: Default::default(),
         };
         let start = Instant::now();
         let result = picker.grep(&parsed, &opts);

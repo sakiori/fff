@@ -3,10 +3,11 @@
 //! - `ripgrep`: the `ignore` crate (ripgrep's walker), used by default.
 //!
 //! Both expose [`walk_collect_files`] with identical semantics so the rest of
-//! the crate stays backend-agnostic.
+//! the crate stays backend-agnostic, including walks limited to a subtree.
 
 use crate::types::FileItem;
 use std::path::Path;
+use std::sync::Arc;
 
 #[cfg(feature = "zlob")]
 mod zlob;
@@ -17,6 +18,23 @@ pub(crate) use zlob::walk_collect_files;
 mod ripgrep;
 #[cfg(all(not(feature = "zlob"), feature = "ripgrep"))]
 pub(crate) use ripgrep::walk_collect_files;
+
+/// A walk limited to `subtree` still traverses from `base_path`, so the root's
+/// ignore and exclusion policy applies unchanged. Returns the subtree's path
+/// relative to the base, or an error when it lies outside.
+fn subtree_relative<'a>(base_path: &Path, subtree: &'a Path) -> crate::Result<&'a Path> {
+    subtree.strip_prefix(base_path).map_err(|_| {
+        crate::Error::WalkFailed(format!(
+            "{} is not under the walk root {}",
+            subtree.display(),
+            base_path.display()
+        ))
+    })
+}
+
+/// Receives the absolute path of every directory the walk reports, before the
+/// walker opens it or reads its entries and ignore files.
+pub(crate) type DirHook = Arc<dyn Fn(&Path) + Send + Sync>;
 
 pub(crate) struct WalkOutput {
     pub(crate) pairs: Vec<(FileItem, String)>,
@@ -93,7 +111,7 @@ mod tests {
         fs::write(root.join("target/out.bin"), "bin").unwrap();
 
         let counter = Arc::new(AtomicUsize::new(0));
-        let out = walk_collect_files(root, true, false, 1, &counter).unwrap();
+        let out = walk_collect_files(root, None, true, false, 1, &counter, None).unwrap();
 
         let mut names: Vec<String> = out.pairs.into_iter().map(|(_, rel)| rel).collect();
         names.sort();
@@ -117,11 +135,116 @@ mod tests {
         fs::write(root.join("index.js"), "x").unwrap();
 
         let counter = Arc::new(AtomicUsize::new(0));
-        let out = walk_collect_files(root, false, false, 1, &counter).unwrap();
+        let out = walk_collect_files(root, None, false, false, 1, &counter, None).unwrap();
         let names: Vec<String> = out.pairs.into_iter().map(|(_, rel)| rel).collect();
 
         assert!(names.iter().any(|n| n.ends_with("index.js")));
         assert!(!names.iter().any(|n| n.contains("node_modules")));
+    }
+
+    // Subtree walks keep the root's ignore rules and report base-relative paths.
+    #[test]
+    fn subtree_walk_keeps_root_rules() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        fs::create_dir(root.join(".git")).unwrap();
+        fs::create_dir_all(root.join("sub/ignored")).unwrap();
+        fs::create_dir_all(root.join("sub/kept")).unwrap();
+        fs::create_dir_all(root.join("other")).unwrap();
+        fs::write(root.join(".gitignore"), "ignored/\n").unwrap();
+        fs::write(root.join("sub/kept/a.rs"), "x").unwrap();
+        fs::write(root.join("sub/ignored/b.rs"), "x").unwrap();
+        fs::write(root.join("other/c.rs"), "x").unwrap();
+
+        let counter = Arc::new(AtomicUsize::new(0));
+        let out = walk_collect_files(
+            root,
+            Some(&root.join("sub")),
+            true,
+            false,
+            1,
+            &counter,
+            None,
+        )
+        .unwrap();
+        let names: Vec<String> = out.pairs.into_iter().map(|(_, rel)| rel).collect();
+        assert_eq!(names, vec!["sub/kept/a.rs".to_string()]);
+        let mut dirs = out.dirs;
+        dirs.sort();
+        assert_eq!(dirs, vec!["sub/".to_string(), "sub/kept/".to_string()]);
+    }
+
+    #[test]
+    fn subtree_outside_the_root_is_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let other = tempfile::tempdir().unwrap();
+        let counter = Arc::new(AtomicUsize::new(0));
+        let result = walk_collect_files(
+            dir.path(),
+            Some(other.path()),
+            false,
+            false,
+            1,
+            &counter,
+            None,
+        );
+        assert!(result.is_err());
+    }
+
+    // The hook sees every reported directory before the walker reads it: an ignore
+    // file and an entry the hook creates both take effect in the same walk.
+    #[test]
+    fn dir_hook_runs_before_each_directory_is_read() {
+        for threads in [1, 4] {
+            let dir = tempfile::tempdir().unwrap();
+            let root = dir.path();
+            fs::create_dir(root.join(".git")).unwrap();
+            fs::create_dir_all(root.join("a/b")).unwrap();
+            fs::create_dir_all(root.join("ignored/c")).unwrap();
+            fs::write(root.join(".gitignore"), "ignored/\n").unwrap();
+            fs::write(root.join("a/hidden_by_hook.rs"), "x").unwrap();
+            fs::write(root.join("a/b/hidden_by_hook.rs"), "x").unwrap();
+
+            let seen = Arc::new(parking_lot::Mutex::new(Vec::new()));
+            let hook: super::DirHook = {
+                let seen = Arc::clone(&seen);
+                let root = root.to_path_buf();
+                Arc::new(move |path: &std::path::Path| {
+                    let _ = fs::write(path.join(".gitignore"), "hidden_by_hook.rs\n");
+                    let _ = fs::write(path.join("from_hook.rs"), "x");
+                    if let Ok(relative) = path.strip_prefix(&root) {
+                        seen.lock().push(relative.to_path_buf());
+                    }
+                })
+            };
+            let counter = Arc::new(AtomicUsize::new(0));
+            let out = walk_collect_files(root, None, true, false, threads, &counter, Some(&hook))
+                .unwrap();
+            let mut names: Vec<String> = out.pairs.into_iter().map(|(_, rel)| rel).collect();
+            names.sort();
+            assert_eq!(
+                names,
+                [
+                    ".gitignore",
+                    "a/.gitignore",
+                    "a/b/.gitignore",
+                    "a/b/from_hook.rs",
+                    "a/from_hook.rs"
+                ]
+            );
+            let mut seen_dirs = seen.lock().clone();
+            seen_dirs.sort();
+            assert_eq!(
+                seen_dirs,
+                [std::path::Path::new("a"), std::path::Path::new("a/b")]
+            );
+
+            seen.lock().clear();
+            let subtree = root.join("a/b");
+            walk_collect_files(root, Some(&subtree), true, false, 1, &counter, Some(&hook))
+                .unwrap();
+            assert_eq!(*seen.lock(), [std::path::Path::new("a/b")]);
+        }
     }
 
     // Stow-style file symlinks pointing outside the root must be indexed with
@@ -142,7 +265,7 @@ mod tests {
         std::os::unix::fs::symlink("../dotfiles/missing", root.join("broken")).unwrap();
 
         let counter = Arc::new(AtomicUsize::new(0));
-        let out = walk_collect_files(&root, false, true, 1, &counter).unwrap();
+        let out = walk_collect_files(&root, None, false, true, 1, &counter, None).unwrap();
         let mut names: Vec<String> = out.pairs.iter().map(|(_, rel)| rel.clone()).collect();
         names.sort();
 
@@ -153,7 +276,7 @@ mod tests {
         assert_eq!(item.size, 10);
         assert_eq!(&rel[item.filename_offset_in_relative_path()..], "sesh.toml");
 
-        let out = walk_collect_files(&root, false, false, 1, &counter).unwrap();
+        let out = walk_collect_files(&root, None, false, false, 1, &counter, None).unwrap();
         let names: Vec<String> = out.pairs.into_iter().map(|(_, rel)| rel).collect();
         assert_eq!(names, ["projects.toml"]);
     }
@@ -172,7 +295,7 @@ mod tests {
         fs::write(root.join("Cargo.toml"), "x").unwrap();
 
         let counter = Arc::new(AtomicUsize::new(0));
-        let out = walk_collect_files(root, true, false, 1, &counter).unwrap();
+        let out = walk_collect_files(root, None, true, false, 1, &counter, None).unwrap();
 
         let rules = out.ignore_rules.expect("zlob surfaces ignore rules");
         assert!(rules.is_ignored(Path::new("target/")));

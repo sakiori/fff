@@ -1,8 +1,9 @@
+use crate::view::SessionView;
 use fff_query_parser::Constraint;
 use rmcp::{model::ErrorData, schemars};
 use std::path::{Component, Path};
 
-#[derive(Debug, Default, serde::Deserialize, schemars::JsonSchema)]
+#[derive(Debug, Clone, Default, serde::Deserialize, schemars::JsonSchema)]
 pub(crate) struct SearchScope {
     /// Files or directories relative to the checkout root. Search any of these paths.
     pub paths: Option<Vec<String>>,
@@ -15,10 +16,10 @@ pub(crate) struct SearchScope {
 impl SearchScope {
     pub fn patterns(
         &self,
-        picker: &fff::FilePicker,
+        view: &SessionView<'_>,
         path_root: Option<(&str, bool)>,
     ) -> Result<Vec<(String, bool)>, ErrorData> {
-        let base = picker.base_path();
+        let base = view.root();
         let mut result = Vec::new();
         // The singular `path` scope is an explicit root too, so it can opt into hidden paths.
         let mut roots: Vec<(String, bool)> = path_root
@@ -118,8 +119,12 @@ impl SearchScope {
                     .map_err(|e| ErrorData::invalid_params(format!("Invalid glob: {e}"), None))?;
                 let mut excluded = Vec::new();
                 let mut overrides_hidden_directory = false;
-                for dir in picker.get_dirs() {
-                    let path = dir.relative_path(picker);
+                for path in view
+                    .picker
+                    .get_dirs()
+                    .iter()
+                    .filter_map(|dir| view.dir_path(dir))
+                {
                     let path = path.trim_end_matches('/');
                     if !path
                         .rsplit('/')

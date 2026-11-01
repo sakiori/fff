@@ -149,6 +149,26 @@ impl<'a> DirectoryDistance<'a> {
     }
 }
 
+/// Refuses the filesystem root and home directory as index bases unless explicitly enabled.
+/// Both the given and the canonical spelling are checked, so aliases cannot bypass the policy.
+pub fn validate_base_path(
+    path: &Path,
+    enable_fs_root_scanning: bool,
+    enable_home_dir_scanning: bool,
+) -> Result<(), crate::error::Error> {
+    let canonical = canonicalize(path).ok();
+    let spellings = || std::iter::once(path).chain(canonical.as_deref());
+    let is_root = spellings().any(|p| p.parent().is_none());
+    let is_home = dirs::home_dir().is_some_and(|home| {
+        let canonical_home = canonicalize(&home).ok();
+        spellings().any(|p| p == home || canonical_home.as_deref() == Some(p))
+    });
+    if (is_root && !enable_fs_root_scanning) || (is_home && !enable_home_dir_scanning) {
+        return Err(crate::error::Error::FilesystemRoot(path.to_path_buf()));
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -258,5 +278,19 @@ mod tests {
             ),
             -1
         );
+    }
+
+    #[test]
+    fn base_path_policy_refuses_root_and_home_aliases() {
+        let root = std::path::Path::new(std::path::MAIN_SEPARATOR_STR);
+        assert!(validate_base_path(root, false, false).is_err());
+        assert!(validate_base_path(root, true, false).is_ok());
+        if let Some(home) = dirs::home_dir() {
+            assert!(validate_base_path(&home, false, false).is_err());
+            assert!(validate_base_path(&home.join("."), false, false).is_err());
+            assert!(validate_base_path(&home, false, true).is_ok());
+        }
+        let temp = tempfile::tempdir().unwrap();
+        assert!(validate_base_path(temp.path(), false, false).is_ok());
     }
 }

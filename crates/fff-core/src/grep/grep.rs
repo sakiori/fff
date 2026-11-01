@@ -6,6 +6,9 @@ use crate::index::{
     BigramFilter, BigramOverlay, bigram_boundary, fuzzy_candidates, literal_candidates,
     regex_candidates,
 };
+use crate::parallelism::{SEARCH_THREAD_POOL, SearchBlocks};
+use crate::scope::ResolvedScope;
+use crate::simd_path::Arenas;
 use crate::simd_string_utils::memmem;
 use crate::types::{ContentCacheBudget, FileItem, MmapSlot};
 use fff_grep::{
@@ -13,7 +16,6 @@ use fff_grep::{
     matcher::{Match, Matcher, NoError},
 };
 use fff_query_parser::{FFFQuery, GrepConfig, QueryParser};
-use rayon::prelude::*;
 use smallvec::SmallVec;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -203,8 +205,8 @@ pub(crate) fn grep_search<'a>(
     bigram_overlay: Option<&BigramOverlay>,
     abort_signal: &AtomicBool,
     base_path: &Path,
-    arena: crate::simd_path::ArenaPtr,
-    overflow_arena: crate::simd_path::ArenaPtr,
+    arenas: Arenas,
+    scope: Option<&ResolvedScope>,
 ) -> GrepResult<'a> {
     let result = grep_search_parsed(
         files,
@@ -216,8 +218,8 @@ pub(crate) fn grep_search<'a>(
         bigram_overlay,
         abort_signal,
         base_path,
-        arena,
-        overflow_arena,
+        arenas,
+        scope,
     );
 
     // Constraint parsing can swallow tokens the user meant literally (e.g. `!=`
@@ -252,8 +254,8 @@ pub(crate) fn grep_search<'a>(
             bigram_overlay,
             abort_signal,
             base_path,
-            arena,
-            overflow_arena,
+            arenas,
+            scope,
         );
         if !unfiltered.matches.is_empty() || unfiltered.next_file_offset != 0 {
             return result;
@@ -292,8 +294,8 @@ pub(crate) fn grep_search<'a>(
         bigram_overlay,
         abort_signal,
         base_path,
-        arena,
-        overflow_arena,
+        arenas,
+        scope,
     );
 
     if fallback.matches.is_empty() {
@@ -315,8 +317,8 @@ fn grep_search_parsed<'a>(
     bigram_overlay: Option<&BigramOverlay>,
     abort_signal: &AtomicBool,
     base_path: &Path,
-    arena: crate::simd_path::ArenaPtr,
-    overflow_arena: crate::simd_path::ArenaPtr,
+    arenas: Arenas,
+    scope: Option<&ResolvedScope>,
 ) -> GrepResult<'a> {
     let constraints_from_query = &query.constraints[..];
 
@@ -342,8 +344,8 @@ fn grep_search_parsed<'a>(
                 bigram_candidates.as_deref(),
                 base_count,
                 options,
-                arena,
-                overflow_arena,
+                arenas,
+                scope,
             );
 
             if files_to_search.is_empty() {
@@ -360,8 +362,7 @@ fn grep_search_parsed<'a>(
                 budget,
                 abort_signal,
                 base_path,
-                arena,
-                overflow_arena,
+                arenas,
             );
         }
         GrepMode::Regex => build_regex(&grep_text, casing)
@@ -409,8 +410,8 @@ fn grep_search_parsed<'a>(
         bigram_candidates.as_deref(),
         base_count,
         options,
-        arena,
-        overflow_arena,
+        arenas,
+        scope,
     );
 
     if files_to_search.is_empty() {
@@ -440,8 +441,7 @@ fn grep_search_parsed<'a>(
             filtered_file_count,
             budget,
             base_path,
-            arena,
-            overflow_arena,
+            arenas,
             prefilter: should_prefilter.then_some(&finder),
             abort_signal,
         },
@@ -554,27 +554,18 @@ fn extract_grep_text(query: &FFFQuery<'_>) -> String {
     t.to_string()
 }
 
+// Up to 8 files per claim keeps a slow file from stalling a job's time slice.
+pub(super) const FILE_BLOCKS: SearchBlocks = SearchBlocks::new(2, 8);
+
 #[derive(Clone, Copy)]
 pub(super) struct GrepContext<'a, 'b> {
     pub(super) total_files: usize,
     pub(super) filtered_file_count: usize,
     pub(super) budget: &'a ContentCacheBudget,
     pub(super) base_path: &'a Path,
-    pub(super) arena: crate::simd_path::ArenaPtr,
-    pub(super) overflow_arena: crate::simd_path::ArenaPtr,
+    pub(super) arenas: Arenas,
     pub(super) prefilter: Option<&'a NeedleFinder<'b>>,
     pub(super) abort_signal: &'a AtomicBool,
-}
-
-impl GrepContext<'_, '_> {
-    #[inline]
-    fn arena_for_file(&self, file: &FileItem) -> crate::simd_path::ArenaPtr {
-        if file.is_overflow() {
-            self.overflow_arena
-        } else {
-            self.arena
-        }
-    }
 }
 
 #[tracing::instrument(
@@ -615,7 +606,7 @@ where
 
     // Grow empty batches to avoid repeated barriers. A strong prefilter caps
     // growth low (bounds over-scan past a filled page) and resets on a match.
-    let base_chunk = rayon::current_num_threads() * 4;
+    let base_chunk = SEARCH_THREAD_POOL.current_num_threads() * 4;
     let prefilter_strong = ctx.total_files > 0 && files_to_search.len() * 2 < ctx.total_files;
     let max_chunk = if prefilter_strong {
         base_chunk * 8
@@ -634,57 +625,58 @@ where
         // Unless enforced, the budget stays dormant until something matched.
         let budget = time_budget.filter(|_| options.enforce_time_budget || all_matches.len() > 1);
 
-        let chunk_results: Vec<(usize, &'a FileItem, Vec<GrepMatch>)> = chunk
-            .par_iter()
-            .enumerate()
-            .map_init(
-                // tested it out a few times, this is just fine for rayon worker in this specific
-                // case it doesn't reallocate this many times and it is actually faster than using
-                // scoped threads with a predefined local scratch buffers because of spawn cost
-                || (Vec::with_capacity(64 * 1024), MmapSlot::default(), false),
-                |(buf, mmap_slot, aborted), (local_idx, file)| {
-                    // check the clock on every 8th file only; `aborted` latches for the
-                    // rest of this worker's range. File 0 is never skipped so a page
-                    // always consumes at least one file (cursor 0 means "done").
-                    let idx = chunk_offset + local_idx;
-                    if !*aborted && local_idx % 8 == 0 && idx > 0 {
-                        *aborted = ctx.abort_signal.load(Ordering::Relaxed)
-                            || budget.is_some_and(|b| search_start.elapsed() > b);
-                    }
-                    if *aborted {
-                        first_skipped.fetch_min(idx, Ordering::Relaxed);
-                        return None;
-                    }
+        let chunk_results: Vec<(usize, &'a FileItem, Vec<GrepMatch>)> = FILE_BLOCKS.filter_map(
+            chunk,
+            || {
+                (
+                    Vec::with_capacity(64 * 1024),
+                    MmapSlot::default(),
+                    0usize,
+                    false,
+                )
+            },
+            |(buf, mmap_slot, visited, aborted), local_idx, file| {
+                // Check the clock on every 8th file a job visits; `aborted` latches for
+                // the rest of the job. File 0 is never skipped so a page always
+                // consumes at least one file (cursor 0 means "done").
+                let idx = chunk_offset + local_idx;
+                if !*aborted && *visited % 8 == 0 && idx > 0 {
+                    *aborted = ctx.abort_signal.load(Ordering::Relaxed)
+                        || budget.is_some_and(|b| search_start.elapsed() > b);
+                }
+                *visited += 1;
+                if *aborted {
+                    first_skipped.fetch_min(idx, Ordering::Relaxed);
+                    return None;
+                }
 
-                    let content = file.get_content_for_search(
-                        buf,
-                        mmap_slot,
-                        ctx.arena_for_file(file),
-                        ctx.base_path,
-                        ctx.budget,
-                        base_dir.as_ref(),
-                    )?;
+                let content = file.get_content_for_search(
+                    buf,
+                    mmap_slot,
+                    ctx.arenas.select(file.is_overflow()),
+                    ctx.base_path,
+                    ctx.budget,
+                    base_dir.as_ref(),
+                )?;
 
-                    // Fast whole-file memmem check before entering the
-                    // grep-searcher machinery. Skips Vec alloc, Searcher
-                    // setup, and line-splitting for files that can't match.
-                    if let Some(pf) = ctx.prefilter
-                        && pf.find(content).is_none()
-                    {
-                        return None;
-                    }
+                // Fast whole-file memmem check before entering the
+                // grep-searcher machinery. Skips Vec alloc, Searcher
+                // setup, and line-splitting for files that can't match.
+                if let Some(pf) = ctx.prefilter
+                    && pf.find(content).is_none()
+                {
+                    return None;
+                }
 
-                    let file_matches = search_file(file, content, options.max_matches_per_file);
+                let file_matches = search_file(file, content, options.max_matches_per_file);
 
-                    if file_matches.is_empty() {
-                        return None;
-                    }
+                if file_matches.is_empty() {
+                    return None;
+                }
 
-                    Some((idx, *file, file_matches))
-                },
-            )
-            .flatten()
-            .collect();
+                Some((idx, *file, file_matches))
+            },
+        );
 
         chunk_size = if prefilter_strong && !chunk_results.is_empty() {
             base_chunk

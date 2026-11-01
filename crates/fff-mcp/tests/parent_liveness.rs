@@ -1,3 +1,12 @@
+#[cfg(unix)]
+#[path = "support/daemon.rs"]
+mod daemon;
+#[path = "support/spawn.rs"]
+mod spawn;
+
+#[cfg(unix)]
+use daemon::{CommandOutputExt, Daemon, wait_for_discovery};
+use spawn::CommandExt;
 use std::io::{BufRead, BufReader, Write};
 use std::process::{Child, ChildStdin, Command, Stdio};
 use std::sync::mpsc;
@@ -22,10 +31,12 @@ fn stays_alive_while_parent_alive_despite_idle_timeout() {
         .arg("--log-file")
         .arg(dir.path().join("test.log"))
         .env("FFF_MCP_TEST_WATCHDOG_INTERVAL_MS", "100")
+        .env("RUST_LOG", "info")
+        .env("FFF_MCP_SERVICE_DIR", dir.path().join("service"))
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
-        .spawn()
+        .spawn_serialized()
         .unwrap();
 
     let mut stdin = child.stdin.take().unwrap();
@@ -51,6 +62,21 @@ fn exits_when_parent_dies_even_without_idle_timeout() {
     std::fs::write(dir.path().join("a.txt"), "hello").unwrap();
     let log_path = dir.path().join("test.log");
     let exit_signal = dir.path().join("exit-parent");
+    let service = dir.path().join("service");
+    let mut daemon = Daemon(
+        Command::new(BIN)
+            .args(["--service", "--no-update-check", "--idle-timeout-secs", "0"])
+            .arg("--service-dir")
+            .arg(&service)
+            .arg("--log-file")
+            .arg(&log_path)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn_serialized()
+            .unwrap(),
+    );
+    wait_for_discovery(&mut daemon, &service);
 
     // Intermediary parent: sh backgrounds fff-mcp and waits until the handshake
     // completes before dying and orphaning it.
@@ -69,10 +95,12 @@ fn exits_when_parent_dies_even_without_idle_timeout() {
         .arg(&log_path)
         .arg(&exit_signal)
         .env("FFF_MCP_TEST_WATCHDOG_INTERVAL_MS", "100")
+        .env("RUST_LOG", "info")
+        .env("FFF_MCP_SERVICE_DIR", dir.path().join("service"))
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
-        .spawn()
+        .spawn_serialized()
         .unwrap();
 
     let mut stdin = sh.stdin.take().unwrap();
@@ -96,6 +124,20 @@ fn exits_when_parent_dies_even_without_idle_timeout() {
     }
     drop(stdin);
 
+    let stopped = Command::new(BIN)
+        .arg("--service-stop")
+        .arg("--service-dir")
+        .arg(&service)
+        .arg("--log-file")
+        .arg(&log_path)
+        .output_serialized()
+        .unwrap();
+    assert!(
+        stopped.status.success(),
+        "{}",
+        String::from_utf8_lossy(&stopped.stderr)
+    );
+    wait_for_exit(&mut daemon, Duration::from_secs(5));
     let logs = read_session_logs(dir.path());
     assert!(
         logs.contains("Parent process") && logs.contains("exited, shutting down"),

@@ -165,44 +165,62 @@ fn watch_events_reflect_applied_file_transitions() {
         WatchOptions::default(),
     );
 
+    let barrier_path = base.join("barrier.txt");
+    let barrier = watch_collect(
+        &picker,
+        barrier_path.to_str().unwrap(),
+        WatchOptions::default(),
+    );
+
+    // The watcher may split one change across batches; each event must still be
+    // a transition of the index, and the events must end in the on-disk state.
     fs::remove_file(&removed_path).unwrap();
     assert!(
-        wait_for(|| !removed.lock().is_empty(), Duration::from_secs(10)),
+        wait_for(
+            || !presence_after(true, &removed.lock()),
+            Duration::from_secs(10)
+        ),
         "remove event was not delivered"
     );
 
     fs::write(&created_path, "created").unwrap();
     assert!(
-        wait_for(|| !created.lock().is_empty(), Duration::from_secs(10)),
+        wait_for(
+            || presence_after(false, &created.lock()),
+            Duration::from_secs(10)
+        ),
         "create event was not delivered"
     );
 
     fs::remove_file(&replaced_path).unwrap();
     fs::write(&replaced_path, "after").unwrap();
     assert!(
-        wait_for(|| !replaced.lock().is_empty(), Duration::from_secs(10)),
+        wait_for(
+            || {
+                let replaced = replaced.lock();
+                !replaced.is_empty() && presence_after(true, &replaced)
+            },
+            Duration::from_secs(10)
+        ),
         "replacement event was not delivered"
     );
 
-    std::thread::sleep(Duration::from_millis(300));
-    let removed = removed.lock();
-    assert_eq!(removed.len(), 1, "unexpected remove events: {removed:?}");
-    assert_eq!(removed[0].path, removed_path);
-    assert_eq!(removed[0].kind, WatchEventKind::Removed);
-
-    let created = created.lock();
-    assert_eq!(created.len(), 1, "unexpected create events: {created:?}");
-    assert_eq!(created[0].path, created_path);
-    assert_eq!(created[0].kind, WatchEventKind::Created);
-
-    let replaced = replaced.lock();
-    assert_eq!(
-        replaced.len(),
-        1,
-        "replacement must be one event: {replaced:?}"
+    // Events are delivered in order, so the barrier's event follows every earlier one.
+    fs::write(&barrier_path, "barrier").unwrap();
+    assert!(
+        wait_for(|| !barrier.lock().is_empty(), Duration::from_secs(10)),
+        "barrier event was not delivered"
     );
-    assert_eq!(replaced[0].path, replaced_path);
-    assert_eq!(replaced[0].kind, WatchEventKind::Modified);
+
+    for (path, events, initial, present) in [
+        (&removed_path, &removed, true, false),
+        (&created_path, &created, false, true),
+        (&replaced_path, &replaced, true, true),
+    ] {
+        let events = events.lock();
+        assert!(events.iter().all(|event| event.path == *path), "{events:?}");
+        assert_eq!(presence_after(initial, &events), present, "{events:?}");
+    }
 }
 
 #[test]
@@ -421,7 +439,6 @@ fn empty_pattern_watches_the_whole_tree() {
         "",
         WatchOptions {
             ignore: vec!["*.log".to_string()],
-            ..Default::default()
         },
     );
 
@@ -535,7 +552,6 @@ fn dir_subscription_with_ignore_option() {
         "src",
         WatchOptions {
             ignore: vec!["*.map".to_string(), "src/vendor".to_string()],
-            ..Default::default()
         },
     );
 
@@ -663,4 +679,21 @@ fn invalid_patterns_are_rejected() {
         "got {:?}",
         got.lock()
     );
+}
+
+// Folds events into index presence, rejecting any the index could not have applied.
+fn presence_after(initial: bool, events: &[WatchEvent]) -> bool {
+    events.iter().fold(initial, |present, event| {
+        let valid = match event.kind {
+            WatchEventKind::Created => !present,
+            WatchEventKind::Modified | WatchEventKind::Removed => present,
+            _ => false,
+        };
+        assert!(
+            valid,
+            "{:?} is not a transition from {present}: {events:?}",
+            event.kind
+        );
+        event.kind != WatchEventKind::Removed
+    })
 }

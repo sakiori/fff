@@ -4,7 +4,9 @@ install = "cargo fetch --locked"
 checks = [
   "cargo fmt --all -- --check",
   "cargo clippy --no-default-features --features zlob -- -D warnings",
+  "make lint-mcp",
   "make test-rust",
+  "make test-mcp",
 ]
 
 [[upstream]]

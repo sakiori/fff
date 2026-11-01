@@ -33,12 +33,26 @@ regex = { workspace = true }
 rayon = { workspace = true }
 globset = { workspace = true }
 clap = { version = "4", features = ["derive", "env"] }
+interprocess = { version = "2.4", features = ["tokio"] }
+blake3 = "1"
+uuid = { version = "1", features = ["v4"] }
+parking_lot = { workspace = true }
+thiserror = { workspace = true }
+constant_time_eq = "0.4"
+
+[target.'cfg(unix)'.dependencies]
+rustix = { version = "1.1", features = ["fs", "process"] }
 
 [target.'cfg(windows)'.dependencies]
-windows-sys = { version = "0.60", features = [
+windows-sys = { version = "0.61", features = [
     "Win32_Foundation",
+    "Win32_Security",
+    "Win32_Security_Authorization",
+    "Win32_Storage_FileSystem",
+    "Win32_System_SystemServices",
     "Win32_System_Threading",
     "Win32_System_Diagnostics_ToolHelp",
+    "Win32_System_Console",
 ] }
 
 [dev-dependencies]

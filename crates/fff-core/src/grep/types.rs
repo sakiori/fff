@@ -1,3 +1,4 @@
+use crate::scope::SearchScope;
 use crate::types::FileItem;
 use smallvec::SmallVec;
 use std::sync::Arc;
@@ -137,6 +138,9 @@ pub struct GrepSearchOptions {
     /// partial results. Omit (or use `..Default::default()`) to let the
     /// picker manage cancellation.
     pub abort_signal: Option<Arc<AtomicBool>>,
+    /// Directory the search is limited to, applied before counts, pagination
+    /// and every query fallback. Query paths are relative to it.
+    pub scope: SearchScope,
 }
 
 impl GrepSearchOptions {
@@ -166,6 +170,7 @@ impl Default for GrepSearchOptions {
             classify_definitions: Default::default(),
             trim_whitespace: false,
             abort_signal: None,
+            scope: SearchScope::default(),
         }
     }
 }

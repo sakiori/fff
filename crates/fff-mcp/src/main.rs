@@ -1,26 +1,25 @@
+mod client;
 mod cursor;
 mod file_search;
 mod handshake;
 mod healthcheck;
+mod namespace;
 mod output;
 mod parent;
+mod protocol;
+mod registry;
 mod scope;
 mod server;
+mod service;
+mod shared_index;
 mod update_check;
+mod view;
 
 use std::path::{Path, PathBuf};
-use std::time::{Duration, SystemTime};
+use std::time::Duration;
 
 use clap::Parser;
-use fff::file_picker::FilePicker;
-use fff::frecency::FrecencyTracker;
-use fff::{FFFMode, SharedFilePicker, SharedFrecency};
-use git2::Repository;
-use handshake::ProbeTolerantTransport;
 use mimalloc::MiMalloc;
-use rmcp::ServiceExt;
-use rmcp::transport::async_rw::AsyncRwTransport;
-use server::FffServer;
 
 #[global_allocator]
 static GLOBAL: MiMalloc = MiMalloc;
@@ -47,6 +46,21 @@ pub(crate) struct Args {
     /// Base directory to index. Defaults to the current working directory.
     #[arg(value_name = "PATH")]
     base_path: Option<String>,
+
+    #[arg(long, hide = true)]
+    service: bool,
+
+    /// Report the shared services in the namespace without starting one.
+    #[arg(long)]
+    service_status: bool,
+
+    /// Stop every shared service in the namespace that has no connected clients.
+    #[arg(long, conflicts_with = "service_status")]
+    service_stop: bool,
+
+    /// Isolate service discovery and runtime files.
+    #[arg(long, env = "FFF_MCP_SERVICE_DIR")]
+    service_dir: Option<PathBuf>,
 
     /// Path to the frecency database.
     #[arg(long = "frecency-db")]
@@ -134,8 +148,8 @@ pub(crate) struct Args {
     #[arg(long = "healthcheck")]
     pub(crate) healthcheck: bool,
 
-    /// Timeout of inactivity after which fff mcp will be exited. Even if the parent process
-    /// is alive we don't want to occupy resources on index and file watches if fff is unused
+    /// Exit the shared service after this many seconds without clients, and a client without a
+    /// detectable parent after this many seconds without MCP traffic; 0 disables idle exit.
     #[arg(
         long = "idle-timeout-secs",
         env = "FFF_MCP_IDLE_TIMEOUT_SECS",
@@ -164,18 +178,19 @@ fn resolve_defaults(args: &mut Args) {
 
 // Own subdirectory: log rotation read_dir's the parent on every startup, and the
 // per-session `<stem>+<ts>+<pid>.log` files otherwise pile up in its root.
-#[cfg(not(windows))]
 fn default_log_file() -> PathBuf {
-    let base =
-        absolute_env("XDG_STATE_HOME").unwrap_or_else(|| dirs_home().join(".local").join("state"));
-    base.join("fff").join("fff_mcp.log")
+    state_dir().join("fff").join("fff_mcp.log")
+}
+
+// Per-user state root shared by logs and the default service namespace.
+#[cfg(not(windows))]
+pub(crate) fn state_dir() -> PathBuf {
+    absolute_env("XDG_STATE_HOME").unwrap_or_else(|| dirs_home().join(".local").join("state"))
 }
 
 #[cfg(windows)]
-fn default_log_file() -> PathBuf {
-    let base =
-        absolute_env("LOCALAPPDATA").unwrap_or_else(|| dirs_home().join("AppData").join("Local"));
-    base.join("fff").join("fff_mcp.log")
+pub(crate) fn state_dir() -> PathBuf {
+    absolute_env("LOCALAPPDATA").unwrap_or_else(|| dirs_home().join("AppData").join("Local"))
 }
 
 // XDG spec: a non-absolute value must be ignored as if unset.
@@ -202,9 +217,32 @@ const FALLBACK_ROOT: &str = "/tmp";
 #[cfg(windows)]
 const FALLBACK_ROOT: &str = "C:\\Windows\\Temp";
 
-#[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let mut args = Args::parse();
+fn main() -> std::process::ExitCode {
+    let args = Args::parse();
+    let mut builder = if args.service {
+        tokio::runtime::Builder::new_multi_thread()
+    } else {
+        tokio::runtime::Builder::new_current_thread()
+    };
+    let result = builder
+        .enable_all()
+        .build()
+        .map_err(Into::into)
+        .and_then(|runtime| {
+            let result = runtime.block_on(run(args));
+            runtime.shutdown_timeout(Duration::from_secs(1));
+            result
+        });
+    match result {
+        Ok(()) => std::process::ExitCode::SUCCESS,
+        Err(error) => {
+            eprintln!("Error: {error}");
+            std::process::ExitCode::FAILURE
+        }
+    }
+}
+
+async fn run(mut args: Args) -> Result<(), Box<dyn std::error::Error>> {
     resolve_defaults(&mut args);
 
     if args.healthcheck {
@@ -226,199 +264,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         ),
     }
 
-    let base_path = args.base_path.unwrap_or_else(|| {
-        std::env::current_dir()
-            .unwrap_or_default()
-            .to_string_lossy()
-            .to_string()
-    });
-
-    let base_path = match Repository::discover(&base_path) {
-        Ok(repo) => {
-            if let Some(workdir) = repo.workdir() {
-                let git_root = workdir.to_string_lossy().to_string();
-                tracing::info!("Discovered git root: {}", git_root);
-                git_root
-            } else {
-                tracing::info!("Git repository is bare, using base path: {}", base_path);
-                base_path
-            }
+    let build = service::Build::current()?;
+    if args.service {
+        if !args.no_update_check {
+            update_check::spawn_update_check();
         }
-        Err(_) => {
-            tracing::info!(
-                "No git repository found, indexing from base path: {}",
-                base_path
-            );
-            base_path
-        }
-    };
-
-    let shared_picker = SharedFilePicker::default();
-    let shared_frecency = SharedFrecency::default();
-    if let Some(frecency_db_path) = args.frecency_db_path {
-        match FrecencyTracker::open(&frecency_db_path) {
-            Ok(tracker) => {
-                let _ = shared_frecency.init(tracker);
-            }
-            Err(e) => {
-                eprintln!("Warning: Failed to init frecency db: {}", e);
-            }
-        }
-    }
-
-    // Content indexing follows warmup by default (backward compat), unless
-    // the user explicitly opts in via --content-indexing or out via
-    // --no-content-indexing.
-    let enable_content_indexing = if args.content_indexing {
-        true
-    } else if args.no_content_indexing {
-        false
+        service::run(&args, &build).await?;
     } else {
-        !args.no_warmup
-    };
-
-    // Initialize file picker (spawns background scan + watcher)
-    FilePicker::new_with_shared_state(
-        shared_picker.clone(),
-        shared_frecency,
-        fff::FilePickerOptions {
-            base_path,
-            enable_mmap_cache: !args.no_warmup,
-            enable_content_indexing,
-            watch: !args.no_watch,
-            mode: FFFMode::Ai,
-            cache_budget: args
-                .max_cached_files
-                .map(fff::ContentCacheBudget::with_max_files),
-            follow_symlinks: args.follow_symlinks,
-            enable_home_dir_scanning: args.enable_home_scan,
-            enable_fs_root_scanning: args.enable_root_scan,
-            git_recency: Default::default(),
-        },
-    )
-    .map_err(|e| format!("Failed to init file picker: {}", e))?;
-
-    if !args.no_update_check {
-        update_check::spawn_update_check();
+        client::run(&args, &build).await?;
     }
-
-    // Create and start the MCP server
-    let server = FffServer::new(shared_picker.clone());
-    let last_activity = server.last_activity();
-    let idle_timeout_secs = args.idle_timeout_secs;
-
-    // Wait for initial scan in background — don't block server startup
-    let picker_clone_for_scan = shared_picker.clone();
-    tokio::task::spawn_blocking(move || {
-        let start = std::time::Instant::now();
-        loop {
-            let is_scanning = picker_clone_for_scan
-                .read()
-                .ok()
-                .and_then(|g| g.as_ref().map(|p| p.is_scan_active()))
-                .unwrap_or(true);
-
-            if !is_scanning {
-                tracing::info!("Initial scan completed in {:?}", start.elapsed());
-                break;
-            }
-            std::thread::sleep(std::time::Duration::from_millis(50));
-        }
-    });
-
-    const STARTUP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
-    let stdio = AsyncRwTransport::new_server(tokio::io::stdin(), tokio::io::stdout());
-    let transport = ProbeTolerantTransport::new(stdio);
-    let service = match tokio::time::timeout(STARTUP_TIMEOUT, server.serve(transport)).await {
-        Ok(res) => res.map_err(|e| format!("Failed to start MCP server: {}", e))?,
-        Err(_) => {
-            return Err("MCP initialize handshake did not complete within 60s".into());
-        }
-    };
-
-    let parent_watcher = parent::ParentWatcher::new();
-    match &parent_watcher {
-        Some(watcher) => tracing::info!(
-            "Watching parent process (pid {}); will exit when it dies",
-            watcher.parent_pid()
-        ),
-        None => tracing::warn!(
-            "Parent process liveness detection unavailable; idle timeout will exit unconditionally"
-        ),
-    }
-
-    if idle_timeout_secs > 0 || parent_watcher.is_some() {
-        last_activity.store(
-            SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_secs())
-                .unwrap_or(0),
-            std::sync::atomic::Ordering::Relaxed,
-        );
-
-        let last_activity_for_watchdog = last_activity.clone();
-        tokio::spawn(async move {
-            let tick = watchdog_interval();
-            loop {
-                tokio::time::sleep(tick).await;
-
-                if let Some(ref watcher) = parent_watcher {
-                    if !watcher.parent_alive() {
-                        tracing::info!(
-                            "Parent process (pid {}) exited, shutting down",
-                            watcher.parent_pid()
-                        );
-                        flush_logs_and_exit().await;
-                    }
-                    // Parent is alive: it owns our lifecycle, never exit on idle
-                    // Clients like Codex do not restart MCP servers @see #703
-                    continue;
-                }
-
-                if idle_timeout_secs == 0 {
-                    continue;
-                }
-
-                let now = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .map(|d| d.as_secs())
-                    .unwrap_or(0);
-
-                let last = last_activity_for_watchdog.load(std::sync::atomic::Ordering::Relaxed);
-                if now.saturating_sub(last) >= idle_timeout_secs {
-                    tracing::info!(?idle_timeout_secs, "Exiting due to inactivity",);
-                    flush_logs_and_exit().await;
-                }
-            }
-        });
-    }
-
-    let picker_for_shutdown = shared_picker.clone();
-    tokio::spawn(async move {
-        tokio::signal::ctrl_c().await.ok();
-        if let Ok(mut guard) = picker_for_shutdown.write()
-            && let Some(ref mut picker) = *guard
-        {
-            picker.stop_background_monitor();
-        }
-        std::process::exit(0);
-    });
-
-    service.waiting().await?;
-
-    if let Ok(mut guard) = shared_picker.write()
-        && let Some(ref mut picker) = *guard
-    {
-        picker.stop_background_monitor();
-    }
-
     Ok(())
-}
-
-// Tracing appender is non blocking, to get full log give it some time before hard exit
-async fn flush_logs_and_exit() -> ! {
-    tokio::time::sleep(std::time::Duration::from_millis(250)).await;
-    std::process::exit(0);
 }
 
 fn watchdog_interval() -> Duration {

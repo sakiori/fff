@@ -42,6 +42,15 @@ impl RescanReason {
         }
     }
 
+    /// Reasons that leave the index knowingly incomplete, so a throttled
+    /// request must still run once the cooldown allows it.
+    pub(crate) const fn defers_when_throttled(self) -> bool {
+        matches!(
+            self,
+            RescanReason::IndexUpdateRejected | RescanReason::OverflowCapacity
+        )
+    }
+
     const fn slot(self) -> usize {
         match self {
             RescanReason::Explicit => 0,

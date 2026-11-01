@@ -1,20 +1,23 @@
 use crate::cursor::{CursorStore, GrepCursor, GrepStage};
 use crate::file_search::FilePatternMode;
 use crate::output::{GrepFormatter, OutputMode, file_suffix};
+use crate::registry::Session;
 use crate::scope::SearchScope;
+use crate::view::SessionView;
 use fff::grep::{GrepMode, GrepSearchOptions, has_regex_metacharacters};
+use fff::scope::SearchScope as SessionScope;
 use fff::types::PaginationArgs;
 use fff::{FuzzySearchOptions, QueryParser, SharedFilePicker};
 use fff_query_parser::{AiGrepConfig, Constraint, FFFQuery, glob_detect::has_wildcards};
-use rayon::prelude::*;
+use parking_lot::{Mutex, MutexGuard};
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::*;
 use rmcp::{ServerHandler, schemars, tool, tool_handler, tool_router};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
-use std::time::{SystemTime, UNIX_EPOCH};
-
-const SCAN_READY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+use std::future::Future;
+use std::path::PathBuf;
+use std::pin::Pin;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 const MAX_CONTEXT_LINES: usize = 100;
 
@@ -56,6 +59,7 @@ fn make_grep_options(
     mode: GrepMode,
     file_offset: usize,
     context: Option<usize>,
+    scope: &SessionScope,
 ) -> (GrepSearchOptions, bool) {
     let is_usage = output_mode == OutputMode::Usage;
     let matches_per_file = match output_mode {
@@ -87,12 +91,13 @@ fn make_grep_options(
             classify_definitions: true.into(),
             trim_whitespace: false,
             abort_signal: None,
+            scope: scope.clone(),
         },
         auto_expand,
     )
 }
 
-#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+#[derive(Debug, Clone, serde::Deserialize, schemars::JsonSchema)]
 pub struct FindFilesParams {
     /// Fuzzy filename or path query. Put known module constraints in path.
     // `pattern` alias for consistency with grep's alias and the common
@@ -117,7 +122,7 @@ pub struct FindFilesParams {
     pub cursor: Option<String>,
 }
 
-#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+#[derive(Debug, Clone, serde::Deserialize, schemars::JsonSchema)]
 pub struct GrepParams {
     /// Content pattern. Use mode="regex" for alternatives such as deadline|timeout.
     // `pattern` alias: LLMs that have seen multi_grep (which uses `patterns`)
@@ -215,7 +220,7 @@ where
     deserializer.deserialize_any(PatternsVisitor)
 }
 
-#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+#[derive(Debug, Clone, serde::Deserialize, schemars::JsonSchema)]
 pub struct MultiGrepParams {
     /// Patterns to match (OR logic). Include all naming conventions: snake_case, PascalCase, camelCase.
     #[serde(deserialize_with = "deserialize_patterns")]
@@ -236,76 +241,70 @@ pub struct MultiGrepParams {
     pub definitions_only: bool,
 }
 
-#[derive(Clone)]
-pub struct FffServer {
-    picker: SharedFilePicker,
-    cursor_store: Arc<Mutex<CursorStore>>,
-    update_notice_sent: Arc<AtomicBool>,
-    last_activity: Arc<AtomicU64>,
-    scan_ready: Arc<AtomicBool>,
+// What a server searches: the index bound to its session and the session directory in it.
+pub(crate) trait SearchSource: Send + Sync {
+    fn target(&self) -> SearchTarget;
+    // Waits until the target is ready to search.
+    fn prepare(&self) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send + '_>>;
 }
 
-fn now_secs() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0)
+pub(crate) struct SearchTarget {
+    // Changes whenever the session binds another index, which invalidates its cursors.
+    pub generation: String,
+    pub picker: SharedFilePicker,
+    pub scope: SessionScope,
+    pub root: PathBuf,
+    pub _binding: Arc<dyn Send + Sync>,
+}
+
+impl SearchSource for Arc<Session> {
+    fn target(&self) -> SearchTarget {
+        let binding = self.snapshot();
+        SearchTarget {
+            generation: binding.index.id.clone(),
+            picker: binding.index.picker.clone(),
+            scope: binding.scope.clone(),
+            root: self.scope.clone(),
+            _binding: binding,
+        }
+    }
+
+    fn prepare(&self) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send + '_>> {
+        Box::pin(async move {
+            Session::prepare(self)
+                .await
+                .map(drop)
+                .map_err(|e| e.to_string())
+        })
+    }
+}
+
+#[derive(Clone)]
+pub struct FffServer {
+    source: Arc<dyn SearchSource>,
+    cursor_store: Arc<Mutex<CursorStore>>,
+    update_notice_sent: Arc<AtomicBool>,
+    request_gate: Arc<tokio::sync::Mutex<()>>,
+    abort: Arc<AtomicBool>,
 }
 
 impl FffServer {
-    pub fn new(picker: SharedFilePicker) -> Self {
+    pub fn new(session: Arc<Session>) -> Self {
+        Self::with_source(Arc::new(session))
+    }
+
+    pub(crate) fn with_source(source: Arc<dyn SearchSource>) -> Self {
         Self {
-            picker,
+            source,
             cursor_store: Arc::new(Mutex::new(CursorStore::new())),
             update_notice_sent: Arc::new(AtomicBool::new(false)),
-            last_activity: Arc::new(AtomicU64::new(now_secs())),
-            scan_ready: Arc::new(AtomicBool::new(false)),
+            request_gate: Arc::new(tokio::sync::Mutex::new(())),
+            abort: Arc::new(AtomicBool::new(false)),
         }
     }
 
-    pub fn last_activity(&self) -> Arc<AtomicU64> {
-        self.last_activity.clone()
-    }
-
-    fn bump_activity(&self) {
-        self.last_activity.store(now_secs(), Ordering::Relaxed);
-    }
-
-    fn wait_for_scan(&self, timeout: std::time::Duration) -> Result<(), ErrorData> {
-        if self.scan_ready.load(Ordering::Relaxed) {
-            return Ok(());
-        }
-
-        let deadline = std::time::Instant::now() + timeout;
-
-        loop {
-            let is_scanning = self
-                .picker
-                .read()
-                .ok()
-                .as_ref()
-                .and_then(|g| g.as_ref())
-                .map(|p| p.is_scan_active())
-                .unwrap_or(true);
-
-            if !is_scanning {
-                self.scan_ready.store(true, Ordering::Relaxed);
-                return Ok(());
-            }
-            if std::time::Instant::now() >= deadline {
-                return Err(ErrorData::internal_error(
-                    "Index is still building; retry shortly",
-                    None,
-                ));
-            }
-            std::thread::sleep(std::time::Duration::from_millis(50));
-        }
-    }
-
-    fn lock_cursors(&self) -> Result<std::sync::MutexGuard<'_, CursorStore>, ErrorData> {
-        self.cursor_store.lock().map_err(|e| {
-            ErrorData::internal_error(format!("Failed to acquire cursor store lock: {e}"), None)
-        })
+    fn lock_cursors(&self) -> MutexGuard<'_, CursorStore> {
+        self.cursor_store.lock()
     }
 
     fn maybe_append_update_notice(&self, result: &mut CallToolResult) {
@@ -336,10 +335,13 @@ impl FffServer {
             normalize_max_results(params.max_results, default_page).min(MAX_GREP_PAGE);
         let output_mode = OutputMode::new(params.output_mode.as_deref());
         let context = normalize_context(params.context);
-        let mut cursor = params
-            .cursor
-            .as_deref()
-            .and_then(|id| self.cursor_store.lock().ok()?.get_grep(id))
+        let target = self.source.target();
+        let mut cursor = self
+            .lock_cursors()
+            .begin_grep(
+                search_context(&target, "grep", &(mode, params.cursor_key())),
+                params.cursor.as_deref(),
+            )?
             .unwrap_or(GrepCursor {
                 stage: if params.definitions_only {
                     GrepStage::Definitions
@@ -357,8 +359,14 @@ impl FffServer {
                 .join(" ")
         });
 
-        let (mut options, mut auto_expand) =
-            make_grep_options(output_mode, mode, cursor.file_offset, context);
+        let (mut options, mut auto_expand) = make_grep_options(
+            output_mode,
+            mode,
+            cursor.file_offset,
+            context,
+            &target.scope,
+        );
+        options.abort_signal = Some(self.abort.clone());
         options.page_limit = cursor.page_limit(max_results);
         options.max_matches_per_file = if output_mode == OutputMode::FilesWithMatches {
             1
@@ -394,20 +402,21 @@ impl FffServer {
         let suggestion_context = (!auto_expand).then_some((ctx_lines, options.after_context));
 
         // Acquire picker lock once for the entire operation.
-        let guard = self.picker.read().map_err(|e| {
+        let guard = target.picker.read().map_err(|e| {
             ErrorData::internal_error(format!("Failed to acquire picker lock: {e}"), None)
         })?;
         let picker = guard
             .as_ref()
             .ok_or_else(|| ErrorData::internal_error("File picker not initialized", None))?;
+        let view = SessionView::new(picker, &target.scope, &target.root);
 
         let parser = QueryParser::new(AiGrepConfig);
-        let path_scope = path_scope(params.path.as_deref(), picker)?;
+        let path_scope = path_scope(params.path.as_deref(), &view)?;
         let scope = path_scope.as_ref().map(|scope| scope.glob.as_str());
         let root = path_scope
             .as_ref()
             .map(|scope| (scope.root.as_str(), scope.nested));
-        let patterns = params.scope.patterns(picker, root)?;
+        let patterns = params.scope.patterns(&view, root)?;
         let verbatim = params.scope.is_explicit()
             || matches!(params.mode, Some(PatternMode::Regex | PatternMode::Literal));
         let mut original = if verbatim {
@@ -443,7 +452,7 @@ impl FffServer {
         };
         let fresh = cursor.stage == GrepStage::Definitions && cursor.file_offset == 0;
         let missing_path = file_path_constraint(&original)
-            .filter(|path| cursor.missing_path || (fresh && !indexes_file_path(picker, path)));
+            .filter(|path| cursor.missing_path || (fresh && !indexes_file_path(&view, path)));
         if missing_path.is_some() {
             original
                 .constraints
@@ -592,7 +601,7 @@ impl FffServer {
                         cursor.stage = GrepStage::Broadened;
                         cursor.paginate(&mut retry_result, max_results, picker);
                         crate::output::declarations_first(&mut retry_result);
-                        let mut cs = self.lock_cursors()?;
+                        let mut cs = self.lock_cursors();
                         let text = &GrepFormatter {
                             matches: &retry_result.matches,
                             files: &retry_result.files,
@@ -603,6 +612,7 @@ impl FffServer {
                             show_context,
                             auto_expand_defs: auto_expand,
                             picker,
+                            scope: &target.scope,
                         }
                         .format(&mut cs);
                         return Ok(respond(
@@ -619,7 +629,8 @@ impl FffServer {
             // Fuzzy fallback for typo tolerance
             let fuzzy_query = cleanup_fuzzy_query(&original.grep_text());
             let (mut fuzzy_options, _) =
-                make_grep_options(output_mode, GrepMode::Fuzzy, 0, Some(0));
+                make_grep_options(output_mode, GrepMode::Fuzzy, 0, Some(0), &target.scope);
+            fuzzy_options.abort_signal = Some(self.abort.clone());
             fuzzy_options.classify_definitions = options.classify_definitions;
             fuzzy_options.casing = options.casing;
             let mut fuzzy_parsed = parse_scoped_grep(&parser, &fuzzy_query, scope);
@@ -650,7 +661,7 @@ impl FffServer {
                 let mut current_file = String::new();
                 for m in fuzzy_result.matches.iter().take(3) {
                     let file = fuzzy_result.files[m.file_index];
-                    let file_rel = file.relative_path(picker);
+                    let file_rel = view.display(file);
                     if file_rel != current_file {
                         current_file = file_rel;
                         lines.push(current_file.to_string());
@@ -678,6 +689,7 @@ impl FffServer {
                         offset: 0,
                         limit: 1,
                     },
+                    scope: &target.scope,
                 };
                 let file_result = picker.fuzzy_search(&file_query, None, file_opts);
                 if let (Some(top), Some(score)) =
@@ -689,7 +701,7 @@ impl FffServer {
                         return Ok(respond(
                             format!(
                                 "0 content matches. But there is a relevant file path: {}",
-                                top.relative_path(picker)
+                                view.display(top)
                             ),
                             false,
                         ));
@@ -699,7 +711,8 @@ impl FffServer {
 
             return Ok(respond(
                 suggest_other_files(
-                    picker,
+                    &view,
+                    &self.abort,
                     &original,
                     mode,
                     options.effective_casing(),
@@ -716,7 +729,8 @@ impl FffServer {
             if prefer_definitions
                 && !cursor.found_matches
                 && let Some(suggestions) = suggest_other_files(
-                    picker,
+                    &view,
+                    &self.abort,
                     &original,
                     mode,
                     options.effective_casing(),
@@ -744,7 +758,7 @@ impl FffServer {
             return Ok(respond("0 matches.".into(), false));
         }
 
-        let mut cs = self.lock_cursors()?;
+        let mut cs = self.lock_cursors();
         let text = GrepFormatter {
             matches: &result.matches,
             files: &result.files,
@@ -755,6 +769,7 @@ impl FffServer {
             show_context,
             auto_expand_defs: auto_expand,
             picker,
+            scope: &target.scope,
         }
         .format(&mut cs);
 
@@ -780,28 +795,110 @@ impl FffServer {
             open_world_hint = false
         )
     )]
-    fn find_files(
+    async fn find_files(
+        &self,
+        Parameters(params): Parameters<FindFilesParams>,
+        context: rmcp::service::RequestContext<rmcp::RoleServer>,
+    ) -> Result<CallToolResult, ErrorData> {
+        self.run_search(context, move |server| {
+            server.find_files_sync(Parameters(params))
+        })
+        .await
+    }
+
+    #[tool(
+        name = "grep",
+        description = "Search source code with line numbers and surrounding context. For content questions, search directly with a module scope in path. Returned source verifies locations when it contains the required evidence.",
+        annotations(
+            read_only_hint = true,
+            destructive_hint = false,
+            open_world_hint = false
+        )
+    )]
+    async fn grep(
+        &self,
+        Parameters(params): Parameters<GrepParams>,
+        context: rmcp::service::RequestContext<rmcp::RoleServer>,
+    ) -> Result<CallToolResult, ErrorData> {
+        self.run_search(context, move |server| server.grep_sync(Parameters(params)))
+            .await
+    }
+
+    /// Search file contents for lines matching ANY of multiple patterns (OR logic).
+    /// Patterns are literal text — NEVER escape special characters.
+    #[tool(
+        name = "multi_grep",
+        description = "Search for any of several literal identifiers in one call. Set constraints to the directory, module, filename, or glob from the request. Set definitions_only=true for declarations. Results contain source lines and line numbers.",
+        annotations(
+            read_only_hint = true,
+            destructive_hint = false,
+            open_world_hint = false
+        )
+    )]
+    async fn multi_grep(
+        &self,
+        Parameters(params): Parameters<MultiGrepParams>,
+        context: rmcp::service::RequestContext<rmcp::RoleServer>,
+    ) -> Result<CallToolResult, ErrorData> {
+        self.run_search(context, move |server| {
+            server.multi_grep_sync(Parameters(params))
+        })
+        .await
+    }
+}
+
+impl FffServer {
+    async fn run_search<F>(
+        &self,
+        context: rmcp::service::RequestContext<rmcp::RoleServer>,
+        search: F,
+    ) -> Result<CallToolResult, ErrorData>
+    where
+        F: FnOnce(Self) -> Result<CallToolResult, ErrorData> + Send + 'static,
+    {
+        tokio::select! {
+            result = self.source.prepare() => result.map_err(|e| ErrorData::internal_error(e, None))?,
+            _ = context.ct.cancelled() => return Err(ErrorData::internal_error("Search cancelled", None)),
+        };
+        let mut server = self.clone();
+        server.abort = Arc::new(AtomicBool::new(false));
+        let abort = server.abort.clone();
+        let gate = tokio::select! {
+            gate = self.request_gate.clone().lock_owned() => gate,
+            _ = context.ct.cancelled() => return Err(ErrorData::internal_error("Search cancelled", None)),
+        };
+        let task = tokio::task::spawn_blocking(move || {
+            let _gate = gate;
+            search(server)
+        });
+        tokio::select! {
+            result = task => result.map_err(|e| ErrorData::internal_error(e.to_string(), None))?,
+            _ = context.ct.cancelled() => {
+                abort.store(true, Ordering::Relaxed);
+                Err(ErrorData::internal_error("Search cancelled", None))
+            }
+        }
+    }
+
+    fn find_files_sync(
         &self,
         Parameters(params): Parameters<FindFilesParams>,
     ) -> Result<CallToolResult, ErrorData> {
-        self.bump_activity();
-        self.wait_for_scan(SCAN_READY_TIMEOUT)?;
-
         let max_results = normalize_max_results(params.max_results, 20);
         let query = &params.query;
 
-        let page_offset = params
-            .cursor
-            .as_deref()
-            .and_then(|id| self.cursor_store.lock().ok()?.get(id))
-            .unwrap_or(0);
-
-        let guard = self.picker.read().map_err(|e| {
+        let target = self.source.target();
+        let page_offset = self.lock_cursors().begin(
+            search_context(&target, "find", &params.cursor_key()),
+            params.cursor.as_deref(),
+        )?;
+        let guard = target.picker.read().map_err(|e| {
             ErrorData::internal_error(format!("Failed to acquire picker lock: {e}"), None)
         })?;
         let picker = guard
             .as_ref()
             .ok_or_else(|| ErrorData::internal_error("File picker not initialized", None))?;
+        let view = SessionView::new(picker, &target.scope, &target.root);
         let base_path = picker.base_path();
         let make_opts = |offset: usize| FuzzySearchOptions {
             max_threads: 0,
@@ -813,17 +910,18 @@ impl FffServer {
                 offset,
                 limit: max_results,
             },
+            scope: &target.scope,
         };
 
         let parser = QueryParser::default();
-        let path_scope = path_scope(params.path.as_deref(), picker)?;
+        let path_scope = path_scope(params.path.as_deref(), &view)?;
         let scope = path_scope.as_ref().map(|scope| scope.glob.as_str());
         let notice = path_scope.as_ref().and_then(|scope| scope.notice.clone());
         let mut fff_query = parser.parse(query);
         let root = path_scope
             .as_ref()
             .map(|scope| (scope.root.as_str(), scope.nested));
-        let mut patterns = params.scope.patterns(picker, root)?;
+        let mut patterns = params.scope.patterns(&view, root)?;
         if let Some(scope) = scope {
             patterns.push((scope.to_owned(), false));
         }
@@ -833,7 +931,7 @@ impl FffServer {
         );
         if explicit_mode || !params.filters.is_empty() || fff_query.constraints.is_empty() {
             let (items, total) = crate::file_search::search(
-                picker,
+                &view,
                 query,
                 params.mode.unwrap_or(FilePatternMode::Fuzzy),
                 &patterns,
@@ -842,15 +940,13 @@ impl FffServer {
                 max_results,
             )?;
             if explicit_mode || !params.filters.is_empty() || total > 0 {
-                let mut lines = items
-                    .iter()
-                    .map(|file| file.relative_path(picker))
-                    .collect::<Vec<_>>();
+                let mut lines = items;
                 if total == 0 {
-                    lines.push(format!("0 matching paths ({} indexed). Globs cannot include files outside the index. Try a broader path or mode=fuzzy for filename suggestions.", picker.live_file_count()));
-                } else if page_offset + items.len() < total {
-                    lines.insert(0, format!("{}/{} paths", items.len(), total));
-                    let id = self.lock_cursors()?.store(page_offset + items.len());
+                    lines.push(format!("0 matching paths ({} indexed). Globs cannot include files outside the index. Try a broader path or mode=fuzzy for filename suggestions.", view.live_file_count()));
+                } else if page_offset + lines.len() < total {
+                    let shown = lines.len();
+                    lines.insert(0, format!("{shown}/{total} paths"));
+                    let id = self.lock_cursors().store(page_offset + shown);
                     lines.push(format!("cursor: {id}"));
                 }
                 let result = CallToolResult::success(vec![Content::text(lines.join("\n"))]);
@@ -867,20 +963,20 @@ impl FffServer {
         let words: Vec<&str> = query.split_whitespace().collect();
         let shorter = words.get(..2).map(|w| w.join(" "));
 
-        let (items, total_matched) =
-            if result.items.is_empty() && words.len() >= 3 && page_offset == 0 {
-                if let Some(shorter) = &shorter {
-                    let mut shorter_query = parser.parse(shorter);
-                    shorter_query.constraints = fff_query.constraints.clone();
-                    let retry = picker.fuzzy_search(&shorter_query, None, make_opts(0));
+        // Every page of a fallback search repeats the fallback, so its cursor keeps the query.
+        let (items, total_matched) = if result.total_matched == 0 && words.len() >= 3 {
+            if let Some(shorter) = &shorter {
+                let mut shorter_query = parser.parse(shorter);
+                shorter_query.constraints = fff_query.constraints.clone();
+                let retry = picker.fuzzy_search(&shorter_query, None, make_opts(page_offset));
 
-                    (retry.items, retry.total_matched)
-                } else {
-                    (result.items, result.total_matched)
-                }
+                (retry.items, retry.total_matched)
             } else {
                 (result.items, result.total_matched)
-            };
+            }
+        } else {
+            (result.items, result.total_matched)
+        };
 
         if items.is_empty() {
             let text = format!("0 results ({} indexed)", total_files);
@@ -905,13 +1001,13 @@ impl FffServer {
         for item in &items {
             lines.push(format!(
                 "{}{}",
-                item.relative_path(picker),
+                view.display(item),
                 file_suffix(item.git_status, item.total_frecency_score())
             ));
         }
 
         if has_more {
-            let mut cs = self.lock_cursors()?;
+            let mut cs = self.lock_cursors();
             let cursor_id = cs.store(next_offset);
             lines.push(format!("cursor: {}", cursor_id));
         }
@@ -921,22 +1017,10 @@ impl FffServer {
         Ok(result)
     }
 
-    #[tool(
-        name = "grep",
-        description = "Search source code with line numbers and surrounding context. For content questions, search directly with a module scope in path. Returned source verifies locations when it contains the required evidence.",
-        annotations(
-            read_only_hint = true,
-            destructive_hint = false,
-            open_world_hint = false
-        )
-    )]
-    fn grep(
+    fn grep_sync(
         &self,
         Parameters(mut params): Parameters<GrepParams>,
     ) -> Result<CallToolResult, ErrorData> {
-        self.bump_activity();
-        self.wait_for_scan(SCAN_READY_TIMEOUT)?;
-
         let mode = match params.mode {
             Some(PatternMode::Regex) => GrepMode::Regex,
             // Plain grep reads `\n` as a newline, so keep literal backslashes in a regex.
@@ -960,24 +1044,10 @@ impl FffServer {
         Ok(result)
     }
 
-    /// Search file contents for lines matching ANY of multiple patterns (OR logic).
-    /// Patterns are literal text — NEVER escape special characters.
-    #[tool(
-        name = "multi_grep",
-        description = "Search for any of several literal identifiers in one call. Set constraints to the directory, module, filename, or glob from the request. Set definitions_only=true for declarations. Results contain source lines and line numbers.",
-        annotations(
-            read_only_hint = true,
-            destructive_hint = false,
-            open_world_hint = false
-        )
-    )]
-    fn multi_grep(
+    fn multi_grep_sync(
         &self,
         Parameters(params): Parameters<MultiGrepParams>,
     ) -> Result<CallToolResult, ErrorData> {
-        self.bump_activity();
-        self.wait_for_scan(SCAN_READY_TIMEOUT)?;
-
         let mut result = self.multi_grep_inner(params)?;
         self.maybe_append_update_notice(&mut result);
         Ok(result)
@@ -990,10 +1060,13 @@ impl FffServer {
         let context = normalize_context(params.context);
         let output_mode = OutputMode::new(params.output_mode.as_deref());
 
-        let mut cursor = params
-            .cursor
-            .as_deref()
-            .and_then(|id| self.cursor_store.lock().ok()?.get_grep(id))
+        let target = self.source.target();
+        let mut cursor = self
+            .lock_cursors()
+            .begin_grep(
+                search_context(&target, "multi", &params.cursor_key()),
+                params.cursor.as_deref(),
+            )?
             .unwrap_or(GrepCursor {
                 stage: if params.definitions_only {
                     GrepStage::Definitions
@@ -1008,7 +1081,9 @@ impl FffServer {
             GrepMode::PlainText,
             cursor.file_offset,
             context,
+            &target.scope,
         );
+        options.abort_signal = Some(self.abort.clone());
         options.page_limit = cursor.page_limit(max_results);
         options.max_matches_per_file = if output_mode == OutputMode::FilesWithMatches {
             1
@@ -1021,7 +1096,7 @@ impl FffServer {
 
         let ctx_lines = options.before_context;
         let constraint_query = params.constraints.as_deref().unwrap_or("");
-        let guard = self.picker.read().map_err(|e| {
+        let guard = target.picker.read().map_err(|e| {
             ErrorData::internal_error(format!("Failed to acquire picker lock: {e}"), None)
         })?;
         let picker = guard
@@ -1061,7 +1136,7 @@ impl FffServer {
         if result.matches.is_empty() && !cursor.has_more() {
             return Ok(grep_response("0 matches.".into(), false));
         }
-        let mut cs = self.lock_cursors()?;
+        let mut cs = self.lock_cursors();
         let text = GrepFormatter {
             matches: &result.matches,
             files: &result.files,
@@ -1072,6 +1147,7 @@ impl FffServer {
             show_context: !auto_expand && ctx_lines > 0,
             auto_expand_defs: auto_expand,
             picker,
+            scope: &target.scope,
         }
         .format(&mut cs);
 
@@ -1133,17 +1209,16 @@ fn file_path_constraint<'a>(query: &FFFQuery<'a>) -> Option<&'a str> {
 }
 
 // Case-insensitive like core's file-path constraint, so `readme.md` finds README.md.
-fn indexes_file_path(picker: &fff::FilePicker, suffix: &str) -> bool {
+fn indexes_file_path(view: &SessionView<'_>, suffix: &str) -> bool {
     let suffix = suffix.replace('\\', "/").to_ascii_lowercase();
-    picker.get_files().iter().any(|file| {
-        let path = file
-            .relative_path(picker)
-            .replace('\\', "/")
-            .to_ascii_lowercase();
+    view.picker.get_files().iter().any(|file| {
         !file.is_deleted()
-            && path
-                .strip_suffix(suffix.as_str())
-                .is_some_and(|rest| rest.is_empty() || rest.ends_with('/'))
+            && view.file_path(file).is_some_and(|path| {
+                path.replace('\\', "/")
+                    .to_ascii_lowercase()
+                    .strip_suffix(suffix.as_str())
+                    .is_some_and(|rest| rest.is_empty() || rest.ends_with('/'))
+            })
     })
 }
 
@@ -1161,8 +1236,10 @@ fn parse_scoped_grep<'a>(
     parsed
 }
 
+#[allow(clippy::too_many_arguments)]
 fn suggest_other_files(
-    picker: &fff::FilePicker,
+    view: &SessionView<'_>,
+    abort: &Arc<AtomicBool>,
     query: &FFFQuery<'_>,
     mode: GrepMode,
     casing: fff::grep::Casing,
@@ -1194,6 +1271,8 @@ fn suggest_other_files(
             trim_whitespace: false,
             time_budget_ms: 100,
             enforce_time_budget: true,
+            abort_signal: Some(abort.clone()),
+            scope: view.scope.clone(),
             ..Default::default()
         };
         if let Some(fragment) = params.path.as_deref().map(str::trim).filter(|path| {
@@ -1205,10 +1284,10 @@ fn suggest_other_files(
             let glob = format!("{{**/*{fragment}*,**/*{fragment}*/**}}");
             let mut nearby = broader.clone();
             nearby.constraints.push(Constraint::Glob(&glob));
-            let result = picker.grep(&nearby, &options);
+            let result = view.picker.grep(&nearby, &options);
             if !result.matches.is_empty() {
                 return Some(format_broader_matches(
-                    picker,
+                    view,
                     &result,
                     context,
                     &format!(
@@ -1219,10 +1298,10 @@ fn suggest_other_files(
         }
         options.time_budget_ms = 100_u64.saturating_sub(started.elapsed().as_millis() as u64);
         if options.time_budget_ms > 0 {
-            let result = picker.grep(&broader, &options);
+            let result = view.picker.grep(&broader, &options);
             if !result.matches.is_empty() {
                 return Some(format_broader_matches(
-                    picker,
+                    view,
                     &result,
                     context,
                     "No matches in the requested scope. Suggestions elsewhere in the indexed project:",
@@ -1235,7 +1314,7 @@ fn suggest_other_files(
         return None;
     }
     broader.fuzzy_query = fff_query_parser::FuzzyQuery::Text(&text);
-    let result = picker.fuzzy_search(
+    let result = view.picker.fuzzy_search(
         &broader,
         None,
         FuzzySearchOptions {
@@ -1243,6 +1322,7 @@ fn suggest_other_files(
                 offset: 0,
                 limit: 3,
             },
+            scope: view.scope,
             ..Default::default()
         },
     );
@@ -1251,7 +1331,7 @@ fn suggest_other_files(
         .iter()
         .zip(&result.scores)
         .filter(|(_, score)| score.base_score > text.len() as i32 * 10)
-        .map(|(file, _)| file.relative_path(picker))
+        .map(|(file, _)| view.display(file))
         .collect::<Vec<_>>();
     let empty = if definitions {
         "No matching definitions or other matches found"
@@ -1262,7 +1342,7 @@ fn suggest_other_files(
 }
 
 fn format_broader_matches(
-    picker: &fff::FilePicker,
+    view: &SessionView<'_>,
     result: &fff::GrepResult<'_>,
     context: Option<(usize, usize)>,
     notice: &str,
@@ -1276,7 +1356,8 @@ fn format_broader_matches(
         max_results: 8,
         show_context: context.is_some_and(|(before, after)| before + after > 0),
         auto_expand_defs: context.is_none(),
-        picker,
+        picker: view.picker,
+        scope: view.scope,
     }
     .format(&mut CursorStore::new());
     format!("{notice}\n{text}\nSuggestions are limited; search a suggested path for more matches.")
@@ -1308,17 +1389,14 @@ struct PathScope {
     notice: Option<String>,
 }
 
-fn path_scope(
-    path: Option<&str>,
-    picker: &fff::FilePicker,
-) -> Result<Option<PathScope>, ErrorData> {
+fn path_scope(path: Option<&str>, view: &SessionView<'_>) -> Result<Option<PathScope>, ErrorData> {
     let Some(raw) = path.map(str::trim).filter(|path| !path.is_empty()) else {
         return Ok(None);
     };
     let given = std::path::Path::new(raw);
     let absolute = given.is_absolute();
     let path = if absolute {
-        strip_root(given, picker.base_path())?
+        strip_root(given, view.root())?
     } else {
         given.to_path_buf()
     };
@@ -1352,7 +1430,7 @@ fn path_scope(
         nested,
         notice: (!found).then(|| format!("Path '{raw}' matches no indexed file or directory.")),
     };
-    let found = lookup_path(picker, path);
+    let found = lookup_path(view, path);
     if absolute || found.anchored {
         return Ok(Some(scope(
             format!("{{{escaped},{escaped}/**}}"),
@@ -1423,7 +1501,7 @@ struct PathLookup {
 }
 
 // Parallel pass over the index: an exact checkout path wins, otherwise note a match at any depth.
-fn lookup_path(picker: &fff::FilePicker, path: &str) -> PathLookup {
+fn lookup_path(view: &SessionView<'_>, path: &str) -> PathLookup {
     let visit = |order: usize, candidate: String| {
         let mut found = PathLookup::default();
         #[cfg(windows)]
@@ -1444,18 +1522,28 @@ fn lookup_path(picker: &fff::FilePicker, path: &str) -> PathLookup {
         }
         found
     };
-    let dirs = picker.get_dirs();
-    let files = picker
-        .get_files()
-        .par_iter()
-        .enumerate()
-        .filter(|(_, file)| !file.is_deleted())
-        .map(|(index, file)| visit(dirs.len() + index, file.relative_path(picker)));
-    dirs.par_iter()
-        .enumerate()
-        .map(|(index, dir)| visit(index, dir.relative_path(picker)))
-        .chain(files)
-        .reduce(PathLookup::default, merge_lookups)
+    let dirs = view.picker.get_dirs();
+    let files = view.picker.get_files();
+    fff::map_search_ranges(
+        dirs.len() + files.len(),
+        || (),
+        |_, range, out| {
+            let mut found = PathLookup::default();
+            for order in range {
+                let candidate = match order.checked_sub(dirs.len()) {
+                    None => view.dir_path(&dirs[order]),
+                    Some(index) if !files[index].is_deleted() => view.file_path(&files[index]),
+                    Some(_) => None,
+                };
+                if let Some(candidate) = candidate {
+                    found = merge_lookups(found, visit(order, candidate));
+                }
+            }
+            out.push(found);
+        },
+    )
+    .into_iter()
+    .fold(PathLookup::default(), merge_lookups)
 }
 
 fn deserialize_filters<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Vec<String>, D::Error> {
@@ -1478,6 +1566,44 @@ fn merge_lookups(mut left: PathLookup, right: PathLookup) -> PathLookup {
         (a, b) => a.or(b),
     };
     left
+}
+
+// A cursor resumes only the search that created it: same arguments and index generation.
+fn search_context(target: &SearchTarget, tool: &str, arguments: &impl std::fmt::Debug) -> String {
+    format!("{}:{tool}:{arguments:?}", target.generation)
+}
+
+// Page size may change between pages, and a cursor's stage already decides definitions.
+impl GrepParams {
+    fn cursor_key(&self) -> Self {
+        Self {
+            cursor: None,
+            max_results: None,
+            definitions_only: false,
+            ..self.clone()
+        }
+    }
+}
+
+impl FindFilesParams {
+    fn cursor_key(&self) -> Self {
+        Self {
+            cursor: None,
+            max_results: None,
+            ..self.clone()
+        }
+    }
+}
+
+impl MultiGrepParams {
+    fn cursor_key(&self) -> Self {
+        Self {
+            cursor: None,
+            max_results: None,
+            definitions_only: false,
+            ..self.clone()
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1628,7 +1754,7 @@ mod tests {
         let request = serde_json::json!({"query": "split(\"\\n\")", "mode": "literal"});
         let text = response_text(
             server
-                .grep(Parameters(serde_json::from_value(request).unwrap()))
+                .grep_sync(Parameters(serde_json::from_value(request).unwrap()))
                 .unwrap(),
         );
         assert!(text.contains("a.rs"), "{text}");
@@ -1817,7 +1943,7 @@ mod tests {
         ]);
         let find = |query: &str| {
             let params = serde_json::from_value(serde_json::json!({"query": query})).unwrap();
-            response_text(server.find_files(Parameters(params)).unwrap())
+            response_text(server.find_files_sync(Parameters(params)).unwrap())
         };
         let text = find("*.nu");
         assert!(text.contains("a.nu") && text.contains("b.nu"), "{text}");
@@ -1870,7 +1996,7 @@ mod tests {
             "query": "Needle", "mode": "literal",
         }))
         .unwrap();
-        let text = response_text(server.grep(Parameters(params)).unwrap());
+        let text = response_text(server.grep_sync(Parameters(params)).unwrap());
         assert!(text.contains("1: fn Needle()"), "{text}");
         assert!(text.contains("  2| …"), "{text}");
         assert!(text.contains("\"; Needle();"), "{text}");
@@ -1929,7 +2055,7 @@ mod tests {
         let text = response_text(server.perform_grep(&params, GrepMode::PlainText).unwrap());
         assert!(text.contains("No matching definitions found"), "{text}");
         let id = text.split("cursor: ").nth(1).unwrap().trim();
-        let cursor = server.cursor_store.lock().unwrap().get_grep(id).unwrap();
+        let cursor = server.cursor_store.lock().peek(id).unwrap();
         assert_eq!(cursor.stage, GrepStage::References);
         assert!(cursor.file_offset > 0);
 
@@ -2041,7 +2167,7 @@ mod tests {
             let text = response_text(server.perform_grep(&params, GrepMode::PlainText).unwrap());
             assert!(text.contains("Maybe you meant"), "{text}");
             let id = text.split("cursor: ").nth(1).unwrap().trim();
-            let cursor = server.cursor_store.lock().unwrap().get_grep(id).unwrap();
+            let cursor = server.cursor_store.lock().peek(id).unwrap();
             assert_eq!(
                 cursor.stage,
                 if definitions {
@@ -2131,15 +2257,17 @@ mod tests {
             assert!(text.contains("fn Needle()"), "{query}: {text}");
         }
 
-        let id = server.cursor_store.lock().unwrap().store_grep(GrepCursor {
-            stage: GrepStage::References,
-            missing_path: true,
-            ..Default::default()
-        });
-        let params = serde_json::from_value(serde_json::json!({
-            "query": "missing.rs Needle", "cursor": id,
-        }))
-        .unwrap();
+        let request = serde_json::json!({"query": "missing.rs Needle"});
+        let id = stored_cursor(
+            &server,
+            &request,
+            GrepCursor {
+                stage: GrepStage::References,
+                missing_path: true,
+                ..Default::default()
+            },
+        );
+        let params = with_cursor(request, &id);
         let text = response_text(server.perform_grep(&params, GrepMode::PlainText).unwrap());
         assert!(text.starts_with(notice), "{text}");
         assert!(text.contains("Needle();"), "{text}");
@@ -2157,16 +2285,18 @@ mod tests {
             GrepStage::FuzzyDefinitions,
             GrepStage::FuzzyMatches,
         ] {
-            let id = server.cursor_store.lock().unwrap().store_grep(GrepCursor {
-                file_offset: 1,
-                stage,
-                found_matches: true,
-                ..Default::default()
-            });
-            let params = serde_json::from_value(serde_json::json!({
-                "query": "Needle", "cursor": id,
-            }))
-            .unwrap();
+            let request = serde_json::json!({"query": "Needle"});
+            let id = stored_cursor(
+                &server,
+                &request,
+                GrepCursor {
+                    file_offset: 1,
+                    stage,
+                    found_matches: true,
+                    ..Default::default()
+                },
+            );
+            let params = with_cursor(request, &id);
             assert_eq!(
                 response_text(server.perform_grep(&params, GrepMode::PlainText).unwrap()),
                 "0 matches.",
@@ -2199,14 +2329,18 @@ mod tests {
         ] {
             let (_dir, server) =
                 definition_server(&[("a.rs".into(), source), ("b.rs".into(), "unrelated();")]);
-            let id = server.cursor_store.lock().unwrap().store_grep(GrepCursor {
-                file_offset: 1,
-                stage,
-                found_matches: false,
-                ..Default::default()
-            });
-            let params =
-                serde_json::from_value(serde_json::json!({"query": query, "cursor": id})).unwrap();
+            let request = serde_json::json!({"query": query});
+            let id = stored_cursor(
+                &server,
+                &request,
+                GrepCursor {
+                    file_offset: 1,
+                    stage,
+                    found_matches: false,
+                    ..Default::default()
+                },
+            );
+            let params = with_cursor(request, &id);
             let text = response_text(server.perform_grep(&params, GrepMode::PlainText).unwrap());
             assert!(text.contains(notice), "{stage:?}: {text}");
             assert!(text.contains(source), "{stage:?}: {text}");
@@ -2288,7 +2422,7 @@ mod tests {
             let params =
                 serde_json::from_value(serde_json::json!({"query": query, "path": "scope_a"}))
                     .unwrap();
-            let text = response_text(server.find_files(Parameters(params)).unwrap());
+            let text = response_text(server.find_files_sync(Parameters(params)).unwrap());
             assert!(text.contains("scope_a/defs.rs"), "{text}");
             assert!(!text.contains("scope_b"), "{text}");
         }
@@ -2333,7 +2467,7 @@ mod tests {
                     request["query"] = "".into();
                     request["mode"] = mode.into();
                     let params = serde_json::from_value(request).unwrap();
-                    let text = response_text(server.find_files(Parameters(params)).unwrap());
+                    let text = response_text(server.find_files_sync(Parameters(params)).unwrap());
                     assert!(text.contains(included), "{scope}: {text}");
                     assert!(!text.contains(excluded), "{scope}: {text}");
                 }
@@ -2373,9 +2507,9 @@ mod tests {
                     "hidden": false,
                 });
                 let response = if grep {
-                    server.grep(Parameters(serde_json::from_value(request).unwrap()))
+                    server.grep_sync(Parameters(serde_json::from_value(request).unwrap()))
                 } else {
-                    server.find_files(Parameters(serde_json::from_value(request).unwrap()))
+                    server.find_files_sync(Parameters(serde_json::from_value(request).unwrap()))
                 };
                 let text = response_text(response.unwrap());
                 assert!(text.contains(&included), "{text}");
@@ -2387,21 +2521,23 @@ mod tests {
     #[test]
     fn named_paths_stay_inside_the_checkout() {
         let (dir, server) = definition_server(&[("src/a.rs".into(), "fn Needle() {}")]);
-        let guard = server.picker.read().unwrap();
+        let target = server.source.target();
+        let guard = target.picker.read().unwrap();
         let picker = guard.as_ref().unwrap();
+        let view = SessionView::new(picker, &target.scope, &target.root);
         let base = dir.path();
         let outside = base.parent().unwrap().join("outside-fff-index");
-        assert_eq!(path_scope(None, picker).unwrap(), None);
-        assert_eq!(path_scope(Some("."), picker).unwrap(), None);
-        assert_eq!(path_scope(base.to_str(), picker).unwrap(), None);
+        assert_eq!(path_scope(None, &view).unwrap(), None);
+        assert_eq!(path_scope(Some("."), &view).unwrap(), None);
+        assert_eq!(path_scope(base.to_str(), &view).unwrap(), None);
         assert_eq!(
-            path_scope(base.join("src").to_str(), picker).unwrap(),
-            path_scope(Some("src/"), picker).unwrap()
+            path_scope(base.join("src").to_str(), &view).unwrap(),
+            path_scope(Some("src/"), &view).unwrap()
         );
-        assert!(path_scope(Some("../other"), picker).is_err());
-        assert!(path_scope(outside.to_str(), picker).is_err());
+        assert!(path_scope(Some("../other"), &view).is_err());
+        assert!(path_scope(outside.to_str(), &view).is_err());
         for missing in [base.join("missing"), "missing".into()] {
-            let scope = path_scope(missing.to_str(), picker).unwrap().unwrap();
+            let scope = path_scope(missing.to_str(), &view).unwrap().unwrap();
             assert!(
                 scope
                     .notice
@@ -2417,14 +2553,14 @@ mod tests {
             let linked_root = link.path().join("root");
             std::os::unix::fs::symlink(base, &linked_root).unwrap();
             assert_eq!(
-                path_scope(linked_root.join("src").to_str(), picker).unwrap(),
-                path_scope(Some("src"), picker).unwrap()
+                path_scope(linked_root.join("src").to_str(), &view).unwrap(),
+                path_scope(Some("src"), &view).unwrap()
             );
             // A missing tail under another spelling of the root stays inside the checkout.
-            let scope = path_scope(linked_root.join("missing").to_str(), picker).unwrap();
+            let scope = path_scope(linked_root.join("missing").to_str(), &view).unwrap();
             assert_eq!(scope.unwrap().glob, "{missing,missing/**}");
             let outside = link.path().join("outside");
-            assert!(path_scope(outside.join("missing").to_str(), picker).is_err());
+            assert!(path_scope(outside.join("missing").to_str(), &view).is_err());
         }
         drop(guard);
 
@@ -2438,7 +2574,7 @@ mod tests {
         );
         let params =
             serde_json::from_value(serde_json::json!({"query": "a", "path": "missing"})).unwrap();
-        let text = response_text(server.find_files(Parameters(params)).unwrap());
+        let text = response_text(server.find_files_sync(Parameters(params)).unwrap());
         assert!(
             text.starts_with("Path 'missing' matches no indexed"),
             "{text}"
@@ -2668,7 +2804,7 @@ mod tests {
         let grep = |request: serde_json::Value| {
             response_text(
                 server
-                    .grep(Parameters(serde_json::from_value(request).unwrap()))
+                    .grep_sync(Parameters(serde_json::from_value(request).unwrap()))
                     .unwrap(),
             )
         };
@@ -2775,7 +2911,7 @@ mod tests {
                         .unwrap()
                 } else {
                     server
-                        .grep(Parameters(serde_json::from_value(request.clone()).unwrap()))
+                        .grep_sync(Parameters(serde_json::from_value(request.clone()).unwrap()))
                         .unwrap()
                 };
                 let text = response_text(result);
@@ -2828,7 +2964,7 @@ mod tests {
                 for _ in 0..50 {
                     let text = response_text(
                         server
-                            .grep(Parameters(serde_json::from_value(request.clone()).unwrap()))
+                            .grep_sync(Parameters(serde_json::from_value(request.clone()).unwrap()))
                             .unwrap(),
                     );
                     assert!(text.starts_with("0 matches for 'unused"), "{text}");
@@ -2873,7 +3009,7 @@ mod tests {
                 serde_json::json!({"query":query,"mode":mode,"context":0,"path":"src/a.rs"}),
             )
             .unwrap();
-            let text = response_text(server.grep(Parameters(params)).unwrap());
+            let text = response_text(server.grep_sync(Parameters(params)).unwrap());
             assert!(text.contains(expected), "{text}");
         }
         let params = serde_json::from_value(serde_json::json!({
@@ -2881,7 +3017,7 @@ mod tests {
             "paths":["src", "tests"], "globs":["*.rs","*.py","!tests/**"],
         }))
         .unwrap();
-        let text = response_text(server.grep(Parameters(params)).unwrap());
+        let text = response_text(server.grep_sync(Parameters(params)).unwrap());
         assert!(
             text.contains("src/a.rs") && text.contains("src/b.py"),
             "{text}"
@@ -2899,7 +3035,7 @@ mod tests {
             serde_json::json!({"query":"needle", "before_context":1, "after_context":2}),
         )
         .unwrap();
-        let text = response_text(server.grep(Parameters(params)).unwrap());
+        let text = response_text(server.grep_sync(Parameters(params)).unwrap());
         for line in ["before", "needle", "after", "last"] {
             assert!(text.contains(line), "{text}");
         }
@@ -2907,7 +3043,7 @@ mod tests {
             serde_json::from_value(serde_json::json!({"query":"[", "mode":"regex"})).unwrap();
         assert!(
             server
-                .grep(Parameters(params))
+                .grep_sync(Parameters(params))
                 .unwrap_err()
                 .message
                 .contains("Invalid regex")
@@ -2930,7 +3066,7 @@ mod tests {
         ] {
             let text = response_text(
                 server
-                    .find_files(Parameters(serde_json::from_value(request).unwrap()))
+                    .find_files_sync(Parameters(serde_json::from_value(request).unwrap()))
                     .unwrap(),
             );
             assert_eq!(text, "utils/image.rs");
@@ -2938,7 +3074,7 @@ mod tests {
         let request = serde_json::json!({"query":"image"});
         let text = response_text(
             server
-                .find_files(Parameters(serde_json::from_value(request).unwrap()))
+                .find_files_sync(Parameters(serde_json::from_value(request).unwrap()))
                 .unwrap(),
         );
         assert!(!text.contains("irrelevant"), "{text}");
@@ -2954,7 +3090,7 @@ mod tests {
             definition_server(&[("a.rs".into(), "before\nNeedle one\nNeedle two\nafter")]);
         let params =
             serde_json::from_value(serde_json::json!({"query":"Needle", "context":1})).unwrap();
-        let text = response_text(server.grep(Parameters(params)).unwrap());
+        let text = response_text(server.grep_sync(Parameters(params)).unwrap());
         for source in ["before", "Needle one", "Needle two", "after"] {
             assert_eq!(text.matches(source).count(), 1, "{text}");
         }
@@ -2977,7 +3113,7 @@ mod tests {
             }
             let text = response_text(
                 server
-                    .grep(Parameters(serde_json::from_value(request).unwrap()))
+                    .grep_sync(Parameters(serde_json::from_value(request).unwrap()))
                     .unwrap(),
             );
             assert_eq!(
@@ -3007,7 +3143,7 @@ mod tests {
                 .extend(scope.as_object().unwrap().clone());
             let text = response_text(
                 server
-                    .grep(Parameters(serde_json::from_value(request).unwrap()))
+                    .grep_sync(Parameters(serde_json::from_value(request).unwrap()))
                     .unwrap(),
             );
             assert!(!text.contains("core/image_tests.rs"), "{text}");
@@ -3033,7 +3169,7 @@ mod tests {
             let request = serde_json::json!({"query":query,"mode":mode});
             let text = response_text(
                 server
-                    .find_files(Parameters(serde_json::from_value(request).unwrap()))
+                    .find_files_sync(Parameters(serde_json::from_value(request).unwrap()))
                     .unwrap(),
             );
             assert!(text.contains("src/network_client.rs"), "{mode}: {text}");
@@ -3057,7 +3193,7 @@ mod tests {
         let request = serde_json::json!({"query": "readme"});
         let text = response_text(
             server
-                .find_files(Parameters(serde_json::from_value(request).unwrap()))
+                .find_files_sync(Parameters(serde_json::from_value(request).unwrap()))
                 .unwrap(),
         );
         let lines: Vec<_> = text.lines().collect();
@@ -3089,7 +3225,7 @@ mod tests {
             let request = serde_json::json!({"query": query});
             response_text(
                 server
-                    .find_files(Parameters(serde_json::from_value(request).unwrap()))
+                    .find_files_sync(Parameters(serde_json::from_value(request).unwrap()))
                     .unwrap(),
             )
         };
@@ -3125,7 +3261,7 @@ mod tests {
         let request = serde_json::json!({"query": "vf_"});
         let text = response_text(
             server
-                .find_files(Parameters(serde_json::from_value(request).unwrap()))
+                .find_files_sync(Parameters(serde_json::from_value(request).unwrap()))
                 .unwrap(),
         );
         let lines: Vec<_> = text.lines().collect();
@@ -3152,7 +3288,7 @@ mod tests {
         });
         let text = response_text(
             server
-                .grep(Parameters(serde_json::from_value(request).unwrap()))
+                .grep_sync(Parameters(serde_json::from_value(request).unwrap()))
                 .unwrap(),
         );
         assert!(text.contains("broader scope"), "{text}");
@@ -3177,7 +3313,7 @@ mod tests {
             "query":"Needle", "mode":"literal", "globs":["!node_modules"], "context":0,
         }))
         .unwrap();
-        let text = response_text(server.grep(Parameters(params)).unwrap());
+        let text = response_text(server.grep_sync(Parameters(params)).unwrap());
         assert!(!text.contains("node_modules"), "{text}");
         assert!(text.contains("src/image.rs"), "{text}");
         let params = serde_json::from_value(serde_json::json!({
@@ -3185,7 +3321,7 @@ mod tests {
         }))
         .unwrap();
         assert_eq!(
-            response_text(server.find_files(Parameters(params)).unwrap()),
+            response_text(server.find_files_sync(Parameters(params)).unwrap()),
             "src/image.rs"
         );
     }
@@ -3204,7 +3340,7 @@ mod tests {
             serde_json::json!({"query":"jitter", "mode":"literal", "paths":["src"]}),
         )
         .unwrap();
-        let text = response_text(server.grep(Parameters(params)).unwrap());
+        let text = response_text(server.grep_sync(Parameters(params)).unwrap());
         assert!(text.contains("elsewhere in the indexed project"), "{text}");
         assert!(text.contains("other/backoff.rs"), "{text}");
         assert!(!text.contains("noise.rs"), "{text}");
@@ -3212,7 +3348,7 @@ mod tests {
             serde_json::json!({"query":"Nedle", "mode":"literal", "paths":["src"]}),
         )
         .unwrap();
-        let text = response_text(server.grep(Parameters(params)).unwrap());
+        let text = response_text(server.grep_sync(Parameters(params)).unwrap());
         assert!(
             text.contains("approximate") && text.contains("src/typo.rs"),
             "{text}"
@@ -3221,7 +3357,7 @@ mod tests {
             serde_json::json!({"query":"Nedle", "mode":"literal", "paths":["missing"]}),
         )
         .unwrap();
-        let text = response_text(server.grep(Parameters(params)).unwrap());
+        let text = response_text(server.grep_sync(Parameters(params)).unwrap());
         assert!(!text.contains("fn Needle"), "{text}");
     }
 
@@ -3248,7 +3384,7 @@ mod tests {
         let grep = |request: serde_json::Value| {
             response_text(
                 server
-                    .grep(Parameters(serde_json::from_value(request).unwrap()))
+                    .grep_sync(Parameters(serde_json::from_value(request).unwrap()))
                     .unwrap(),
             )
         };
@@ -3288,7 +3424,7 @@ mod tests {
         let request = serde_json::json!({"query": "Needle", "paths": [linked.join("src")]});
         let text = response_text(
             server
-                .grep(Parameters(serde_json::from_value(request).unwrap()))
+                .grep_sync(Parameters(serde_json::from_value(request).unwrap()))
                 .unwrap(),
         );
         assert!(text.contains("src/a.rs"), "{text}");
@@ -3365,7 +3501,7 @@ mod tests {
             let request = serde_json::json!({"query":"", "mode":"glob", "globs":globs});
             let text = response_text(
                 server
-                    .find_files(Parameters(serde_json::from_value(request).unwrap()))
+                    .find_files_sync(Parameters(serde_json::from_value(request).unwrap()))
                     .unwrap(),
             );
             assert_eq!(
@@ -3383,8 +3519,8 @@ mod tests {
                 });
                 let mut found = std::collections::BTreeSet::new();
                 for _ in 0..paths.len() {
-                    let response =
-                        server.grep(Parameters(serde_json::from_value(request.clone()).unwrap()));
+                    let response = server
+                        .grep_sync(Parameters(serde_json::from_value(request.clone()).unwrap()));
                     let text = response_text(response.unwrap());
                     let page: Vec<_> = text.lines().filter(|line| paths.contains(line)).collect();
                     assert!((1..=2).contains(&page.len()), "{text}");
@@ -3461,9 +3597,9 @@ mod tests {
                     "globs":globs, "hidden":false, "context":0,
                 });
                 let response = if grep {
-                    server.grep(Parameters(serde_json::from_value(request).unwrap()))
+                    server.grep_sync(Parameters(serde_json::from_value(request).unwrap()))
                 } else {
-                    server.find_files(Parameters(serde_json::from_value(request).unwrap()))
+                    server.find_files_sync(Parameters(serde_json::from_value(request).unwrap()))
                 };
                 let text = response_text(response.unwrap());
                 let actual = text
@@ -3496,7 +3632,7 @@ mod tests {
                 serde_json::json!({"query":"", "mode":"glob", "paths":paths, "hidden":false});
             let text = response_text(
                 server
-                    .find_files(Parameters(serde_json::from_value(request).unwrap()))
+                    .find_files_sync(Parameters(serde_json::from_value(request).unwrap()))
                     .unwrap(),
             );
             assert_eq!(
@@ -3515,16 +3651,18 @@ mod tests {
             ("excluded.txt".into(), "Needle outside scope"),
         ]);
         for query in ["unused Needle *.rs", "unused Needle[0-9] *.rs"] {
-            let id = server.cursor_store.lock().unwrap().store_grep(GrepCursor {
-                file_offset: 1,
-                stage: GrepStage::Broadened,
-                found_matches: true,
-                ..Default::default()
-            });
-            let params = serde_json::from_value(serde_json::json!({
-                "query": query, "cursor": id, "context": 1,
-            }))
-            .unwrap();
+            let request = serde_json::json!({"query": query, "context": 1});
+            let id = stored_cursor(
+                &server,
+                &request,
+                GrepCursor {
+                    file_offset: 1,
+                    stage: GrepStage::Broadened,
+                    found_matches: true,
+                    ..Default::default()
+                },
+            );
+            let params = with_cursor(request, &id);
             let text = response_text(server.perform_grep(&params, GrepMode::PlainText).unwrap());
             assert!(text.starts_with("0 matches for 'unused"), "{text}");
             assert!(text.contains("Auto-broadened to"), "{text}");
@@ -3587,7 +3725,7 @@ mod tests {
             shared.wait_for_indexing_complete(std::time::Duration::from_secs(10)),
             "content indexing did not finish"
         );
-        (dir, FffServer::new(shared))
+        (dir, picker_server(shared))
     }
 
     fn definition_server(files: &[(String, &str)]) -> (tempfile::TempDir, FffServer) {
@@ -3615,7 +3753,7 @@ mod tests {
         picker.collect_files().unwrap();
         let shared = SharedFilePicker::default();
         *shared.write().unwrap() = Some(picker);
-        (dir, FffServer::new(shared))
+        (dir, picker_server(shared))
     }
 
     fn response_text(result: CallToolResult) -> String {
@@ -3623,5 +3761,57 @@ mod tests {
             .as_str()
             .unwrap()
             .to_owned()
+    }
+
+    struct PickerSource(SharedFilePicker);
+
+    impl SearchSource for PickerSource {
+        fn target(&self) -> SearchTarget {
+            let root = self
+                .0
+                .read()
+                .unwrap()
+                .as_ref()
+                .unwrap()
+                .base_path()
+                .to_path_buf();
+            SearchTarget {
+                generation: String::new(),
+                picker: self.0.clone(),
+                scope: SessionScope::default(),
+                root,
+                _binding: Arc::new(()),
+            }
+        }
+
+        fn prepare(&self) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send + '_>> {
+            Box::pin(async { Ok(()) })
+        }
+    }
+
+    fn picker_server(picker: SharedFilePicker) -> FffServer {
+        FffServer::with_source(Arc::new(PickerSource(picker)))
+    }
+
+    // A cursor of the grep `request` (as perform_grep runs it) holding `cursor`.
+    fn stored_cursor(
+        server: &FffServer,
+        request: &serde_json::Value,
+        cursor: GrepCursor,
+    ) -> String {
+        let params: GrepParams = serde_json::from_value(request.clone()).unwrap();
+        let context = search_context(
+            &server.source.target(),
+            "grep",
+            &(GrepMode::PlainText, params.cursor_key()),
+        );
+        let mut store = server.cursor_store.lock();
+        store.begin_grep(context, None).unwrap();
+        store.store_grep(cursor)
+    }
+
+    fn with_cursor(mut request: serde_json::Value, id: &str) -> GrepParams {
+        request["cursor"] = id.into();
+        serde_json::from_value(request).unwrap()
     }
 }

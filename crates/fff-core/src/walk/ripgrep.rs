@@ -1,6 +1,6 @@
 use crate::ignore::non_git_repo_overrides;
 use crate::types::FileItem;
-use crate::walk::WalkOutput;
+use crate::walk::{DirHook, WalkOutput};
 use crate::watch::is_git_file;
 use ignore::WalkBuilder;
 use std::path::Path;
@@ -12,10 +12,12 @@ use std::sync::{
 #[tracing::instrument(skip_all, name = "ripgrep walker", level = "info")]
 pub(crate) fn walk_collect_files(
     base_path: &Path,
+    subtree: Option<&Path>,
     is_git_repo: bool,
     follow_symlinks: bool,
     threads: usize,
     synced_files_count: &Arc<AtomicUsize>,
+    on_dir: Option<&DirHook>,
 ) -> crate::Result<WalkOutput> {
     let mut walk_builder = WalkBuilder::new(base_path);
     walk_builder
@@ -32,6 +34,30 @@ pub(crate) fn walk_collect_files(
         walk_builder.overrides(overrides);
     }
 
+    if let Some(subtree) = subtree {
+        super::subtree_relative(base_path, subtree)?;
+    }
+    if subtree.is_some() || on_dir.is_some() {
+        let subtree = subtree.map(Path::to_path_buf);
+        let on_dir = on_dir.cloned();
+        // Runs while the parent is listed, so before the entry's own directory is read.
+        walk_builder.filter_entry(move |entry| {
+            let path = entry.path();
+            // Descend only into the subtree and the ancestors leading to it.
+            if let Some(subtree) = &subtree
+                && !path.starts_with(subtree)
+            {
+                return subtree.starts_with(path);
+            }
+            if let Some(on_dir) = &on_dir
+                && entry.file_type().is_some_and(|ft| ft.is_dir())
+                && !is_git_file(path)
+            {
+                on_dir(path);
+            }
+            true
+        });
+    }
     let walker = walk_builder.build_parallel();
 
     // Single lock for both collections: every entry is either a file or a
@@ -48,6 +74,10 @@ pub(crate) fn walk_collect_files(
                 return ignore::WalkState::Continue;
             };
 
+            // Ancestors of the subtree are traversed but not reported.
+            if subtree.is_some_and(|subtree| !entry.path().starts_with(subtree)) {
+                return ignore::WalkState::Continue;
+            }
             if entry.file_type().is_some_and(|ft| ft.is_file()) {
                 let path = entry.path();
 

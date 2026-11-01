@@ -34,6 +34,7 @@ fn run_grep(picker: &FilePicker, query: &str, iters: usize) {
         classify_definitions: Default::default(),
         trim_whitespace: false,
         abort_signal: None,
+        scope: Default::default(),
     };
 
     let parsed = parse_grep_query(query);

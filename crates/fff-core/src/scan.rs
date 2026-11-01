@@ -1,32 +1,85 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
-use tracing::{error, info};
+use tracing::{error, info, warn};
 
 use crate::FileSync;
 use crate::error::Error;
 use crate::file_picker::FFFMode;
+use crate::git::GitDiscovery;
 use crate::index::{build_bigram_index, sniff_binary_for_non_indexable};
 use crate::parallelism::BACKGROUND_THREAD_POOL;
+use crate::rescan_stats::RescanReason;
 use crate::shared::{SharedFilePicker, SharedFrecency};
 use crate::types::ContentCacheBudget;
-use crate::watch::BackgroundWatcher;
+use crate::watch::{BackgroundWatcher, Released, handle_debounced_events, request_recovery_rescan};
 
 #[derive(Clone, Default)]
 pub(crate) struct ScanSignals {
     /// Set to `true` while any scan phase is running
     pub(crate) scanning: Arc<AtomicBool>,
-    /// Set to `true` once the filesystem watcher has been installed
+    /// Set once the watcher is subscribed and every change since the initial walk
+    /// began is indexed or queued behind it
     pub(crate) watcher_ready: Arc<AtomicBool>,
+    /// Set when the initial scan ends without installing the requested watcher
+    pub(crate) watcher_failed: Arc<AtomicBool>,
     /// Indicates that that owning picker was requested to shut down
     pub(crate) cancelled: Arc<AtomicBool>,
-    /// Used to resolve conflicts if multiple rescans were triggered in a queue
+    /// Claimed by the one scan job allowed to run for this picker, from its start
+    /// until it has handed a pending request to a follow-up scan
+    pub(crate) scan_job_running: Arc<AtomicBool>,
+    /// A rescan requested while a job ran; the job starts it when it ends
     pub(crate) rescan_pending: Arc<AtomicBool>,
     /// Set by `post_scan_snapshot`, cleared by `PostScanSnapshot::drop`.
     /// DO NOT set or clear this manually — it is managed exclusively by the
     /// PostScanSnapshot lifecycle.
     pub(crate) post_scan_indexing_active: Arc<AtomicBool>,
+}
+
+/// Lifecycle of a picker's filesystem watcher.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WatcherStatus {
+    /// The picker was created without a watcher.
+    Disabled,
+    /// The initial scan has not finished setting up the watcher.
+    Starting,
+    Ready,
+    /// The watcher could not be installed; the index is not kept up to date.
+    Failed,
+    /// The picker was cancelled or its watcher was stopped.
+    Stopped,
+}
+
+/// Lock-free view of a picker's background scan and watcher progress.
+#[derive(Clone)]
+pub struct BackgroundStatus {
+    signals: ScanSignals,
+    watch: bool,
+}
+
+impl BackgroundStatus {
+    pub(crate) fn new(signals: ScanSignals, watch: bool) -> Self {
+        Self { signals, watch }
+    }
+
+    pub fn is_scanning(&self) -> bool {
+        self.signals.scanning.load(Ordering::Acquire)
+    }
+
+    pub fn watcher(&self) -> WatcherStatus {
+        if !self.watch {
+            WatcherStatus::Disabled
+        } else if self.signals.watcher_ready.load(Ordering::Acquire) {
+            WatcherStatus::Ready
+        } else if self.signals.watcher_failed.load(Ordering::Acquire) {
+            WatcherStatus::Failed
+        } else if self.signals.cancelled.load(Ordering::Acquire) {
+            WatcherStatus::Stopped
+        } else {
+            WatcherStatus::Starting
+        }
+    }
 }
 
 /// Which optional phases a scan should run.
@@ -61,22 +114,60 @@ pub(crate) struct ScanJob {
     trace_span: tracing::Span,
 }
 
+impl ScanSignals {
+    fn claim_scan_job(&self) -> bool {
+        self.scan_job_running
+            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+            .is_ok()
+    }
+}
+
 impl ScanJob {
-    pub fn new_rescan(
+    /// Starts a rescan, or leaves it to the running scan job, which starts it when it ends.
+    pub(crate) fn request_rescan(
         shared_picker: &SharedFilePicker,
         shared_frecency: &SharedFrecency,
+    ) -> Result<(), Error> {
+        if let Some(job) = Self::new_rescan(shared_picker, shared_frecency, None)? {
+            #[cfg(test)]
+            tests::reached(tests::Stage::Claimed, &job.base_path);
+            job.spawn();
+            return Ok(());
+        }
+        let signals = {
+            let guard = shared_picker.read()?;
+            guard
+                .as_ref()
+                .ok_or(Error::FilePickerMissing)?
+                .scan_signals()
+        };
+        signals.rescan_pending.store(true, Ordering::SeqCst);
+        info!("Full rescan requested while another scan is active; it runs next");
+        // The running job may have ended between the claim and the flag.
+        if let Some(job) = Self::new_rescan(shared_picker, shared_frecency, Some(&signals))? {
+            job.spawn();
+        }
+        Ok(())
+    }
+
+    // Claims the picker's single scan job; `None` while another job holds it or
+    // when the published picker is no longer the one owning `expected`.
+    fn new_rescan(
+        shared_picker: &SharedFilePicker,
+        shared_frecency: &SharedFrecency,
+        expected: Option<&ScanSignals>,
     ) -> Result<Option<Self>, Error> {
         let guard = shared_picker.read()?;
         let picker = guard.as_ref().ok_or(Error::FilePickerMissing)?;
 
-        if picker.is_scan_active()
-            || picker
-                .signals
-                .post_scan_indexing_active
-                .load(Ordering::Acquire)
+        if expected.is_some_and(|expected| {
+            !Arc::ptr_eq(&expected.scan_job_running, &picker.signals.scan_job_running)
+        }) || !picker.signals.claim_scan_job()
         {
             return Ok(None);
         }
+        // The walk has not started yet, so it covers every request made until now.
+        picker.signals.rescan_pending.store(false, Ordering::SeqCst);
 
         let mode = picker.mode();
         let signals = picker.scan_signals();
@@ -161,11 +252,51 @@ impl ScanJob {
             trace_span: _,
         } = self;
 
-        let _scanning = ScanningGuard::new(&signals);
+        // Declared first so it ends last, after the scanning signal is cleared.
+        let _job = ScanJobClaim {
+            shared_picker: &shared_picker,
+            shared_frecency: &shared_frecency,
+            signals: &signals,
+            base_path: &base_path,
+        };
+        let scanning = ScanningGuard::new(&signals);
+        let mut watcher_install =
+            WatcherInstallGuard::new(&signals, config.install_watcher && config.watch);
         scanned_files_counter.store(0, Ordering::Relaxed);
-
-        // 1. Walk the file system and collect the list of files
         let git = FileSync::discover_git(&base_path);
+        let git_workdir = git.as_ref().map(|git| git.workdir.clone());
+
+        // 1. Subscribe before walking. Events arriving from now on are held until
+        // the walk's snapshot replaces the index, then replayed in order.
+        let held_events = config
+            .watch
+            .then(|| HeldEvents::new(&shared_picker, &signals))
+            .flatten();
+        if config.install_watcher && config.watch && !signals.cancelled.load(Ordering::Acquire) {
+            Self::install_watcher(
+                &shared_picker,
+                &shared_frecency,
+                &base_path,
+                &git,
+                mode,
+                &config,
+                &signals,
+            );
+        }
+        // Per-directory backends subscribe each directory before the walker reads it.
+        let dir_hook = shared_picker.read().ok().and_then(|guard| {
+            guard
+                .as_ref()
+                .filter(|picker| {
+                    picker.base_path() == base_path && !signals.cancelled.load(Ordering::Acquire)
+                })
+                .and_then(|picker| picker.background_watcher.as_ref())
+                .and_then(BackgroundWatcher::dir_hook)
+        });
+
+        // 2. Walk the file system and collect the list of files
+        #[cfg(test)]
+        tests::reached(tests::Stage::Walking, &base_path);
         let sync = match FileSync::walk_filesystem(
             &base_path,
             git.clone(),
@@ -173,15 +304,24 @@ impl ScanJob {
             &shared_frecency,
             mode,
             config.follow_symlinks,
+            dir_hook.as_ref(),
         ) {
             Ok(sync) => sync,
             Err(e) => {
                 error!(?e, "scan walk failed");
+                if config.install_watcher {
+                    Self::remove_watcher(&shared_picker, &base_path, &signals);
+                } else if let Some(held_events) = held_events {
+                    held_events.replay(&shared_frecency, &base_path, &git_workdir, mode);
+                }
                 return;
             }
         };
+        drop(dir_hook);
+        #[cfg(test)]
+        tests::reached(tests::Stage::Walked, &base_path);
 
-        // 2. Populate the file list
+        // 3. Populate the file list
         let git_status_worker;
         if let Ok(mut guard) = shared_picker.write()
             && let Some(picker) = guard.as_mut()
@@ -210,6 +350,23 @@ impl ScanJob {
             git_status_worker.request_full_rescan(); // this runs anyway
         }
 
+        if let Some(held_events) = held_events {
+            held_events.replay(&shared_frecency, &base_path, &git_workdir, mode);
+        }
+
+        // 4. Every change since the walk began is now indexed or queued behind the
+        // live watcher. The lock orders this with a concurrent stop.
+        if config.install_watcher
+            && let Ok(guard) = shared_picker.read()
+            && let Some(picker) = guard.as_ref()
+            && picker.background_watcher.is_some()
+            && !signals.cancelled.load(Ordering::Acquire)
+        {
+            signals.watcher_ready.store(true, Ordering::Release);
+            watcher_install.installed();
+        }
+        drop(watcher_install);
+
         // BUG pinning: take the snapshot *before* the storing the scan=true, otherwise there is a tiny
         // race window when there scanned is set to true, but `post_scan_indexing_active` flag is `false`
         let snapshot = if !signals.cancelled.load(Ordering::Acquire) {
@@ -224,13 +381,7 @@ impl ScanJob {
 
         signals.scanning.store(false, Ordering::Relaxed); // file are searchable
 
-        // in case we do a rescan, we have to resubscribe a watcher to the new set of directories
-        // all the already watched directories are not going to be resubscribed (this is internally deduped)
-        if !config.install_watcher && !signals.cancelled.load(Ordering::Acquire) {
-            rescubscribe_watcher_post_scan(&shared_picker);
-        }
-
-        // 3. Runs post scna in parallel with git status collection
+        // 5. Runs post scna in parallel with git status collection
         if !signals.cancelled.load(Ordering::Acquire)
             && let Some(snap) = snapshot.as_ref()
         {
@@ -239,57 +390,58 @@ impl ScanJob {
 
         drop(snapshot); // SNAPSHOT SHOULD NOT BE USED AFTER THIS POINT
 
-        // 5. Install filesystem watcher (initial scan only).
-        if config.install_watcher && config.watch && !signals.cancelled.load(Ordering::Acquire) {
-            let shared_picker: &SharedFilePicker = &shared_picker;
-            let shared_frecency: &SharedFrecency = &shared_frecency;
-            let base_path: &std::path::Path = &base_path;
+        drop(scanning);
+    }
 
-            match BackgroundWatcher::new(
-                base_path.to_path_buf(),
-                git,
-                shared_picker.clone(),
-                shared_frecency.clone(),
-                mode,
-                config.enable_fs_root_scanning,
-                config.enable_home_dir_scanning,
-                git_status_worker,
-                tracing::Span::current(),
-            ) {
-                Ok(watcher) => {
-                    if let Ok(mut guard) = shared_picker.write()
-                        && let Some(picker) = guard.as_mut()
-                        && picker.base_path() == base_path
-                        && !signals.cancelled.load(Ordering::Acquire)
-                    {
-                        picker.background_watcher = Some(watcher);
-                        signals.watcher_ready.store(true, Ordering::Release);
-                    }
-                }
-                Err(e) => error!(?e, "failed to initialize background watcher"),
-            };
-        }
-
-        // 6. Drain any rescan that arrived while we were busy.
-        // if user initiated a new rescan we had no way to cancel current post scan, so do it again
-        if !signals.cancelled.load(Ordering::Acquire)
-            && signals.rescan_pending.swap(false, Ordering::AcqRel)
-        {
-            match Self::new_rescan(&shared_picker, &shared_frecency) {
-                Ok(Some(follow_up)) => {
-                    info!("Rescheduling deferred rescan after current scan finished");
-                    follow_up.spawn();
-                }
-                Ok(None) => {
-                    // this should be practically impossible because we do not have any
-                    // queue, but if somehow a new rescan was triggered JUST IN THIS MOMENT
-                    // just ignore it because the ongoing one is fresh enough
-                    tracing::warn!("Post scan was re-triggered, ignoring");
-                }
-                Err(e) => {
-                    error!(?e, "Failed to reschedule deferred rescan");
+    // Installs the initial scan's watcher; its events stay held until the replay.
+    fn install_watcher(
+        shared_picker: &SharedFilePicker,
+        shared_frecency: &SharedFrecency,
+        base_path: &Path,
+        git: &Option<GitDiscovery>,
+        mode: FFFMode,
+        config: &ScanConfig,
+        signals: &ScanSignals,
+    ) {
+        let Some(git_status_worker) = shared_picker.read().ok().and_then(|guard| {
+            guard
+                .as_ref()
+                .map(|picker| Arc::clone(&picker.git_status_worker))
+        }) else {
+            return;
+        };
+        match BackgroundWatcher::new(
+            base_path.to_path_buf(),
+            git.clone(),
+            shared_picker.clone(),
+            shared_frecency.clone(),
+            mode,
+            config.enable_fs_root_scanning,
+            config.enable_home_dir_scanning,
+            git_status_worker,
+            tracing::Span::current(),
+        ) {
+            Ok(watcher) => {
+                if let Ok(mut guard) = shared_picker.write()
+                    && let Some(picker) = guard.as_mut()
+                    && picker.base_path() == base_path
+                    && !signals.cancelled.load(Ordering::Acquire)
+                {
+                    picker.background_watcher = Some(watcher);
                 }
             }
+            Err(e) => error!(?e, "failed to initialize background watcher"),
+        }
+    }
+
+    // An index whose initial walk failed cannot follow the tree.
+    fn remove_watcher(shared_picker: &SharedFilePicker, base_path: &Path, signals: &ScanSignals) {
+        if let Ok(mut guard) = shared_picker.write()
+            && let Some(picker) = guard.as_mut()
+            && picker.base_path() == base_path
+            && !signals.cancelled.load(Ordering::Acquire)
+        {
+            picker.stop_background_monitor();
         }
     }
 
@@ -323,6 +475,8 @@ impl ScanJob {
             let indexable_count = unsafe_snapshot.indexable_count.min(files.len());
             let (indexable_files, non_indexable_files) = files.split_at(indexable_count);
             let index = build_bigram_index(indexable_files, &unsafe_snapshot.base_path, arena);
+            #[cfg(test)]
+            tests::reached(tests::Stage::ContentIndexed, &unsafe_snapshot.base_path);
 
             // A root change may have replaced the picker while this index was building.
             if let Ok(mut guard) = shared_picker.write()
@@ -362,6 +516,114 @@ impl ScanJob {
     }
 }
 
+// Holds watcher events from before a scan's walk until its snapshot is committed,
+// which would otherwise overwrite changes applied while the walk ran.
+struct HeldEvents<'a> {
+    shared_picker: &'a SharedFilePicker,
+    owner: u64,
+}
+
+impl<'a> HeldEvents<'a> {
+    fn new(shared_picker: &'a SharedFilePicker, signals: &ScanSignals) -> Option<Self> {
+        let owner = shared_picker.event_hold().hold(&signals.cancelled)?;
+        Some(Self {
+            shared_picker,
+            owner,
+        })
+    }
+
+    // Applies the held events in arrival order, including those arriving meanwhile,
+    // then lets later events through. Dropped events are recovered by a rescan.
+    fn replay(
+        self,
+        shared_frecency: &SharedFrecency,
+        base_path: &Path,
+        git_workdir: &Option<PathBuf>,
+        mode: FFFMode,
+    ) {
+        let shared_picker = self.shared_picker;
+        let Some(git_status_worker) = shared_picker.read().ok().and_then(|guard| {
+            guard
+                .as_ref()
+                .map(|picker| Arc::clone(&picker.git_status_worker))
+        }) else {
+            return;
+        };
+        loop {
+            let events = match shared_picker.event_hold().release(self.owner) {
+                Released::Events(events) => events,
+                Released::Done => break,
+                Released::Overflowed => {
+                    warn!("Too many changes arrived while scanning; rescanning");
+                    request_recovery_rescan(
+                        shared_picker,
+                        shared_frecency,
+                        base_path,
+                        RescanReason::EventBatchOverflow,
+                    );
+                    break;
+                }
+            };
+            let new_dirs = handle_debounced_events(
+                mode,
+                events,
+                base_path,
+                git_workdir,
+                shared_picker,
+                shared_frecency,
+                &git_status_worker,
+            );
+            if let Ok(guard) = shared_picker.read()
+                && let Some(watcher) = guard
+                    .as_ref()
+                    .and_then(|picker| picker.background_watcher.as_ref())
+            {
+                for dir in new_dirs {
+                    watcher.request_index_dir(dir);
+                }
+            }
+        }
+    }
+}
+
+impl Drop for HeldEvents<'_> {
+    // A scan that ends without replaying (cancelled or unpublished) drops what it held.
+    fn drop(&mut self) {
+        self.shared_picker.event_hold().discard(self.owner);
+    }
+}
+
+// Releases the scan job claim on every exit, then starts a rescan requested meanwhile.
+struct ScanJobClaim<'a> {
+    shared_picker: &'a SharedFilePicker,
+    shared_frecency: &'a SharedFrecency,
+    signals: &'a ScanSignals,
+    base_path: &'a Path,
+}
+
+impl Drop for ScanJobClaim<'_> {
+    fn drop(&mut self) {
+        self.signals.scan_job_running.store(false, Ordering::SeqCst);
+        // A requester sets the flag before retrying its claim, so one of us starts it.
+        if !self.signals.cancelled.load(Ordering::Acquire)
+            && self.signals.rescan_pending.load(Ordering::SeqCst)
+        {
+            // A replaced index is not claimed: its successor's own scan covers the request.
+            match ScanJob::new_rescan(self.shared_picker, self.shared_frecency, Some(self.signals))
+            {
+                Ok(Some(follow_up)) => {
+                    info!(base_path = %self.base_path.display(), "Starting the rescan requested while the scan ran");
+                    follow_up.spawn();
+                }
+                Ok(None) => {}
+                Err(e) => error!(?e, "Failed to start the requested rescan"),
+            }
+        }
+        #[cfg(test)]
+        tests::reached(tests::Stage::Finished, self.base_path);
+    }
+}
+
 // Ensures early returns clear the scanning signal.
 struct ScanningGuard<'a> {
     signals: &'a ScanSignals,
@@ -380,31 +642,411 @@ impl Drop for ScanningGuard<'_> {
     }
 }
 
-/// If the scan encounters new directories created we have to add them to the watch list
-/// this is fine because the watcher does deduplicate the entries and doesn't add a lot of
-/// garbage notify watchers / fs events streams
-#[tracing::instrument(skip_all)]
-fn rescubscribe_watcher_post_scan(shared_picker: &SharedFilePicker) {
-    let Ok(guard) = shared_picker.read() else {
-        return;
-    };
-    let Some(picker) = guard.as_ref() else {
-        return;
-    };
-    let Some(watcher) = picker.background_watcher.as_ref() else {
-        return;
-    };
+// Reports a requested watcher that the initial scan did not install, unless cancelled.
+struct WatcherInstallGuard<'a> {
+    signals: &'a ScanSignals,
+    pending: bool,
+}
 
-    picker.for_each_dir(|dir: &std::path::Path| {
-        watcher.request_watch_dir(dir.to_path_buf());
-        std::ops::ControlFlow::Continue(())
-    });
+impl<'a> WatcherInstallGuard<'a> {
+    fn new(signals: &'a ScanSignals, requested: bool) -> Self {
+        Self {
+            signals,
+            pending: requested,
+        }
+    }
+
+    fn installed(&mut self) {
+        self.pending = false;
+    }
+}
+
+impl Drop for WatcherInstallGuard<'_> {
+    fn drop(&mut self) {
+        if self.pending && !self.signals.cancelled.load(Ordering::Acquire) {
+            self.signals.watcher_failed.store(true, Ordering::Release);
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::file_picker::{FilePicker, FilePickerOptions};
+    use crate::grep::{GrepSearchOptions, parse_grep_query};
+    use crate::scope::SearchScope;
+    use crate::watch::MAX_BATCH_PATHS;
+    use notify::event::{CreateKind, EventKind};
+    use notify_debouncer_full::DebouncedEvent;
+    use std::sync::Mutex;
+    use std::time::{Duration, Instant};
+
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub(super) enum Stage {
+        Claimed,
+        Walking,
+        Walked,
+        ContentIndexed,
+        Finished,
+    }
+
+    type Hook = Box<dyn FnOnce() + Send>;
+
+    // Each hook runs once, when the next scan of its base path reaches its stage.
+    static HOOKS: Mutex<Vec<(PathBuf, Stage, Hook)>> = Mutex::new(Vec::new());
+    static REACHED: Mutex<Vec<(PathBuf, Stage)>> = Mutex::new(Vec::new());
+
+    // The hook runs before the stage is recorded.
+    pub(super) fn reached(stage: Stage, base_path: &Path) {
+        let hook = {
+            let mut hooks = HOOKS.lock().unwrap();
+            let position = hooks
+                .iter()
+                .position(|(path, at, _)| path == base_path && *at == stage);
+            position.map(|position| hooks.remove(position).2)
+        };
+        if let Some(hook) = hook {
+            hook();
+        }
+        REACHED
+            .lock()
+            .unwrap()
+            .push((base_path.to_path_buf(), stage));
+    }
+
+    fn most_concurrent_walks(root: &Path) -> usize {
+        let mut walking = 0usize;
+        let mut most = 0;
+        for (path, stage) in REACHED.lock().unwrap().iter() {
+            match stage {
+                _ if path != root => {}
+                Stage::Walking => {
+                    walking += 1;
+                    most = most.max(walking);
+                }
+                Stage::Walked => walking = walking.saturating_sub(1),
+                _ => {}
+            }
+        }
+        most
+    }
+
+    fn on(root: &Path, stage: Stage, hook: impl FnOnce() + Send + 'static) {
+        HOOKS
+            .lock()
+            .unwrap()
+            .push((root.to_path_buf(), stage, Box::new(hook)));
+    }
+
+    fn times_reached(root: &Path, stage: Stage) -> usize {
+        REACHED
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(path, at)| path == root && *at == stage)
+            .count()
+    }
+
+    fn poll(done: impl FnMut() -> bool) -> bool {
+        poll_for(Duration::from_secs(20), done)
+    }
+
+    fn poll_for(limit: Duration, mut done: impl FnMut() -> bool) -> bool {
+        let deadline = Instant::now() + limit;
+        while !done() {
+            if Instant::now() >= deadline {
+                return false;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        true
+    }
+
+    fn eventually(what: &str, done: impl FnMut() -> bool) {
+        assert!(poll(done), "timed out waiting until {what}");
+    }
+
+    // Waits until every scan that walked `root` has finished and none is starting.
+    fn settle(shared: &SharedFilePicker, root: &Path) {
+        eventually("the scans settle", || {
+            let walks = times_reached(root, Stage::Walked);
+            walks > 0
+                && times_reached(root, Stage::Finished) == walks
+                && shared.wait_for_indexing_complete(Duration::ZERO)
+        });
+    }
+
+    fn start(shared: &SharedFilePicker, root: &Path, content_indexing: bool) -> SharedFrecency {
+        let frecency = SharedFrecency::default();
+        FilePicker::new_with_shared_state(
+            shared.clone(),
+            frecency.clone(),
+            FilePickerOptions {
+                base_path: root.to_string_lossy().into_owned(),
+                enable_content_indexing: content_indexing,
+                watch: true,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        frecency
+    }
+
+    fn live_files(shared: &SharedFilePicker) -> Vec<String> {
+        let guard = shared.read().unwrap();
+        let picker = guard.as_ref().unwrap();
+        let mut files: Vec<_> = picker
+            .get_files()
+            .iter()
+            .filter(|file| !file.is_deleted())
+            .map(|file| file.relative_path(picker))
+            .collect();
+        files.sort();
+        files
+    }
+
+    fn files_containing(shared: &SharedFilePicker, text: &str) -> Vec<String> {
+        let guard = shared.read().unwrap();
+        let picker = guard.as_ref().unwrap();
+        let result = picker.grep(&parse_grep_query(text), &GrepSearchOptions::default());
+        let mut files: Vec<_> = result
+            .files
+            .iter()
+            .map(|file| file.relative_path(picker))
+            .collect();
+        files.sort();
+        files
+    }
+
+    fn indexed_size(shared: &SharedFilePicker, path: &Path) -> Option<u64> {
+        let guard = shared.read().unwrap();
+        let picker = guard.as_ref()?;
+        picker.get_file_by_path(path).map(|file| file.size)
+    }
+
+    fn canonical_tempdir() -> (tempfile::TempDir, PathBuf) {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = crate::path_utils::canonicalize(tmp.path()).unwrap();
+        (tmp, root)
+    }
+
+    #[test]
+    fn changes_after_the_walk_reach_the_index_without_a_rescan() {
+        let (_tmp, root) = canonical_tempdir();
+        std::fs::create_dir(root.join("src")).unwrap();
+        std::fs::write(root.join("src/removed.rs"), "fn removed() {}\n").unwrap();
+        std::fs::write(root.join("src/edited.rs"), "").unwrap();
+        std::fs::write(root.join("src/kept.rs"), "fn kept() {}\n").unwrap();
+        let changes = root.clone();
+        on(&root, Stage::Walked, move || {
+            let _ = std::fs::create_dir_all(changes.join("new/empty"));
+            let _ = std::fs::write(changes.join("src/added.rs"), "fn added() {}\n");
+            let _ = std::fs::remove_file(changes.join("src/removed.rs"));
+            let _ = std::fs::write(
+                changes.join("src/edited.rs"),
+                "const edited_after_walk: u8 = 1;\n",
+            );
+        });
+
+        let shared = SharedFilePicker::default();
+        start(&shared, &root, true);
+        assert!(shared.wait_for_watcher(Duration::from_secs(10)));
+
+        let empty = SearchScope::new(&root, &root.join("new/empty")).unwrap();
+        eventually("the changes are indexed", || {
+            shared
+                .read()
+                .unwrap()
+                .as_ref()
+                .is_some_and(|picker| picker.contains_scope(&empty))
+                && live_files(&shared) == ["src/added.rs", "src/edited.rs", "src/kept.rs"]
+                && files_containing(&shared, "edited_after_walk") == ["src/edited.rs"]
+        });
+        settle(&shared, &root);
+        assert_eq!(times_reached(&root, Stage::Walked), 1);
+        assert_eq!(shared.rescan_stats().total, 0);
+        assert_eq!(
+            files_containing(&shared, "edited_after_walk"),
+            ["src/edited.rs"]
+        );
+    }
+
+    #[test]
+    fn an_edit_after_the_content_index_read_the_file_stays_searchable() {
+        let (_tmp, root) = canonical_tempdir();
+        std::fs::write(root.join("holder.rs"), "const zebra_quokka: u8 = 0;\n").unwrap();
+        std::fs::write(root.join("edited.rs"), "fn edited() {}\n").unwrap();
+        for i in 0..3 {
+            std::fs::write(root.join(format!("filler{i}.rs")), "fn filler() {}\n").unwrap();
+        }
+        let shared = SharedFilePicker::default();
+        let edited = root.join("edited.rs");
+        let observed = shared.clone();
+        // Hooks run on a pool thread, where a panic aborts: they report instead.
+        let applied = Arc::new(AtomicBool::new(false));
+        let edit_applied = Arc::clone(&applied);
+        on(&root, Stage::ContentIndexed, move || {
+            let content = "const zebra_quokka: u8 = 1;\n";
+            let written = std::fs::write(&edited, content).is_ok();
+            let seen = poll(|| indexed_size(&observed, &edited) == Some(content.len() as u64));
+            edit_applied.store(written && seen, Ordering::Release);
+        });
+
+        start(&shared, &root, true);
+        settle(&shared, &root);
+        assert!(
+            applied.load(Ordering::Acquire),
+            "the watcher missed the edit"
+        );
+        let guard = shared.read().unwrap();
+        assert!(guard.as_ref().unwrap().bigram_index().is_some());
+        drop(guard);
+        assert_eq!(
+            files_containing(&shared, "zebra_quokka"),
+            ["edited.rs", "holder.rs"]
+        );
+    }
+
+    #[test]
+    fn a_hold_beyond_one_batch_falls_back_to_one_rescan() {
+        let (_tmp, root) = canonical_tempdir();
+        std::fs::write(root.join("kept.rs"), "fn kept() {}\n").unwrap();
+        let shared = SharedFilePicker::default();
+        let watcher_side = shared.clone();
+        let changes = root.clone();
+        let still_held = Arc::new(AtomicUsize::new(usize::MAX));
+        let held_after_burst = Arc::clone(&still_held);
+        on(&root, Stage::Walked, move || {
+            let _ = std::fs::write(changes.join("late.rs"), "fn late() {}\n");
+            let burst = (0..=MAX_BATCH_PATHS)
+                .map(|i| {
+                    let event = notify::Event::new(EventKind::Create(CreateKind::File))
+                        .add_path(changes.join(format!("burst/{i}.rs")));
+                    DebouncedEvent::new(event, Instant::now())
+                })
+                .collect();
+            if watcher_side.event_hold().defer(burst).is_none() {
+                held_after_burst.store(watcher_side.event_hold().held_count(), Ordering::Release);
+            }
+        });
+
+        start(&shared, &root, false);
+        assert!(shared.wait_for_watcher(Duration::from_secs(10)));
+        assert_eq!(still_held.load(Ordering::Acquire), 0);
+        eventually("the fallback rescan walks", || {
+            times_reached(&root, Stage::Walked) == 2
+        });
+        settle(&shared, &root);
+        assert_eq!(times_reached(&root, Stage::Walked), 2);
+        #[cfg(rescan_stats)]
+        assert_eq!(
+            shared
+                .rescan_stats()
+                .count(RescanReason::EventBatchOverflow),
+            1
+        );
+        assert_eq!(live_files(&shared), ["kept.rs", "late.rs"]);
+    }
+
+    #[test]
+    fn rescans_requested_together_run_one_at_a_time_and_none_is_lost() {
+        let (_tmp, root) = canonical_tempdir();
+        std::fs::write(root.join("kept.rs"), "fn kept() {}\n").unwrap();
+        let shared = SharedFilePicker::default();
+        let frecency = start(&shared, &root, false);
+        settle(&shared, &root);
+
+        // A second request arrives after the first claimed its scan, before it runs.
+        let (requester, requester_frecency) = (shared.clone(), frecency.clone());
+        on(&root, Stage::Claimed, move || {
+            let _ = requester.trigger_full_rescan_async(&requester_frecency);
+        });
+        // The first walk to end waits to see whether another walk starts meanwhile.
+        let observed = root.clone();
+        on(&root, Stage::Walked, move || {
+            poll_for(Duration::from_secs(2), || {
+                times_reached(&observed, Stage::Walking) >= 3
+            });
+        });
+        shared.trigger_full_rescan_async(&frecency).unwrap();
+
+        eventually("the second request runs", || {
+            times_reached(&root, Stage::Walked) == 3
+        });
+        settle(&shared, &root);
+        assert_eq!(times_reached(&root, Stage::Walked), 3);
+        assert_eq!(most_concurrent_walks(&root), 1);
+    }
+
+    #[test]
+    fn a_rescan_keeps_changes_the_watcher_reports_during_its_walk() {
+        let (_tmp, root) = canonical_tempdir();
+        std::fs::create_dir(root.join("src")).unwrap();
+        std::fs::write(root.join("src/kept.rs"), "fn kept() {}\n").unwrap();
+        let shared = SharedFilePicker::default();
+        let frecency = start(&shared, &root, false);
+        assert!(shared.wait_for_watcher(Duration::from_secs(10)));
+        settle(&shared, &root);
+
+        // The file appears after the rescan's walk; its event arrives before the commit.
+        let changes = root.clone();
+        on(&root, Stage::Walked, move || {
+            let _ = std::fs::write(changes.join("src/late.rs"), "fn late() {}\n");
+            std::thread::sleep(Duration::from_millis(500));
+        });
+        shared.trigger_full_rescan_async(&frecency).unwrap();
+        settle(&shared, &root);
+
+        eventually("the change reported during the walk is indexed", || {
+            live_files(&shared) == ["src/kept.rs", "src/late.rs"]
+        });
+    }
+
+    fn status_after_install(requested: bool, installed: bool, cancelled: bool) -> WatcherStatus {
+        let signals = ScanSignals::default();
+        let mut guard = WatcherInstallGuard::new(&signals, requested);
+        if installed {
+            signals.watcher_ready.store(true, Ordering::Release);
+            guard.installed();
+        }
+        if cancelled {
+            signals.cancelled.store(true, Ordering::Release);
+        }
+        drop(guard);
+        BackgroundStatus::new(signals, true).watcher()
+    }
+
+    #[test]
+    fn a_requested_watcher_that_is_not_installed_fails() {
+        assert_eq!(
+            status_after_install(true, false, false),
+            WatcherStatus::Failed
+        );
+    }
+
+    #[test]
+    fn an_installed_watcher_is_ready() {
+        assert_eq!(
+            status_after_install(true, true, false),
+            WatcherStatus::Ready
+        );
+    }
+
+    #[test]
+    fn cancellation_before_installation_is_a_stop_not_a_failure() {
+        assert_eq!(
+            status_after_install(true, false, true),
+            WatcherStatus::Stopped
+        );
+    }
+
+    #[test]
+    fn a_scan_that_does_not_request_the_watcher_leaves_its_status_alone() {
+        assert_eq!(
+            status_after_install(false, false, false),
+            WatcherStatus::Starting
+        );
+    }
 
     fn collected(root: &std::path::Path) -> FilePicker {
         let mut picker = FilePicker::new(FilePickerOptions {

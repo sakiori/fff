@@ -582,6 +582,7 @@ fn test_multi_grep_search() {
         classify_definitions: Default::default(),
         trim_whitespace: false,
         abort_signal: None,
+        scope: Default::default(),
     };
     let no_cancel = AtomicBool::new(false);
 
@@ -596,8 +597,8 @@ fn test_multi_grep_search() {
         None,
         &no_cancel,
         dir.path(),
-        arena,
-        arena,
+        crate::simd_path::Arenas::single(arena),
+        None,
     );
 
     assert!(
@@ -636,8 +637,8 @@ fn test_multi_grep_search() {
         None,
         &no_cancel,
         dir.path(),
-        arena,
-        arena,
+        crate::simd_path::Arenas::single(arena),
+        None,
     );
     assert_eq!(
         result2.matches.len(),
@@ -656,8 +657,8 @@ fn test_multi_grep_search() {
         None,
         &no_cancel,
         dir.path(),
-        arena,
-        arena,
+        crate::simd_path::Arenas::single(arena),
+        None,
     );
     assert_eq!(
         result3.matches.len(),
@@ -856,6 +857,7 @@ fn test_grep_no_duplicates_with_overflow_trailing_bits() {
         classify_definitions: Default::default(),
         trim_whitespace: false,
         abort_signal: Some(std::sync::Arc::new(AtomicBool::new(false))),
+        scope: Default::default(),
     };
     let result = picker.grep(&query, &options);
 

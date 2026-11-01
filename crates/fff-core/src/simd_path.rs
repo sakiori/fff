@@ -48,6 +48,36 @@ impl std::fmt::Debug for ArenaPtr {
     }
 }
 
+/// The two arenas an index reads paths from: scan-built items live in `base`,
+/// watcher-appended items in `overflow`.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct Arenas {
+    pub(crate) base: ArenaPtr,
+    pub(crate) overflow: ArenaPtr,
+}
+
+impl Arenas {
+    #[inline]
+    pub(crate) fn new(base: ArenaPtr, overflow: ArenaPtr) -> Self {
+        Self { base, overflow }
+    }
+
+    /// Both regions share one arena (tests and single-arena item lists).
+    #[inline]
+    pub(crate) fn single(arena: ArenaPtr) -> Self {
+        Self::new(arena, arena)
+    }
+
+    #[inline]
+    pub(crate) fn select(self, is_overflow: bool) -> ArenaPtr {
+        if is_overflow {
+            self.overflow
+        } else {
+            self.base
+        }
+    }
+}
+
 #[repr(C, align(16))]
 #[derive(Clone, Copy)]
 pub(crate) struct SimdChunk(pub(crate) [u8; SIMD_CHUNK_BYTES]);
@@ -393,6 +423,11 @@ impl ChunkedPathStoreBuilder {
 
     pub fn as_arena_ptr(&self) -> ArenaPtr {
         ArenaPtr::new(self.arena.as_ptr() as *const u8, self.indices.as_ptr())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn written_chunks(&self) -> usize {
+        self.indices.len()
     }
 
     /// Like [`add_file_immediate`] but for directory paths where the entire

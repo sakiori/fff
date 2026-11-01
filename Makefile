@@ -83,6 +83,16 @@ test-setup:
 		git clone --depth 1 https://github.com/echasnovski/mini.nvim $(MINI_DIR); \
 	fi
 
+.PHONY: build-mcp test-mcp lint-mcp
+build-mcp:
+	cargo build --release -p fff-mcp
+
+test-mcp:
+	cargo test -p fff-mcp -p fff-search
+
+lint-mcp:
+	cargo clippy -p fff-mcp -p fff-search --all-targets -- -D warnings
+
 test-rust:
 	cargo test --workspace --no-default-features --features zlob --exclude fff-nvim --exclude fff-python
 

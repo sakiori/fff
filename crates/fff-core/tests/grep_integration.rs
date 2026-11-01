@@ -43,6 +43,7 @@ fn plain_opts() -> GrepSearchOptions {
         classify_definitions: Default::default(),
         trim_whitespace: false,
         abort_signal: None,
+        scope: Default::default(),
     }
 }
 
@@ -63,6 +64,7 @@ fn regex_opts() -> GrepSearchOptions {
         classify_definitions: Default::default(),
         trim_whitespace: false,
         abort_signal: None,
+        scope: Default::default(),
     }
 }
 
@@ -83,6 +85,7 @@ fn fuzzy_opts() -> GrepSearchOptions {
         classify_definitions: Default::default(),
         trim_whitespace: false,
         abort_signal: None,
+        scope: Default::default(),
     }
 }
 
@@ -687,25 +690,10 @@ fn large_binary_with_nuls_past_header_is_classified() {
     )
     .expect("Failed to create FilePicker");
 
-    let deadline = std::time::Instant::now() + Duration::from_secs(15);
-    loop {
-        std::thread::sleep(Duration::from_millis(25));
-        let ready = shared_picker
-            .read()
-            .ok()
-            .and_then(|g| {
-                g.as_ref()
-                    .map(|p| !p.is_scan_active() && p.bigram_index().is_some())
-            })
-            .unwrap_or(false);
-        if ready {
-            break;
-        }
-        assert!(
-            std::time::Instant::now() < deadline,
-            "Timed out waiting for bigram build"
-        );
-    }
+    assert!(
+        shared_picker.wait_for_indexing_complete(Duration::from_secs(15)),
+        "Timed out waiting for binary classification"
+    );
 
     let guard = shared_picker.read().unwrap();
     let picker = guard.as_ref().unwrap();

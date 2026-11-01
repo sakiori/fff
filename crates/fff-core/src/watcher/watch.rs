@@ -945,10 +945,11 @@ mod tests {
                 "**",
                 WatchOptions::default(),
                 Box::new(move |_, events| {
-                    sink.lock().extend_from_slice(events);
+                    // Rebase before recording, so a test that saw the events sees the new base.
                     if let Some(registry) = weak.upgrade() {
                         registry.rebase(&callback_base);
                     }
+                    sink.lock().extend_from_slice(events);
                 }),
             )
             .unwrap();

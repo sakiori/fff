@@ -964,6 +964,7 @@ fn grep_plain_matches(shared: &SharedFilePicker, query: &str) -> Vec<String> {
         classify_definitions: Default::default(),
         trim_whitespace: false,
         abort_signal: None,
+        scope: Default::default(),
     };
     let result = picker.grep(&parsed, &opts);
     // `GrepResult::files` is the already-deduplicated list of files that
@@ -1003,6 +1004,7 @@ fn grep_fuzzy_matches(shared: &SharedFilePicker, query: &str) -> Vec<String> {
         classify_definitions: Default::default(),
         trim_whitespace: false,
         abort_signal: None,
+        scope: Default::default(),
     };
     let result = picker.grep(&parsed, &opts);
     result
@@ -1037,6 +1039,7 @@ fn grep_regex_matches(shared: &SharedFilePicker, query: &str) -> Vec<String> {
         classify_definitions: Default::default(),
         trim_whitespace: false,
         abort_signal: None,
+        scope: Default::default(),
     };
     let result = picker.grep(&parsed, &opts);
     result

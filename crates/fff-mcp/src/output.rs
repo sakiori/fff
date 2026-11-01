@@ -159,6 +159,7 @@ pub struct GrepFormatter<'a> {
     pub show_context: bool,
     pub auto_expand_defs: bool,
     pub picker: &'a FilePicker,
+    pub scope: &'a fff::scope::SearchScope,
 }
 
 impl GrepFormatter<'_> {
@@ -173,6 +174,7 @@ impl GrepFormatter<'_> {
             show_context,
             auto_expand_defs,
             picker,
+            scope,
         } = *self;
 
         let items = if matches.len() > max_results {
@@ -189,11 +191,12 @@ impl GrepFormatter<'_> {
                 auto_expand_defs,
                 cursor_store,
                 picker,
+                scope,
             );
         }
 
         if output_mode == OutputMode::Count {
-            return format_count(items, files, cursor, cursor_store, picker);
+            return format_count(items, files, cursor, cursor_store, picker, scope);
         }
         if show_context
             && let Some(text) =
@@ -282,7 +285,7 @@ impl GrepFormatter<'_> {
             let mut match_lines: Vec<String> = Vec::new();
             let over_budget = shown_count > 0 && char_count >= max_output_chars;
 
-            let file_rel_path = file.relative_path(picker);
+            let file_rel_path = display_path(file, picker, scope);
             if file_rel_path != current_file {
                 current_file = file_rel_path;
                 match_lines.push(current_file.to_string());
@@ -300,7 +303,7 @@ impl GrepFormatter<'_> {
             ));
 
             // Auto-expand definitions with body context
-            let file_rel_for_expand = file.relative_path(picker);
+            let file_rel_for_expand = display_path(file, picker, scope);
             let expands = auto_expand_defs
                 && m.is_definition
                 && !m.context_after.is_empty()
@@ -407,7 +410,11 @@ impl GrepFormatter<'_> {
         let mut previous = None;
         for ((file_index, line), (text, matched)) in rows {
             if previous.is_none_or(|(file, _)| file != file_index) {
-                lines.push(self.files[file_index].relative_path(self.picker));
+                lines.push(display_path(
+                    self.files[file_index],
+                    self.picker,
+                    self.scope,
+                ));
             } else if previous.is_some_and(|(_, last)| line > last + 1) {
                 lines.push("--".into());
             }
@@ -429,6 +436,7 @@ fn format_files_with_matches(
     auto_expand_defs: bool,
     cursor_store: &mut CursorStore,
     picker: &FilePicker,
+    scope: &fff::scope::SearchScope,
 ) -> String {
     let file_map = collect_file_preview(items, files, picker);
 
@@ -443,7 +451,7 @@ fn format_files_with_matches(
         let def_tag = if is_def { " [def]" } else { "" };
         lines.push(format!(
             "{}{}{}",
-            fm.file.relative_path(picker),
+            display_path(fm.file, picker, scope),
             def_tag,
             size_tag(fm.file.size)
         ));
@@ -510,12 +518,13 @@ fn format_count(
     cursor: GrepCursor,
     cursor_store: &mut CursorStore,
     picker: &FilePicker,
+    scope: &fff::scope::SearchScope,
 ) -> String {
     let mut counts: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
     let mut order: Vec<String> = Vec::new();
     for m in items {
         let file = files[m.file_index];
-        let path = file.relative_path(picker);
+        let path = display_path(file, picker, scope);
         let count = counts.entry(path.to_string()).or_insert_with(|| {
             order.push(path.to_string());
             0
@@ -555,6 +564,23 @@ fn collect_file_preview<'a>(
         }
     }
     file_preview
+}
+
+// Scope-relative path of a result; results outside the scope are a search bug, so they are
+// reported by absolute path rather than as an empty or misleading relative path.
+pub(crate) fn display_path(
+    file: &FileItem,
+    picker: &FilePicker,
+    scope: &fff::scope::SearchScope,
+) -> String {
+    let relative = file.relative_path(picker);
+    match scope.relative_path(&relative) {
+        Some(path) => path.to_owned(),
+        None => {
+            tracing::error!(path = relative, "Search result outside the session scope");
+            picker.base_path().join(&relative).display().to_string()
+        }
+    }
 }
 
 // Files whose declaration is named by a whole matched word move ahead; the cursor is already set.

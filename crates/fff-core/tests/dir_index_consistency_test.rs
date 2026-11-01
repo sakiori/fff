@@ -1,7 +1,7 @@
 use fff_search::file_picker::{FFFMode, FilePicker};
 use fff_search::{
     DirSearchConfig, FilePickerOptions, FuzzySearchOptions, PaginationArgs, QueryParser,
-    SharedFilePicker, SharedFrecency,
+    RescanReason, SharedFilePicker, SharedFrecency,
 };
 use std::fs;
 use std::path::Path;
@@ -9,6 +9,13 @@ use std::time::{Duration, Instant};
 use tempfile::TempDir;
 
 fn make_watched_picker(base: &Path) -> (SharedFilePicker, SharedFrecency) {
+    make_watched_picker_with_cooldown(base, None)
+}
+
+fn make_watched_picker_with_cooldown(
+    base: &Path,
+    rescan_cooldown: Option<Duration>,
+) -> (SharedFilePicker, SharedFrecency) {
     let shared_picker = SharedFilePicker::default();
     let shared_frecency = SharedFrecency::noop();
 
@@ -21,6 +28,7 @@ fn make_watched_picker(base: &Path) -> (SharedFilePicker, SharedFrecency) {
             enable_content_indexing: false,
             mode: FFFMode::Neovim,
             watch: true,
+            rescan_cooldown,
             ..Default::default()
         },
     )
@@ -298,4 +306,56 @@ fn empty_directory_at_scan_is_searchable_and_watched() {
         .filter(|d| d.relative_path(p).starts_with("commands"))
         .count();
     assert_eq!(commands_dirs, 1, "no duplicate DirItem for the empty dir");
+}
+
+#[test]
+fn repeated_empty_directory_overflow_eventually_recovers() {
+    // Each wave moves in a prepared tree, so it overflows in one event. The
+    // second wave lands inside the cooldown and must wait for the deferred rescan.
+    const COOLDOWN: Duration = Duration::from_secs(2);
+    let tmp = TempDir::new().unwrap();
+    let staging = TempDir::new().unwrap();
+    let base = fff_search::path_utils::canonicalize(tmp.path()).unwrap();
+    let (picker, _frecency) = make_watched_picker_with_cooldown(&base, Some(COOLDOWN));
+    for wave in ["first", "second"] {
+        let incoming = staging.path().join(wave);
+        for i in 0..1200 {
+            fs::create_dir_all(incoming.join(format!("dir{i}"))).unwrap();
+        }
+        let before = picker.rescan_stats();
+        fs::rename(&incoming, base.join(wave)).unwrap();
+        assert!(
+            wait_until(
+                || {
+                    let guard = picker.read().unwrap();
+                    let p = guard.as_ref().unwrap();
+                    p.get_dirs()
+                        .iter()
+                        .filter(|d| {
+                            !d.is_deleted() && d.relative_path(p).starts_with(&format!("{wave}/"))
+                        })
+                        .count()
+                        == 1201
+                },
+                COOLDOWN * 5,
+            ),
+            "coverage was lost for {wave} overflow"
+        );
+
+        if !fff_search::RESCAN_STATS_ENABLED {
+            continue;
+        }
+        let after = picker.rescan_stats();
+        let reason = RescanReason::IndexUpdateRejected;
+        assert_eq!(
+            after.count(reason),
+            before.count(reason) + 1,
+            "{wave} overflow must be recovered by one rescan"
+        );
+        let throttled = after.count_throttled(reason) - before.count_throttled(reason);
+        match wave {
+            "first" => assert_eq!(throttled, 0, "the first rescan is admitted at once"),
+            _ => assert_eq!(throttled, 1, "the second rescan runs deferred"),
+        }
+    }
 }

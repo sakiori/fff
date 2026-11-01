@@ -267,6 +267,7 @@ pub unsafe extern "C" fn fff_create_instance_with(opts: *const FffCreateOptions)
             enable_fs_root_scanning: opts.enable_fs_root_scanning,
             enable_home_dir_scanning: opts.enable_home_dir_scanning,
             git_recency: Default::default(),
+            rescan_cooldown: None,
         },
     ) {
         return FffResult::err(&format!("Failed to init file picker: {}", e));
@@ -394,6 +395,7 @@ pub unsafe extern "C" fn fff_search(
                 offset: page_index as usize,
                 limit: page_size,
             },
+            scope: Default::default(),
         },
     );
 
@@ -456,6 +458,7 @@ pub unsafe extern "C" fn fff_glob(
                 offset: page_index as usize,
                 limit: page_size,
             },
+            scope: Default::default(),
         },
     );
 
@@ -520,6 +523,7 @@ pub unsafe extern "C" fn fff_search_directories(
                 offset: page_index as usize,
                 limit: page_size,
             },
+            scope: Default::default(),
         },
     );
 
@@ -595,6 +599,7 @@ pub unsafe extern "C" fn fff_search_mixed(
                 offset: page_index as usize,
                 limit: page_size,
             },
+            scope: Default::default(),
         },
     );
 
@@ -718,6 +723,7 @@ pub unsafe extern "C" fn fff_live_grep_ex(
         classify_definitions,
         trim_whitespace: false,
         abort_signal: None,
+        scope: Default::default(),
     };
 
     let result = picker.grep(&parsed, &options);
@@ -846,6 +852,7 @@ pub unsafe extern "C" fn fff_multi_grep_ex(
         classify_definitions,
         trim_whitespace: false,
         abort_signal: None,
+        scope: Default::default(),
     };
 
     let result = picker.multi_grep(&patterns, constraint_refs, &options);
@@ -1048,6 +1055,7 @@ pub unsafe extern "C" fn fff_restart_index(
             enable_fs_root_scanning: fs_root,
             enable_home_dir_scanning: home_dir,
             git_recency,
+            rescan_cooldown: None,
         },
     ) {
         Ok(()) => FffResult::ok_empty(),

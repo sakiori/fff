@@ -3,6 +3,8 @@ use super::prefilter::prefilter_files;
 use super::sink::{SinkState, debug_assert_newline_terminator, strip_line_terminators};
 use super::types::{GrepResult, GrepSearchOptions};
 use crate::index::{BigramFilter, BigramOverlay, bigram_boundary, literal_candidates};
+use crate::scope::ResolvedScope;
+use crate::simd_path::Arenas;
 use crate::types::{ContentCacheBudget, FileItem, FileSliceExt};
 use aho_corasick::AhoCorasick;
 use fff_grep::{
@@ -113,10 +115,13 @@ pub(crate) fn multi_grep_search<'a>(
     bigram_overlay: Option<&BigramOverlay>,
     abort_signal: &AtomicBool,
     base_path: &Path,
-    arena: crate::simd_path::ArenaPtr,
-    overflow_arena: crate::simd_path::ArenaPtr,
+    arenas: Arenas,
+    scope: Option<&ResolvedScope>,
 ) -> GrepResult<'a> {
-    let total_files = files.live_count();
+    let total_files = match scope {
+        Some(scope) => scope.live_file_count(files),
+        None => files.live_count(),
+    };
 
     if patterns.is_empty() || patterns.iter().all(|p| p.is_empty()) {
         return GrepResult::empty(total_files, total_files);
@@ -132,8 +137,8 @@ pub(crate) fn multi_grep_search<'a>(
         bigram_candidates.as_deref(),
         base_file_count,
         options,
-        arena,
-        overflow_arena,
+        arenas,
+        scope,
     );
 
     if files_to_search.is_empty() {
@@ -164,8 +169,7 @@ pub(crate) fn multi_grep_search<'a>(
             filtered_file_count,
             budget,
             base_path,
-            arena,
-            overflow_arena,
+            arenas,
             prefilter: None, // no memmem prefilter for multi-pattern search
             abort_signal,
         },

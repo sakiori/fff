@@ -48,6 +48,7 @@ fn plain_opts() -> GrepSearchOptions {
         classify_definitions: Default::default(),
         trim_whitespace: false,
         abort_signal: None,
+        scope: Default::default(),
     }
 }
 

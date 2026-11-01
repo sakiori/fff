@@ -363,6 +363,7 @@ pub fn fuzzy_search_files(
                 offset: page_index.unwrap_or(0),
                 limit: page_size.unwrap_or(0),
             },
+            scope: Default::default(),
         },
     );
 
@@ -429,6 +430,7 @@ pub fn fuzzy_search_directories(
                 offset: page_index.unwrap_or(0),
                 limit: page_size.unwrap_or(0),
             },
+            scope: Default::default(),
         },
     );
 
@@ -478,6 +480,7 @@ pub fn fuzzy_search_mixed(
                 offset: page_index.unwrap_or(0),
                 limit: page_size.unwrap_or(0),
             },
+            scope: Default::default(),
         },
     );
 
@@ -1170,6 +1173,7 @@ fn parse_grep_args(
         classify_definitions: Default::default(),
         trim_whitespace: trim_whitespace.unwrap_or(false),
         abort_signal: None,
+        scope: Default::default(),
     };
 
     (query, options)

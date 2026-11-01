@@ -44,8 +44,10 @@ impl<T> Drop for StableBuf<T> {
 }
 
 impl<T> StableVec<T> {
+    /// Takes `vec` with room for at least `extra` more elements, without the
+    /// amortized over-allocation `Vec::reserve` would add.
     pub fn from_vec_with_reserve(mut vec: Vec<T>, extra: usize) -> Self {
-        vec.reserve(extra);
+        vec.reserve_exact(extra);
         let cap = vec.capacity();
         let len = vec.len();
 
@@ -70,6 +72,13 @@ impl<T> StableVec<T> {
         Self {
             inner: Arc::new(inner),
         }
+    }
+
+    /// Slots left before `push` would have to reallocate. Callers check this
+    /// before committing side effects tied to the new element.
+    #[inline]
+    pub fn remaining_capacity(&self) -> usize {
+        self.inner.cap - self.len()
     }
 
     /// Append. Returns `false` if capacity is exhausted (item dropped).

@@ -101,10 +101,10 @@ fn poll_until(
     loop {
         {
             let guard = shared_picker.read().unwrap();
-            if let Some(ref picker) = *guard {
-                if predicate(picker) {
-                    return start.elapsed();
-                }
+            if let Some(ref picker) = *guard
+                && predicate(picker)
+            {
+                return start.elapsed();
             }
         }
         if start.elapsed() >= timeout {
@@ -145,6 +145,7 @@ fn grep_plain_count(picker: &FilePicker, query: &str) -> usize {
         classify_definitions: Default::default(),
         trim_whitespace: false,
         abort_signal: None,
+        scope: Default::default(),
     };
     picker.grep(&parsed, &opts).matches.len()
 }

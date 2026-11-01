@@ -74,6 +74,7 @@ fn fuzzy_options<'a>(
         combo_boost_score_multiplier,
         min_combo_count,
         pagination: pagination_args(page_index, page_size),
+        scope: Default::default(),
     }
 }
 
@@ -107,6 +108,7 @@ fn grep_options(
         classify_definitions: classify_definitions.into(),
         trim_whitespace: false,
         abort_signal: None,
+        scope: Default::default(),
     }
 }
 
@@ -256,6 +258,7 @@ impl FileFinder {
                     enable_fs_root_scanning,
                     enable_home_dir_scanning,
                     git_recency: Default::default(),
+                    rescan_cooldown: None,
                 },
             )
             .map_err(py_err)
@@ -878,6 +881,7 @@ impl FileFinder {
                     enable_fs_root_scanning: fs_root,
                     enable_home_dir_scanning: home_dir,
                     git_recency,
+                    rescan_cooldown: None,
                 },
             )
             .map_err(py_err)

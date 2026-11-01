@@ -1,5 +1,4 @@
-use fff::{FilePicker, types::FileItem};
-use rayon::prelude::*;
+use crate::view::SessionView;
 use rmcp::{model::ErrorData, schemars};
 use std::cmp::Reverse;
 use std::collections::BinaryHeap;
@@ -12,15 +11,16 @@ pub(crate) enum FilePatternMode {
     Regex,
 }
 
-pub(crate) fn search<'a>(
-    picker: &'a FilePicker,
+// Session-relative paths of one page of matching files, and the number of matches.
+pub(crate) fn search(
+    view: &SessionView<'_>,
     pattern: &str,
     mode: FilePatternMode,
     constraints: &[(String, bool)],
     filters: &[String],
     offset: usize,
     limit: usize,
-) -> Result<(Vec<&'a FileItem>, usize), ErrorData> {
+) -> Result<(Vec<String>, usize), ErrorData> {
     let filters = filters
         .iter()
         .map(|pattern| {
@@ -58,25 +58,30 @@ pub(crate) fn search<'a>(
             false,
         ));
     }
-    let files = picker.get_files();
+    let files = view.picker.get_files();
     let capacity = offset.saturating_add(limit);
     let fuzzy = matches!(mode, FilePatternMode::Fuzzy);
-    // Each thread keeps its best `capacity` paths; the merge keeps the global best.
-    let (count, matches) = files
-        .par_iter()
-        .enumerate()
-        .filter(|(_, file)| !file.is_deleted())
-        .fold(
-            || (0usize, BinaryHeap::new()),
-            |(mut count, mut best), (index, file)| {
-                let path = file.relative_path(picker);
+    // Each range keeps its best `capacity` paths; the merge keeps the global best.
+    let (count, matches) = fff::map_search_ranges(
+        files.len(),
+        || (),
+        |_, range, out| {
+            let mut count = 0usize;
+            let mut best = BinaryHeap::new();
+            for file in &files[range] {
+                if file.is_deleted() {
+                    continue;
+                }
+                let Some(path) = view.file_path(file) else {
+                    continue;
+                };
                 if regex.as_ref().is_some_and(|regex| !regex.is_match(&path))
                     || filters.iter().any(|regex| !regex.is_match(&path))
                     || globs
                         .iter()
                         .any(|(glob, exclude)| glob.is_match(&path) == *exclude)
                 {
-                    return (count, best);
+                    continue;
                 }
                 count += 1;
                 let rank = if fuzzy {
@@ -86,25 +91,27 @@ pub(crate) fn search<'a>(
                 };
                 let depth = path.bytes().filter(|&b| b == b'/').count();
                 let frecency = Reverse(file.total_frecency_score());
-                keep_best(&mut best, (rank, depth, frecency, path, index), capacity);
-                (count, best)
-            },
-        )
-        .reduce(
-            || (0, BinaryHeap::new()),
-            |(left_count, mut left), (right_count, right)| {
-                for key in right {
-                    keep_best(&mut left, key, capacity);
-                }
-                (left_count + right_count, left)
-            },
-        );
+                keep_best(&mut best, (rank, depth, frecency, path), capacity);
+            }
+            out.push((count, best));
+        },
+    )
+    .into_iter()
+    .fold(
+        (0, BinaryHeap::new()),
+        |(total, mut left), (count, right)| {
+            for key in right {
+                keep_best(&mut left, key, capacity);
+            }
+            (total + count, left)
+        },
+    );
     Ok((
         matches
             .into_sorted_vec()
             .into_iter()
             .skip(offset)
-            .map(|(.., index)| &files[index])
+            .map(|(.., path)| path)
             .collect(),
         count,
     ))
