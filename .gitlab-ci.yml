@@ -171,26 +171,28 @@ node-tests:
   variables:
     GIT_DEPTH: "0"
     GIT_STRATEGY: clone
-    # Without this flag the runner rewrites every URL of the server to one that
-    # carries the job token, whose pushes neither create protected tags nor
-    # start pipelines; with it the runner offers the job token through a
-    # credential helper, which the job replaces below.
-    FF_GIT_URLS_WITHOUT_TOKENS: "true"
   before_script:
     - '[ -n "${GITLAB_TOKEN:-}" ] || { echo "GITLAB_TOKEN is not set; CUSTOM.md, Releases, describes it" >&2; exit 1; }'
     - .gitlab/scripts/install-tools.sh "$TOOLS" git-intake
     - export PATH="$TOOLS/bin:$PATH"
     - git config user.name Sakiori
     - git config user.email oss@sakiori.app
-    # The empty helper clears the runner's job-token helper configured before it.
+    - git remote set-url origin "$CI_PROJECT_URL.git"
+    # The runner's own git configuration, included from the clone's and from the
+    # global one, carries the job token: a rewrite of the server's URLs into ones
+    # with the token, and a credential helper. The job drops both and answers
+    # with GITLAB_TOKEN alone.
+    - export GIT_CONFIG_GLOBAL="$(mktemp)"
+    - git config --local --unset-all include.path || true
+    - git config --unset-all credential.helper || true
     - git config --add credential.helper ''
     - git config --add credential.helper '!f() { echo username=oauth2; echo "password=$GITLAB_TOKEN"; }; f'
-    - git remote set-url origin "$CI_PROJECT_URL.git"
-    # A push URL that carries credentials would push without GITLAB_TOKEN.
     - |
       case "$(git remote get-url --push origin)" in
         *@*) echo "git rewrites the push URL to carry credentials; it must reach the server without them" >&2; exit 1 ;;
       esac
+      answer=$(printf 'url=%s\n\n' "$CI_PROJECT_URL.git" | GIT_TERMINAL_PROMPT=0 git credential fill | sed -n 's/^password=//p')
+      [ "$answer" = "$GITLAB_TOKEN" ] || { echo "git answers the server with a credential other than GITLAB_TOKEN" >&2; exit 1; }
 
 git-intake-sync:
   extends: .git-intake-bot
