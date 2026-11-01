@@ -35,6 +35,11 @@ changes, stage the resolutions and run `git intake continue`.
 configuration; the combined result must pass them before the update is ready.
 `git intake finish` opens the merge request into `main`.
 
+`mise.toml` pins the Zig version that builds zlob. It is downstream-only and
+must match the Zig version upstream pins in its workflow setup-zig steps and in
+`flake.nix`; when an update changes upstream's pin, change `mise.toml` in the
+same update.
+
 Merge the update's merge request by fast-forward with _Squash commits_
 unticked, so that the verified merge commit itself lands on `main`, keeping
 upstream ancestry and the sync record that `status` and the next update read.
