@@ -131,6 +131,13 @@ each MCP client to launch that executable, passing its desired search directory
 as the positional argument. The upstream install scripts and package manager
 releases do not contain these downstream changes.
 
+The upstream update notice is off. Upstream's `fff-mcp` asks GitHub for
+upstream's latest release when its service starts and tells agents to install it
+with upstream's script, which would replace the downstream build. The fork's
+service makes no update request and adds no notice to its instructions or tool
+results; `--no-update-check` is still accepted, so existing client
+configurations keep working.
+
 The first client starts the service automatically. A client completes MCP
 initialization as soon as its session is registered; the index keeps scanning in
 the service. Tool calls wait up to 30 seconds for the initial scan and, for
@@ -193,7 +200,8 @@ scoped tools and fallbacks, watcher updates, consolidation when an index gains
 coverage through a rescan or a directory its watcher indexes, removed scopes,
 concurrent searches over one index, cursor isolation, disconnects, parent exit,
 side-by-side builds, handshake rejection, namespace permissions, stale discovery
-recovery, unreachable services, shutdown races and idle cleanup. Each test stops
+recovery, unreachable services, shutdown races, idle cleanup and the absence of
+an upstream update check. Each test stops
 the services of its namespace when it ends, also when it fails. In debug
 builds, watchers leave new directories unindexed while the file named by
 `FFF_TEST_HOLD_DIR_INDEXING` exists, so the watcher consolidation test orders

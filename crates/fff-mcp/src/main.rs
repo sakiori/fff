@@ -82,7 +82,7 @@ pub(crate) struct Args {
     #[arg(long = "log-level")]
     log_level: Option<String>,
 
-    /// Disable automatic update checks on startup.
+    /// Accepted for compatibility: this build never checks for updates.
     #[arg(long = "no-update-check")]
     no_update_check: bool,
 

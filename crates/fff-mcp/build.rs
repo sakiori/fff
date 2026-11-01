@@ -1,5 +1,5 @@
 fn main() {
-    // Embed the git commit hash at build time for update checking.
+    // Embed the git commit hash at build time; `--version` and the health check report it.
     let hash = std::process::Command::new("git")
         .args(["rev-parse", "HEAD"])
         .output()

@@ -1394,3 +1394,105 @@ fn shared_or_public_namespaces_are_rejected() {
         assert!(endpoints(&service).is_empty());
     }
 }
+
+// The service never checks upstream for updates and never advises installing
+// upstream's build, even without --no-update-check.
+#[cfg(unix)]
+#[test]
+fn the_service_never_checks_upstream_for_updates() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let project = tmp.path().join("project");
+    std::fs::create_dir_all(&project).unwrap();
+    std::fs::write(project.join("main.rs"), "fn main() {}\n").unwrap();
+
+    // Upstream's check runs curl against GitHub. This curl answers as GitHub would
+    // for a newer upstream release, and leaves a mark when anything runs it.
+    let bin = tmp.path().join("bin");
+    let ran = tmp.path().join("curl-ran");
+    std::fs::create_dir_all(&bin).unwrap();
+    let curl = bin.join("curl");
+    std::fs::write(
+        &curl,
+        format!(
+            "#!/bin/sh\ntouch '{}'\necho '{{\"tag_name\":\"v99.0.0\"}}'\n",
+            ran.display()
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&curl, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let path = format!("{}:{}", bin.display(), std::env::var("PATH").unwrap());
+
+    // The service is the process that would check; it exits once idle.
+    let service = tmp.path().join("service");
+    let mut daemon = Daemon(
+        Command::new(BIN)
+            .args(["--service", "--idle-timeout-secs", "1"])
+            .arg("--service-dir")
+            .arg(&service)
+            .arg("--log-file")
+            .arg(service.with_extension("log"))
+            .env("PATH", &path)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::inherit())
+            .spawn_serialized()
+            .unwrap(),
+    );
+    wait_for_discovery(&mut daemon, &service);
+
+    let mut client = Command::new(BIN)
+        .arg(&project)
+        .args(["--no-warmup", "--no-watch", "--idle-timeout-secs", "1"])
+        .arg("--service-dir")
+        .arg(&service)
+        .arg("--log-file")
+        .arg(service.with_extension("log"))
+        .env("PATH", &path)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::inherit())
+        .spawn_serialized()
+        .unwrap();
+    let mut input = client.stdin.take().unwrap();
+    let mut output = BufReader::new(client.stdout.take().unwrap()).lines();
+    let mut request = |id: u64, method: &str, params: Value| -> Value {
+        let message = json!({"jsonrpc":"2.0","id":id,"method":method,"params":params});
+        writeln!(input, "{message}").unwrap();
+        input.flush().unwrap();
+        loop {
+            let line = output.next().expect("MCP response").unwrap();
+            if let Ok(reply) = serde_json::from_str::<Value>(&line)
+                && reply["id"] == id
+            {
+                return reply;
+            }
+        }
+    };
+
+    let init = request(
+        1,
+        "initialize",
+        json!({"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"update-notice-test","version":"1"}}),
+    );
+    // Upstream appends its notice to the first tool result after the check answers.
+    let found = request(
+        2,
+        "tools/call",
+        json!({"name":"find_files","arguments":{"query":"main"}}),
+    )["result"]
+        .to_string();
+    assert!(found.contains("main.rs"), "{found}");
+    for reply in [init.to_string(), found] {
+        assert!(!reply.contains("update available"), "{reply}");
+        assert!(!reply.contains("install-mcp.sh"), "{reply}");
+    }
+
+    // Closing the transport ends the session; the idle service then exits, so
+    // whatever it started has run by then.
+    drop(input);
+    assert!(client.wait().unwrap().success());
+    daemon.wait().unwrap();
+    assert!(!ran.exists(), "fff-mcp ran curl to check for updates");
+}
