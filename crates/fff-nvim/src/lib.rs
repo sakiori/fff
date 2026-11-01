@@ -364,6 +364,7 @@ pub fn fuzzy_search_files(
                 limit: page_size.unwrap_or(0),
             },
             scope: Default::default(),
+            exclude_frecency: false,
         },
     );
 
@@ -431,6 +432,7 @@ pub fn fuzzy_search_directories(
                 limit: page_size.unwrap_or(0),
             },
             scope: Default::default(),
+            exclude_frecency: false,
         },
     );
 
@@ -481,6 +483,7 @@ pub fn fuzzy_search_mixed(
                 limit: page_size.unwrap_or(0),
             },
             scope: Default::default(),
+            exclude_frecency: false,
         },
     );
 
@@ -1174,6 +1177,7 @@ fn parse_grep_args(
         trim_whitespace: trim_whitespace.unwrap_or(false),
         abort_signal: None,
         scope: Default::default(),
+        exclude_frecency: false,
     };
 
     (query, options)

@@ -12,10 +12,13 @@ use std::ops::Range;
 
 const FIRST_RANKED: usize = 8192;
 
+type Rank = fn(&&FileItem, &&FileItem) -> Ordering;
+
 pub(super) struct RankedFiles<'a> {
     files: Vec<&'a FileItem>,
     ranked: usize,
     offset: usize,
+    rank: Rank,
 }
 
 fn rank(a: &&FileItem, b: &&FileItem) -> Ordering {
@@ -24,20 +27,30 @@ fn rank(a: &&FileItem, b: &&FileItem) -> Ordering {
         .then_with(|| b.modified.cmp(&a.modified))
 }
 
-fn rank_with_ties(a: &&FileItem, b: &&FileItem) -> Ordering {
+// Without frecency every score is zero, so only modification time orders files.
+fn rank_without_frecency(a: &&FileItem, b: &&FileItem) -> Ordering {
+    b.modified.cmp(&a.modified)
+}
+
+fn with_ties(rank: Rank, a: &&FileItem, b: &&FileItem) -> Ordering {
     // All references point into one input slice, whose order breaks ties.
     rank(a, b).then_with(|| std::ptr::from_ref(*a).cmp(&std::ptr::from_ref(*b)))
 }
 
 impl<'a> RankedFiles<'a> {
     fn new(mut files: Vec<&'a FileItem>, options: &GrepSearchOptions) -> Self {
+        let rank: Rank = if options.exclude_frecency {
+            rank_without_frecency
+        } else {
+            rank
+        };
         let offset = options.file_offset.min(files.len());
         let prefix = offset.saturating_add(FIRST_RANKED);
         let ranked = if offset == files.len() {
             files.len()
         } else if prefix <= files.len() / 8 && options.page_limit <= FIRST_RANKED {
-            files.select_nth_unstable_by(prefix, rank_with_ties);
-            files[..prefix].sort_unstable_by(rank_with_ties);
+            files.select_nth_unstable_by(prefix, |a, b| with_ties(rank, a, b));
+            files[..prefix].sort_unstable_by(|a, b| with_ties(rank, a, b));
             prefix
         } else {
             sort_with_buffer(&mut files, rank);
@@ -47,6 +60,7 @@ impl<'a> RankedFiles<'a> {
             files,
             ranked,
             offset,
+            rank,
         }
     }
 
@@ -61,7 +75,8 @@ impl<'a> RankedFiles<'a> {
     pub(super) fn batch(&mut self, range: Range<usize>) -> &[&'a FileItem] {
         let range = self.offset + range.start..self.offset + range.end;
         if range.end > self.ranked {
-            self.files[self.ranked..].sort_unstable_by(rank_with_ties);
+            let rank = self.rank;
+            self.files[self.ranked..].sort_unstable_by(|a, b| with_ties(rank, a, b));
             self.ranked = self.files.len();
         }
         &self.files[range]

@@ -176,6 +176,7 @@ fn bench_search_queries(c: &mut Criterion) {
                             limit: 100,
                         },
                         scope: Default::default(),
+                        exclude_frecency: false,
                     },
                 );
                 results.total_matched
@@ -228,6 +229,7 @@ fn bench_search_thread_scaling(c: &mut Criterion) {
                                 limit: 100,
                             },
                             scope: Default::default(),
+                            exclude_frecency: false,
                         },
                     );
                     results.total_matched
@@ -275,6 +277,7 @@ fn bench_search_result_limits(c: &mut Criterion) {
                         min_combo_count: 3,
                         pagination: PaginationArgs { offset: 0, limit },
                         scope: Default::default(),
+                        exclude_frecency: false,
                     },
                 );
                 results.total_matched
@@ -336,6 +339,7 @@ fn bench_search_scalability(c: &mut Criterion) {
                             limit: 100,
                         },
                         scope: Default::default(),
+                        exclude_frecency: false,
                     },
                 );
                 results.total_matched
@@ -384,6 +388,7 @@ fn bench_search_ordering(c: &mut Criterion) {
                         limit: 100,
                     },
                     scope: Default::default(),
+                    exclude_frecency: false,
                 },
             );
             results.total_matched
@@ -408,6 +413,7 @@ fn bench_search_ordering(c: &mut Criterion) {
                         limit: 100,
                     },
                     scope: Default::default(),
+                    exclude_frecency: false,
                 },
             );
             results.total_matched
@@ -432,6 +438,7 @@ fn bench_search_ordering(c: &mut Criterion) {
                         limit: 500,
                     },
                     scope: Default::default(),
+                    exclude_frecency: false,
                 },
             );
             results.total_matched
@@ -455,6 +462,7 @@ fn bench_search_ordering(c: &mut Criterion) {
                         limit: 500,
                     },
                     scope: Default::default(),
+                    exclude_frecency: false,
                 },
             );
             results.total_matched
@@ -479,6 +487,7 @@ fn bench_search_ordering(c: &mut Criterion) {
                         limit: 10,
                     },
                     scope: Default::default(),
+                    exclude_frecency: false,
                 },
             );
             results.total_matched
@@ -502,6 +511,7 @@ fn bench_search_ordering(c: &mut Criterion) {
                         limit: 10,
                     },
                     scope: Default::default(),
+                    exclude_frecency: false,
                 },
             );
             results.total_matched
@@ -550,6 +560,7 @@ fn bench_pagination_performance(c: &mut Criterion) {
                         limit: page_size,
                     },
                     scope: Default::default(),
+                    exclude_frecency: false,
                 },
             );
             results.total_matched
@@ -574,6 +585,7 @@ fn bench_pagination_performance(c: &mut Criterion) {
                         limit: page_size,
                     },
                     scope: Default::default(),
+                    exclude_frecency: false,
                 },
             );
             results.total_matched
@@ -598,6 +610,7 @@ fn bench_pagination_performance(c: &mut Criterion) {
                         limit: page_size,
                     },
                     scope: Default::default(),
+                    exclude_frecency: false,
                 },
             );
             results.total_matched
@@ -639,6 +652,7 @@ fn bench_grep_search(c: &mut Criterion) {
         trim_whitespace: false,
         abort_signal: None,
         scope: Default::default(),
+        exclude_frecency: false,
     };
 
     let test_queries = vec![

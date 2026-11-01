@@ -9,12 +9,19 @@ const TEARDOWN: Duration = Duration::from_secs(15);
 /// Test root whose service namespace is torn down on drop, also when the test panics.
 pub struct Sandbox {
     root: tempfile::TempDir,
+    service: String,
 }
 
 impl Sandbox {
     pub fn new() -> Self {
+        Self::with_service("service")
+    }
+
+    /// A sandbox whose namespace is `service`, a path relative to its root.
+    pub fn with_service(service: &str) -> Self {
         Self {
             root: tempfile::tempdir().unwrap(),
+            service: service.to_owned(),
         }
     }
 
@@ -23,7 +30,7 @@ impl Sandbox {
     }
 
     pub fn service(&self) -> PathBuf {
-        self.path().join("service")
+        self.path().join(&self.service)
     }
 
     // Asks every service to stop, then removes the namespace so an orphaned one exits.
@@ -72,7 +79,7 @@ impl Sandbox {
     #[cfg(unix)]
     fn names_service(&self, command: &str) -> bool {
         let unique = self.path().file_name().unwrap().to_string_lossy();
-        let namespace = format!("{unique}/service");
+        let namespace = format!("{unique}/{}", self.service);
         let args: Vec<&str> = command.split_whitespace().collect();
         args.contains(&"--service") && args.iter().any(|arg| arg.ends_with(&namespace))
     }

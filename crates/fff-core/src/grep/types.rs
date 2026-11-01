@@ -141,6 +141,8 @@ pub struct GrepSearchOptions {
     /// Directory the search is limited to, applied before counts, pagination
     /// and every query fallback. Query paths are relative to it.
     pub scope: SearchScope,
+    /// Order files as if the index had no frecency database.
+    pub exclude_frecency: bool,
 }
 
 impl GrepSearchOptions {
@@ -171,6 +173,7 @@ impl Default for GrepSearchOptions {
             trim_whitespace: false,
             abort_signal: None,
             scope: SearchScope::default(),
+            exclude_frecency: false,
         }
     }
 }

@@ -6,7 +6,7 @@ use std::sync::Mutex;
 use fff::{WatchEvent, WatchId, WatchOptions};
 
 use crate::ffi_types::FffResult;
-use crate::instance_ref;
+use crate::local_instance;
 
 /// Current version of [`FffWatchOptions`].
 pub const FFF_WATCH_OPTIONS_VERSION: u32 = 1;
@@ -169,7 +169,7 @@ pub unsafe extern "C" fn fff_set_watch_callback(
     callback: FffWatchCallback,
     user_data: *mut c_void,
 ) -> *mut FffResult {
-    let inst = match unsafe { instance_ref(fff_handle) } {
+    let inst = match unsafe { local_instance(fff_handle, "fff_set_watch_callback") } {
         Ok(i) => i,
         Err(e) => return e,
     };
@@ -195,7 +195,7 @@ pub unsafe extern "C" fn fff_watch(
     pattern: *const c_char,
     opts: *const FffWatchOptions,
 ) -> *mut FffResult {
-    let inst = match unsafe { instance_ref(fff_handle) } {
+    let inst = match unsafe { local_instance(fff_handle, "fff_watch") } {
         Ok(i) => i,
         Err(e) => return e,
     };
@@ -258,7 +258,7 @@ pub unsafe extern "C" fn fff_watch_args(
 /// `fff_handle` must be a valid instance pointer from `fff_create_instance`.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn fff_unwatch(fff_handle: *mut c_void, watch_id: u64) -> *mut FffResult {
-    let inst = match unsafe { instance_ref(fff_handle) } {
+    let inst = match unsafe { local_instance(fff_handle, "fff_unwatch") } {
         Ok(i) => i,
         Err(e) => return e,
     };

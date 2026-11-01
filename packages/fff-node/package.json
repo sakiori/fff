@@ -1,17 +1,16 @@
 {
-  "name": "@ff-labs/fff-node",
+  "name": "@sakiori/fff-node",
   "version": "0.1.37",
   "private": false,
-  "description": "High-performance fuzzy file finder for Node.js - perfect for LLM agent tools",
+  "description": "Fuzzy file finder for Node.js over the shared fff service - perfect for LLM agent tools",
   "type": "module",
-  "main": "dist/index.cjs",
-  "module": "dist/index.js",
+  "main": "dist/index.js",
   "types": "dist/index.d.ts",
   "exports": {
     ".": {
       "types": "./dist/index.d.ts",
       "import": "./dist/index.js",
-      "require": "./dist/index.cjs",
+      "require": "./dist/index.js",
       "default": "./dist/index.js"
     },
     "./package.json": "./package.json"
@@ -21,19 +20,17 @@
   ],
   "scripts": {
     "build": "npm run build:bundle && npm run build:types",
-    "build:bundle": "tsup src/index.ts --format esm,cjs --platform node --target node18 --external ffi-rs --sourcemap",
+    "build:bundle": "tsup src/index.ts --format esm --platform node --target node20 --external ffi-rs --sourcemap",
     "build:types": "tsc -p tsconfig.build.json",
-    "test": "node test/e2e.mjs && node test/watch.mjs",
+    "test": "node --test --test-concurrency=1 test/e2e.mjs test/service.mjs",
     "typecheck": "tsc --noEmit"
   },
   "engines": {
-    "node": ">=18.0.0"
+    "node": "^20.19.0 || >=22.12.0"
   },
   "os": [
     "darwin",
     "linux",
-    "win32",
-    "android",
     "freebsd"
   ],
   "cpu": [
@@ -42,7 +39,7 @@
   ],
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/dmtrKovalenko/fff.git",
+    "url": "git+https://gitlab.com/sakiori-oss/fff.git",
     "directory": "packages/fff-node"
   },
   "keywords": [
@@ -61,9 +58,9 @@
     "access": "public"
   },
   "bugs": {
-    "url": "https://github.com/dmtrKovalenko/fff/issues"
+    "url": "https://gitlab.com/sakiori-oss/fff/-/issues"
   },
-  "homepage": "https://github.com/dmtrKovalenko/fff#readme",
+  "homepage": "https://gitlab.com/sakiori-oss/fff#readme",
   "dependencies": {
     "ffi-rs": "^1.0.0"
   },

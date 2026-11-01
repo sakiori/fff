@@ -75,6 +75,7 @@ fn fuzzy_options<'a>(
         min_combo_count,
         pagination: pagination_args(page_index, page_size),
         scope: Default::default(),
+        exclude_frecency: false,
     }
 }
 
@@ -109,6 +110,7 @@ fn grep_options(
         trim_whitespace: false,
         abort_signal: None,
         scope: Default::default(),
+        exclude_frecency: false,
     }
 }
 

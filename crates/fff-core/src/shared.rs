@@ -18,6 +18,15 @@ use crate::scan::ScanJob;
 use crate::watch::{EventHold, WatchEvent, WatchId, WatchOptions, WatchRegistry};
 use git2::Repository;
 
+/// What became of changes a program reported with [`SharedFilePicker::apply_reported_changes`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ReportedChanges {
+    /// The index holds them.
+    Applied,
+    /// A scan runs; it applies them once it commits.
+    Held,
+}
+
 /// Poll `<git_dir>/index.lock` until it disappears (git write completed), giving up
 /// after [`GIT_LOCK_MAX_WAIT`]. Used by [`SharedPicker::refresh_git_status`]
 /// to avoid reading a half-updated index when the watcher fires mid-`git add`.
@@ -152,6 +161,11 @@ impl SharedFilePicker {
         Ok(self.0.picker.write())
     }
 
+    /// Read access without waiting; `None` while a writer holds or waits for the lock.
+    pub fn try_read(&self) -> Option<parking_lot::RwLockReadGuard<'_, Option<FilePicker>>> {
+        self.0.picker.try_read()
+    }
+
     /// Signal the background scan to cancel. Non-blocking: post-scan
     /// threads check this flag and bail out at their next cancellation point.
     pub fn cancel(&self) {
@@ -159,6 +173,25 @@ impl SharedFilePicker {
             && let Some(picker) = guard.as_ref()
         {
             picker.cancel();
+        }
+    }
+
+    /// Applies changes to `paths` that a program reports, as the watcher applies its events
+    /// for them: each existing path is added or updated unless the index's ignore rules
+    /// exclude it, each missing one is removed with any indexed files below it, and the
+    /// content index follows. An index that does not follow symlinks treats a reported
+    /// symlink as removed, as its scan skips symlinks. Returns [`ReportedChanges::Held`] while a scan runs; the scan
+    /// applies them once it commits, as it does with watcher events. Applying a change the
+    /// watcher also delivers is harmless.
+    pub fn apply_reported_changes(
+        &self,
+        shared_frecency: &SharedFrecency,
+        paths: Vec<PathBuf>,
+    ) -> ReportedChanges {
+        if crate::watch::apply_reported_changes(self, shared_frecency, paths) {
+            ReportedChanges::Applied
+        } else {
+            ReportedChanges::Held
         }
     }
 

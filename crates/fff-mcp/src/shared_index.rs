@@ -8,66 +8,21 @@ use fff::{
     BackgroundStatus, CoverageSubscription, FFFMode, FilePickerOptions, SharedFilePicker,
     SharedFrecency,
 };
-use serde::{Deserialize, Serialize};
-
-use crate::protocol::ServiceError;
+use fff_service::protocol::{IndexOptions, Readiness, ServiceError, Watcher};
 
 const READINESS_POLL: Duration = Duration::from_millis(20);
 
-#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
-pub(crate) struct IndexOptions {
-    pub warmup: bool,
-    pub content_indexing: bool,
-    pub watch: bool,
-    pub follow_symlinks: bool,
-    pub max_cached_files: Option<usize>,
-    pub frecency_db: Option<String>,
-    pub enable_home_scan: bool,
-    pub enable_root_scan: bool,
+pub(crate) fn allows_root(options: &IndexOptions, root: &Path) -> bool {
+    fff::path_utils::validate_base_path(root, options.enable_root_scan, options.enable_home_scan)
+        .is_ok()
 }
 
-impl IndexOptions {
-    pub fn allows_root(&self, root: &Path) -> bool {
-        fff::path_utils::validate_base_path(root, self.enable_root_scan, self.enable_home_scan)
-            .is_ok()
-    }
-}
-
-// Everything that decides whether two requests may share one index.
+// An index to build: its root, repository context and the options it is built with.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub(crate) struct IndexKey {
     pub root: PathBuf,
     pub repository: Option<PathBuf>,
     pub options: IndexOptions,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub(crate) enum Readiness {
-    Scanning,
-    Ready,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub(crate) enum Watcher {
-    Disabled,
-    Starting,
-    Ready,
-    Failed,
-    Stopped,
-}
-
-impl From<fff::WatcherStatus> for Watcher {
-    fn from(status: fff::WatcherStatus) -> Self {
-        match status {
-            fff::WatcherStatus::Disabled => Self::Disabled,
-            fff::WatcherStatus::Starting => Self::Starting,
-            fff::WatcherStatus::Ready => Self::Ready,
-            fff::WatcherStatus::Failed => Self::Failed,
-            fff::WatcherStatus::Stopped => Self::Stopped,
-        }
-    }
 }
 
 pub(crate) struct Index {
@@ -77,6 +32,7 @@ pub(crate) struct Index {
     pub id: String,
     pub picker: SharedFilePicker,
     pub warnings: Vec<String>,
+    frecency: SharedFrecency,
     background: BackgroundStatus,
     ready: tokio::sync::watch::Sender<bool>,
     _coverage: CoverageSubscription,
@@ -113,7 +69,7 @@ impl Index {
         let coverage = picker.subscribe_coverage(on_coverage_change);
         FilePicker::new_with_shared_state(
             picker.clone(),
-            frecency,
+            frecency.clone(),
             FilePickerOptions {
                 base_path: root
                     .to_str()
@@ -145,6 +101,7 @@ impl Index {
             id: uuid::Uuid::new_v4().to_string(),
             picker,
             warnings,
+            frecency,
             background,
             ready: tokio::sync::watch::Sender::new(false),
             _coverage: coverage,
@@ -163,12 +120,75 @@ impl Index {
         self.readiness() == Readiness::Ready
     }
 
+    // A scan runs or waits to run, post-scan phase included.
+    pub fn is_busy(&self) -> bool {
+        self.background.is_scanning() || self.background.is_scan_pending()
+    }
+
+    // Files the current or last scan has walked so far, read without the index lock.
+    pub fn scanned_files(&self) -> usize {
+        self.background.scanned_files()
+    }
+
+    // Starts a full rescan, coalesced with one already running.
+    pub fn rescan(&self) -> Result<(), ServiceError> {
+        self.picker
+            .trigger_full_rescan_async(&self.frecency)
+            .map_err(|error| ServiceError::Index {
+                root: self.root.clone(),
+                reason: error.to_string(),
+            })
+    }
+
+    // Applies changes a program reports to the index as the watcher would.
+    pub fn apply_changes(&self, paths: Vec<PathBuf>) -> fff::ReportedChanges {
+        self.picker.apply_reported_changes(&self.frecency, paths)
+    }
+
+    // Returns false when a scan still runs or waits to run at `deadline`.
+    pub async fn wait_scanned(&self, deadline: tokio::time::Instant) -> bool {
+        while self.is_busy() {
+            if tokio::time::Instant::now() >= deadline {
+                return false;
+            }
+            tokio::time::sleep(READINESS_POLL).await;
+        }
+        true
+    }
+
     pub fn watcher(&self) -> Watcher {
-        self.background.watcher().into()
+        match self.background.watcher() {
+            fff::WatcherStatus::Disabled => Watcher::Disabled,
+            fff::WatcherStatus::Starting => Watcher::Starting,
+            fff::WatcherStatus::Ready => Watcher::Ready,
+            fff::WatcherStatus::Failed => Watcher::Failed,
+            fff::WatcherStatus::Stopped => Watcher::Stopped,
+        }
     }
 
     pub fn depth(&self) -> usize {
         self.root.components().count()
+    }
+
+    // The file set must match; capabilities may exceed the request, and a request that
+    // names a frecency database only accepts that one.
+    pub fn serves(&self, request: &IndexOptions) -> bool {
+        let own = &self.options;
+        own.follow_symlinks == request.follow_symlinks
+            && offers(own, request)
+            && (request.frecency_db.is_none() || own.frecency_db == request.frecency_db)
+    }
+
+    // Whether this index offers every capability of `other` and more.
+    pub fn extends(&self, other: &Index) -> bool {
+        offers(&self.options, &other.options) && !offers(&other.options, &self.options)
+    }
+
+    // Broader coverage first, then more capabilities, so fewer sessions move later.
+    pub fn preference(&self) -> (usize, std::cmp::Reverse<u8>) {
+        let own = &self.options;
+        let capabilities = own.content_indexing as u8 + own.watch as u8 + own.warmup as u8;
+        (self.depth(), std::cmp::Reverse(capabilities))
     }
 
     // Returns false when the index is not ready by `deadline`.
@@ -183,7 +203,10 @@ impl Index {
     pub async fn monitor(index: Weak<Self>) -> Option<Arc<Self>> {
         loop {
             let current = index.upgrade()?;
-            if !current.background.is_scanning() && current.watcher() != Watcher::Starting {
+            if !current.background.is_scanning()
+                && current.watcher() != Watcher::Starting
+                && !readiness_held()
+            {
                 if current.watcher() == Watcher::Failed {
                     tracing::warn!(
                         root = %current.root.display(),
@@ -232,6 +255,49 @@ impl Index {
             path: scope.to_path_buf(),
             reason: e.to_string(),
         })
+    }
+}
+
+// In debug builds, tests keep indexes building while the file this names exists.
+fn readiness_held() -> bool {
+    cfg!(debug_assertions)
+        && std::env::var_os("FFF_MCP_TEST_HOLD_READINESS")
+            .is_some_and(|file| Path::new(&file).exists())
+}
+
+// Whether `own` offers every capability `request` needs.
+pub(crate) fn offers(own: &IndexOptions, request: &IndexOptions) -> bool {
+    (own.content_indexing || !request.content_indexing)
+        && (own.watch || !request.watch)
+        && (own.warmup || !request.warmup)
+        && caches_enough(own.max_cached_files, request.max_cached_files)
+}
+
+// Raises the capabilities of `options` to those `other` offers, keeping its file set policy.
+pub(crate) fn upgrade(options: &mut IndexOptions, other: &IndexOptions) {
+    options.content_indexing |= other.content_indexing;
+    options.watch |= other.watch;
+    options.warmup |= other.warmup;
+    let (own, wanted) = (options.max_cached_files, other.max_cached_files);
+    if !caches_enough(own, wanted) {
+        options.max_cached_files = if caches_enough(wanted, own) {
+            wanted
+        } else {
+            // A core budget and an explicit one between its bounds: an explicit one above both.
+            own.max(wanted)
+                .map(|n| n.max(fff::ContentCacheBudget::AUTO_MAX_FILES))
+        };
+    }
+}
+
+// `None` is the core's size-based budget, which caches between its bounds.
+fn caches_enough(own: Option<usize>, request: Option<usize>) -> bool {
+    use fff::ContentCacheBudget as Budget;
+    match (own, request) {
+        (None, None) => true,
+        (Some(own), Some(request)) => own >= request,
+        (None, Some(request)) => request <= Budget::AUTO_MIN_FILES,
+        (Some(own), None) => own >= Budget::AUTO_MAX_FILES,
     }
 }
 
@@ -293,6 +359,36 @@ fn repository_root(path: &Path) -> Option<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn options(warmup: bool, max_cached_files: Option<usize>) -> IndexOptions {
+        IndexOptions {
+            warmup,
+            content_indexing: true,
+            watch: true,
+            follow_symlinks: false,
+            max_cached_files,
+            frecency_db: None,
+            enable_home_scan: false,
+            enable_root_scan: false,
+        }
+    }
+
+    #[test]
+    fn warmup_and_cache_budget_are_capabilities() {
+        let agent = options(true, None);
+        let app = options(false, Some(100));
+        assert!(offers(&agent, &app));
+        assert!(!offers(&app, &agent));
+        assert!(offers(&options(true, Some(50_000)), &agent));
+        assert!(!offers(&agent, &options(true, Some(20_000))));
+        let mut upgraded = app.clone();
+        upgrade(&mut upgraded, &agent);
+        assert!(offers(&upgraded, &agent) && offers(&upgraded, &app));
+        let mut between = options(false, Some(20_000));
+        upgrade(&mut between, &agent);
+        assert!(offers(&between, &agent) && offers(&between, &options(false, Some(20_000))));
+        assert_eq!(between.max_cached_files, Some(30_000));
+    }
 
     #[test]
     fn repository_probe_detects_new_repositories() {

@@ -56,15 +56,31 @@ pub enum WatcherStatus {
 pub struct BackgroundStatus {
     signals: ScanSignals,
     watch: bool,
+    scanned_files: Arc<AtomicUsize>,
 }
 
 impl BackgroundStatus {
-    pub(crate) fn new(signals: ScanSignals, watch: bool) -> Self {
-        Self { signals, watch }
+    pub(crate) fn new(signals: ScanSignals, watch: bool, scanned_files: Arc<AtomicUsize>) -> Self {
+        Self {
+            signals,
+            watch,
+            scanned_files,
+        }
+    }
+
+    /// Files the current or last scan has walked so far.
+    pub fn scanned_files(&self) -> usize {
+        self.scanned_files.load(Ordering::Relaxed)
     }
 
     pub fn is_scanning(&self) -> bool {
         self.signals.scanning.load(Ordering::Acquire)
+    }
+
+    /// Whether a scan job runs, post-scan phase included, or a requested rescan waits for one.
+    pub fn is_scan_pending(&self) -> bool {
+        self.signals.scan_job_running.load(Ordering::SeqCst)
+            || self.signals.rescan_pending.load(Ordering::SeqCst)
     }
 
     pub fn watcher(&self) -> WatcherStatus {
@@ -874,6 +890,39 @@ mod tests {
     }
 
     #[test]
+    fn a_scan_stays_pending_through_post_scan_and_a_queued_rescan() {
+        let (_tmp, root) = canonical_tempdir();
+        std::fs::write(root.join("a.rs"), "fn a() {}\n").unwrap();
+        let shared = SharedFilePicker::default();
+        let observed = shared.clone();
+        // Hooks run on a pool thread, where a panic aborts: they report instead.
+        let held = Arc::new(AtomicBool::new(false));
+        let report = Arc::clone(&held);
+        on(&root, Stage::ContentIndexed, move || {
+            let status = observed
+                .read()
+                .unwrap()
+                .as_ref()
+                .unwrap()
+                .background_status();
+            let frecency = SharedFrecency::default();
+            let queued = observed.trigger_full_rescan_async(&frecency).is_ok();
+            report.store(
+                queued && !status.is_scanning() && status.is_scan_pending(),
+                Ordering::Release,
+            );
+        });
+        start(&shared, &root, true);
+        eventually("the queued rescan walks", || {
+            times_reached(&root, Stage::Walked) == 2
+        });
+        settle(&shared, &root);
+        assert!(held.load(Ordering::Acquire), "no pending scan was reported");
+        let status = shared.read().unwrap().as_ref().unwrap().background_status();
+        assert!(!status.is_scan_pending());
+    }
+
+    #[test]
     fn an_edit_after_the_content_index_read_the_file_stays_searchable() {
         let (_tmp, root) = canonical_tempdir();
         std::fs::write(root.join("holder.rs"), "const zebra_quokka: u8 = 0;\n").unwrap();
@@ -1015,7 +1064,7 @@ mod tests {
             signals.cancelled.store(true, Ordering::Release);
         }
         drop(guard);
-        BackgroundStatus::new(signals, true).watcher()
+        BackgroundStatus::new(signals, true, Arc::default()).watcher()
     }
 
     #[test]

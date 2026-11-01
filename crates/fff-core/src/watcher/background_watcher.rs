@@ -369,6 +369,70 @@ impl Drop for BackgroundWatcher {
     }
 }
 
+// Applies changes to `paths` reported by a program exactly as watcher events for them: a
+// path that exists is added or updated unless the index ignores it, one that does not is
+// removed, with any indexed files below it. While a scan runs, they wait with the scan's
+// held events, as watcher events do. Returns false when they were held.
+pub(crate) fn apply_reported_changes(
+    shared_picker: &SharedFilePicker,
+    shared_frecency: &SharedFrecency,
+    paths: Vec<PathBuf>,
+) -> bool {
+    let Some((mode, base_path, git_workdir, git_status_worker, follow_symlinks)) =
+        shared_picker.read().ok().and_then(|guard| {
+            guard.as_ref().map(|picker| {
+                (
+                    picker.mode(),
+                    picker.base_path().to_path_buf(),
+                    picker.git_root().map(Path::to_path_buf),
+                    Arc::clone(&picker.git_status_worker),
+                    picker.follows_symlinks(),
+                )
+            })
+        })
+    else {
+        return true;
+    };
+    let now = std::time::Instant::now();
+    let events = paths
+        .into_iter()
+        .map(|path| {
+            // An index that does not follow symlinks holds none, as its scan skips them: a
+            // reported symlink, also one that replaced a file or directory, is a removal.
+            let skipped_link = !follow_symlinks
+                && std::fs::symlink_metadata(&path).is_ok_and(|meta| meta.file_type().is_symlink());
+            let kind = if skipped_link {
+                EventKind::Remove(notify::event::RemoveKind::Any)
+            } else {
+                EventKind::Modify(ModifyKind::Any)
+            };
+            DebouncedEvent::new(notify::Event::new(kind).add_path(path), now)
+        })
+        .collect();
+    let Some(events) = shared_picker.event_hold().defer(events) else {
+        return false;
+    };
+    let new_dirs = handle_debounced_events(
+        mode,
+        events,
+        &base_path,
+        &git_workdir,
+        shared_picker,
+        shared_frecency,
+        &git_status_worker,
+    );
+    if let Ok(guard) = shared_picker.read()
+        && let Some(watcher) = guard
+            .as_ref()
+            .and_then(|picker| picker.background_watcher.as_ref())
+    {
+        for dir in new_dirs {
+            watcher.request_index_dir(dir);
+        }
+    }
+    true
+}
+
 #[tracing::instrument(name = "fs_events", skip(events, shared_picker, shared_frecency, git_status_worker), level = Level::DEBUG)]
 pub(crate) fn handle_debounced_events(
     mode: FFFMode,

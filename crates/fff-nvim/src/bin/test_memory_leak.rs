@@ -207,6 +207,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                             limit: max_results,
                         },
                         scope: Default::default(),
+                        exclude_frecency: false,
                     },
                 );
                 let duration = search_start.elapsed();

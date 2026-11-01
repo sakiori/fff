@@ -2,10 +2,14 @@
  * FileFinder - High-level API for the fff file finder
  *
  * This class provides a type-safe, ergonomic API for file finding operations.
- * Each instance owns an independent native file picker that can be created
- * and destroyed independently. Multiple instances can coexist.
+ * Each instance is a session on the shared fff service of the package's
+ * release, which owns the index; instances of any process searching the same
+ * directory share one index with each other and with `fff-mcp` agents.
  *
- * All methods return Result types for explicit error handling.
+ * Every method that reaches the service returns a Promise of a Result and runs
+ * its native call on one of the package's worker threads, so a slow or
+ * unresponsive service blocks neither the event loop nor the libuv thread pool.
+ * Methods that need no service stay synchronous.
  */
 
 import {
@@ -13,24 +17,10 @@ import {
   ffiCreate,
   ffiDestroy,
   ffiGetBasePath,
-  ffiGetHistoricalQuery,
-  ffiGetScanProgress,
-  ffiGlob,
   ffiHealthCheck,
-  ffiIsScanning,
-  ffiLiveGrep,
-  ffiMultiGrep,
-  ffiRefreshGitStatus,
+  ffiHealthCheckStatic,
   ffiRestartIndex,
-  ffiScanFiles,
-  ffiSearch,
-  ffiSearchDirectories,
-  ffiSearchMixed,
-  ffiTrackQuery,
-  ffiUnwatch,
-  ffiWaitForScan,
-  ffiWatch,
-  ffiWatchCleanupAfterDestroy,
+  ffiServiceCall,
   isAvailable,
   type NativeHandle,
 } from "./ffi.js";
@@ -38,15 +28,13 @@ import {
 import type {
   DirSearchOptions,
   DirSearchResult,
-  FileFinderApi,
   GlobOptions,
+  GrepCursor,
   GrepOptions,
   GrepResult,
   HealthCheck,
-  InitOptions,
   MixedSearchResult,
   MultiGrepOptions,
-  Result,
   ScanProgress,
   SearchOptions,
   SearchResult,
@@ -54,22 +42,142 @@ import type {
   WatchOptions,
   WatchUnsubscribe,
 } from "./fff-api.js";
+import { definitionModeToInt } from "./fff-api.js";
 
-import { err } from "./fff-api.js";
+import { ErrorCode, err, type Result } from "./errors.js";
+import type { FrecencyOptions, ServiceInitOptions } from "./service-options.js";
+
+/** Interval of the readiness polls of `waitForScan` and `waitForIndexReady`. */
+const READY_POLL_MS = 50;
+
+/** The error of a method the shared service has no equivalent for. */
+function unavailable<T>(method: string): Result<T> {
+  return err(`FileFinder.${method} is unavailable over the shared service`, ErrorCode.unavailable);
+}
+
+/** Where a grep continues: a file offset into the order of the index that returned it. */
+interface ServiceCursor {
+  index: string;
+  offset: number;
+}
+
+/** The opaque cursor of the shared API, carrying the index it belongs to. */
+interface IndexedGrepCursor extends GrepCursor {
+  readonly _index: string;
+}
+
+/** A grep reply before its cursor is wrapped. */
+type GrepReply = Omit<GrepResult, "nextCursor"> & { nextCursor: ServiceCursor | null };
+
+const GREP_MODES = { plain: "PlainText", regex: "Regex", fuzzy: "Fuzzy" } as const;
+
+/** The service's definition modes, indexed by `definitionModeToInt`. */
+const DEFINITION_MODES = ["Off", "Classify", "DefinitionOnly", "UsageOnly"] as const;
+
+function serviceCursor(cursor: GrepCursor | null | undefined): Result<ServiceCursor | null> {
+  if (!cursor) return { ok: true, value: null };
+  const index = (cursor as Partial<IndexedGrepCursor>)._index;
+  if (index === undefined) {
+    return err(
+      "The grep cursor was not returned by a FileFinder grep; search again without it",
+      ErrorCode.invalidRequest,
+    );
+  }
+  return { ok: true, value: { index, offset: cursor._offset } };
+}
+
+function grepResult(reply: Result<GrepReply>): Result<GrepResult> {
+  if (!reply.ok) return reply;
+  const next = reply.value.nextCursor;
+  const nextCursor: IndexedGrepCursor | null = next
+    ? { __brand: "GrepCursor", _offset: next.offset, _index: next.index }
+    : null;
+  return { ok: true, value: { ...reply.value, nextCursor } };
+}
+
+function grepOptions(options: GrepOptions & FrecencyOptions, cursor: ServiceCursor | null) {
+  const definitionMode = definitionModeToInt(options.classifyDefinitions);
+  if (definitionMode === undefined) {
+    return err("Invalid classifyDefinitions mode", ErrorCode.invalidRequest);
+  }
+  const value = {
+    max_file_size: options.maxFileSize || 10 * 1024 * 1024,
+    max_matches_per_file: options.maxMatchesPerFile ?? 0,
+    smart_case: options.smartCase ?? true,
+    cursor,
+    page_size: options.pageSize || 50,
+    time_budget_ms: options.timeBudgetMs ?? 0,
+    enforce_time_budget: options.enforceTimeBudget ?? false,
+    before_context: options.beforeContext ?? 0,
+    after_context: options.afterContext ?? 0,
+    classify_definitions: DEFINITION_MODES[definitionMode],
+    exclude_frecency: options.excludeFrecency ?? false,
+  };
+  return { ok: true as const, value };
+}
+
+/**
+ * The native calls of one instance, one at a time.
+ *
+ * The service session answers one call at a time anyway; queuing here keeps an
+ * instance to one worker thread, so other instances keep the rest. When a call
+ * finds the service lost (it did not answer within its bound, or the
+ * connection broke), the calls queued behind it fail with the same error
+ * rather than each waiting out that bound again; the next call opens a new
+ * session. A call run with `always` runs regardless, as freeing the instance
+ * must.
+ */
+class CallQueue {
+  private tail: Promise<unknown> = Promise.resolve();
+  private lost = { epoch: 0, error: "" };
+
+  run<T>(
+    call: () => Promise<Result<T>>,
+    always = false,
+  ): Promise<Result<T>> {
+    const epoch = this.lost.epoch;
+    const result = this.tail.then(async (): Promise<Result<T>> => {
+      if (!always && this.lost.epoch !== epoch) return err(this.lost.error, ErrorCode.lostService);
+      let outcome: Result<T>;
+      try {
+        outcome = await call();
+      } catch (error) {
+        return err(`fff native call failed: ${String(error)}`);
+      }
+      if (outcome.ok) return outcome;
+      if (outcome.code === ErrorCode.lostService) {
+        this.lost = { epoch: this.lost.epoch + 1, error: outcome.error };
+      }
+      return outcome;
+    });
+    this.tail = result.catch(() => undefined);
+    return result;
+  }
+}
+
+function page(options?: SearchOptions & FrecencyOptions) {
+  return {
+    current_file: options?.currentFile || null,
+    offset: options?.pageIndex ?? 0,
+    limit: options?.pageSize || 100,
+    exclude_frecency: options?.excludeFrecency ?? false,
+  };
+}
 
 /**
  * FileFinder - Fast file finder with fuzzy search
  *
- * Each instance is backed by an independent native file picker. Create as many
- * as you need and destroy them when done.
+ * Each instance is a session on the shared fff service. Create as many as you
+ * need and destroy them when done. Calls on one instance may overlap; they
+ * reach the service one at a time, in call order.
  *
  * @example
  *
  * ```ts
- * import { FileFinder } from "@ff-labs/fff-node";
+ * import { FileFinder } from "@sakiori/fff-node";
  *
  * // Create an instance
- * const finder = FileFinder.create({ basePath: "/path/to/project" });
+ * const finder = await FileFinder.create({ basePath: "/path/to/project" });
  * if (!finder.ok) {
  *   console.error(finder.error);
  *   process.exit(1);
@@ -79,7 +187,7 @@ import { err } from "./fff-api.js";
  * await finder.value.waitForScan(5000);
  *
  * // Search for files
- * const search = finder.value.search("main.ts");
+ * const search = await finder.value.fileSearch("main.ts");
  * if (search.ok) {
  *   for (const item of search.value.items) {
  *     console.log(item.relativePath);
@@ -87,13 +195,12 @@ import { err } from "./fff-api.js";
  * }
  *
  * // Cleanup
- * finder.value.destroy();
+ * await finder.value.destroy();
  * ```
  */
-export class FileFinder implements FileFinderApi {
+export class FileFinder {
   private handle: NativeHandle | null;
-  /** Native ids of this instance's active watch subscriptions. */
-  private watchers = new Set<number>();
+  private readonly calls = new CallQueue();
 
   private constructor(handle: NativeHandle) {
     this.handle = handle;
@@ -102,41 +209,51 @@ export class FileFinder implements FileFinderApi {
   /**
    * Create a new file finder instance.
    *
+   * Opens a session on the shared fff service, starting the service from the
+   * platform package's `fff-mcp` when none of this release runs. When the
+   * service cannot be started or reached within `timeoutMs` (90 seconds by
+   * default), the result carries its reason.
+   *
    * @param options - Initialization options
    * @returns Result containing the new FileFinder instance or an error
    *
    * @example
    * ```typescript
-   * // Basic initialization
-   * const finder = FileFinder.create({ basePath: "/path/to/project" });
-   *
-   * // With custom database paths
-   * const finder = FileFinder.create({
-   *   basePath: "/path/to/project",
-   *   frecencyDbPath: "/custom/frecency.mdb",
-   *   historyDbPath: "/custom/history.mdb",
-   * });
+   * const finder = await FileFinder.create({ basePath: "/path/to/project" });
    * ```
    */
-  static create(options: InitOptions): Result<FileFinder> {
-    const result = ffiCreate(
-      options.basePath,
-      options.frecencyDbPath ?? "",
-      options.historyDbPath ?? "",
-      options.useUnsafeNoLock ?? false,
-      !(options.disableMmapCache ?? false),
-      !(options.disableContentIndexing ?? options.disableMmapCache ?? false),
-      !(options.disableWatch ?? false),
-      options.aiMode ?? false,
-      options.logFilePath ?? "",
-      options.logLevel ?? "",
-      options.cacheBudgetMaxFiles ?? 0,
-      options.cacheBudgetMaxBytes ?? 0,
-      options.cacheBudgetMaxFileSize ?? 0,
-      options.enableFsRootScanning ?? false,
-      options.enableHomeDirScanning ?? false,
-      options.followSymlinks ?? false,
-    );
+  static async create(options: ServiceInitOptions): Promise<Result<FileFinder>> {
+    if (options.historyDbPath) {
+      return err("historyDbPath is unavailable over the shared service", ErrorCode.unavailable);
+    }
+    const timeoutMs = options.timeoutMs ?? 0;
+    if (!Number.isSafeInteger(timeoutMs) || timeoutMs < 0) {
+      return err(
+        "timeoutMs must be a non-negative integer number of milliseconds",
+        ErrorCode.invalidRequest,
+      );
+    }
+    let result: Result<NativeHandle>;
+    try {
+      result = await ffiCreate(
+        options.basePath,
+        options.frecencyDbPath ?? "",
+        !(options.disableMmapCache ?? false),
+        !(options.disableContentIndexing ?? options.disableMmapCache ?? false),
+        !(options.disableWatch ?? false),
+        options.aiMode ?? false,
+        options.logFilePath ?? "",
+        options.logLevel ?? "",
+        options.cacheBudgetMaxFiles ?? 0,
+        options.enableFsRootScanning ?? false,
+        options.enableHomeDirScanning ?? false,
+        options.followSymlinks ?? false,
+        options.serviceDir ?? "",
+        timeoutMs,
+      );
+    } catch (error) {
+      return err(`fff native call failed: ${String(error)}`);
+    }
 
     if (!result.ok) {
       return result;
@@ -146,24 +263,21 @@ export class FileFinder implements FileFinderApi {
   }
 
   /**
-   * Destroy and clean up all resources.
+   * Destroy the instance and end its service session.
    *
-   * Call this when you're done using the file finder to free memory
-   * and stop background file watching. After calling this, the instance
-   * must not be used again.
+   * Calls made after this report the instance as destroyed; calls made before
+   * it finish first. The service releases the index once no session uses it.
+   * An instance that is never destroyed keeps its session until the process
+   * exits.
    */
-  destroy(): void {
-    if (this.handle !== null) {
-      const handle = this.handle;
-      ffiDestroy(handle);
-      this.handle = null;
-      // ffiDestroy unsubscribes every watch (a delivery racing it is a
-      // benign id-map miss); dropping the remaining handlers afterwards is
-      // safe, and the process-wide trampoline is released when this was the
-      // last watching instance.
-      ffiWatchCleanupAfterDestroy(handle, this.watchers);
-      this.watchers.clear();
-    }
+  async destroy(): Promise<void> {
+    const handle = this.handle;
+    if (handle === null) return;
+    this.handle = null;
+    await this.calls.run(async () => {
+      await ffiDestroy(handle);
+      return { ok: true, value: undefined };
+    }, true);
   }
 
   /**
@@ -174,13 +288,23 @@ export class FileFinder implements FileFinderApi {
   }
 
   /**
-   * Guard that returns an error if the instance has been destroyed.
+   * Run a native call of this instance, or report it destroyed.
    */
-  private ensureAlive(): Result<NativeHandle> {
-    if (this.handle === null) {
-      return err("FileFinder instance has been destroyed.");
+  private call<T>(
+    native: (handle: NativeHandle) => Promise<Result<T>>,
+  ): Promise<Result<T>> {
+    const handle = this.handle;
+    if (handle === null) {
+      return Promise.resolve(err("FileFinder instance has been destroyed.", ErrorCode.destroyed));
     }
-    return { ok: true, value: this.handle };
+    return this.calls.run(() => native(handle));
+  }
+
+  /**
+   * Send one request of the service's program protocol.
+   */
+  private request<T>(request: unknown): Promise<Result<T>> {
+    return this.call((handle) => ffiServiceCall<T>(handle, request));
   }
 
   /**
@@ -198,7 +322,7 @@ export class FileFinder implements FileFinderApi {
    *
    * @example
    * ```typescript
-   * const result = finder.search("main.ts", { pageSize: 10 });
+   * const result = await finder.fileSearch("main.ts", { pageSize: 10 });
    * if (result.ok) {
    *   console.log(`Found ${result.value.totalMatched} files`);
    *   for (const item of result.value.items) {
@@ -207,20 +331,11 @@ export class FileFinder implements FileFinderApi {
    * }
    * ```
    */
-  fileSearch(query: string, options?: SearchOptions): Result<SearchResult> {
-    const guard = this.ensureAlive();
-    if (!guard.ok) return guard;
-
-    return ffiSearch(
-      guard.value,
-      query,
-      options?.currentFile ?? "",
-      options?.maxThreads ?? 0,
-      options?.pageIndex ?? 0,
-      options?.pageSize ?? 0,
-      options?.comboBoostMultiplier ?? 0,
-      options?.minComboCount ?? 0,
-    );
+  fileSearch(
+    query: string,
+    options?: SearchOptions & FrecencyOptions,
+  ): Promise<Result<SearchResult>> {
+    return this.request({ SearchFiles: { query, ...page(options) } });
   }
 
   /**
@@ -235,7 +350,7 @@ export class FileFinder implements FileFinderApi {
    *
    * @example
    * ```typescript
-   * const result = finder.glob("**\/*.rs", { pageSize: 100 });
+   * const result = await finder.glob("**\/*.rs", { pageSize: 100 });
    * if (result.ok) {
    *   for (const item of result.value.items) {
    *     console.log(item.relativePath);
@@ -243,18 +358,8 @@ export class FileFinder implements FileFinderApi {
    * }
    * ```
    */
-  glob(pattern: string, options?: GlobOptions): Result<SearchResult> {
-    const guard = this.ensureAlive();
-    if (!guard.ok) return guard;
-
-    return ffiGlob(
-      guard.value,
-      pattern,
-      options?.currentFile ?? "",
-      options?.maxThreads ?? 0,
-      options?.pageIndex ?? 0,
-      options?.pageSize ?? 0,
-    );
+  glob(pattern: string, options?: GlobOptions & FrecencyOptions): Promise<Result<SearchResult>> {
+    return this.request({ Glob: { pattern, ...page(options) } });
   }
 
   /**
@@ -266,7 +371,7 @@ export class FileFinder implements FileFinderApi {
    *
    * @example
    * ```typescript
-   * const result = finder.directorySearch("src/comp", { pageSize: 10 });
+   * const result = await finder.directorySearch("src/comp", { pageSize: 10 });
    * if (result.ok) {
    *   console.log(`Found ${result.value.totalMatched} directories`);
    *   for (const item of result.value.items) {
@@ -275,18 +380,11 @@ export class FileFinder implements FileFinderApi {
    * }
    * ```
    */
-  directorySearch(query: string, options?: DirSearchOptions): Result<DirSearchResult> {
-    const guard = this.ensureAlive();
-    if (!guard.ok) return guard;
-
-    return ffiSearchDirectories(
-      guard.value,
-      query,
-      options?.currentFile ?? null,
-      options?.maxThreads ?? 0,
-      options?.pageIndex ?? 0,
-      options?.pageSize ?? 0,
-    );
+  directorySearch(
+    query: string,
+    options?: DirSearchOptions & FrecencyOptions,
+  ): Promise<Result<DirSearchResult>> {
+    return this.request({ SearchDirectories: { query, ...page(options) } });
   }
 
   /**
@@ -301,7 +399,7 @@ export class FileFinder implements FileFinderApi {
    *
    * @example
    * ```typescript
-   * const result = finder.mixedSearch("main", { pageSize: 20 });
+   * const result = await finder.mixedSearch("main", { pageSize: 20 });
    * if (result.ok) {
    *   for (const entry of result.value.items) {
    *     if (entry.type === "file") {
@@ -313,20 +411,11 @@ export class FileFinder implements FileFinderApi {
    * }
    * ```
    */
-  mixedSearch(query: string, options?: SearchOptions): Result<MixedSearchResult> {
-    const guard = this.ensureAlive();
-    if (!guard.ok) return guard;
-
-    return ffiSearchMixed(
-      guard.value,
-      query,
-      options?.currentFile ?? "",
-      options?.maxThreads ?? 0,
-      options?.pageIndex ?? 0,
-      options?.pageSize ?? 0,
-      options?.comboBoostMultiplier ?? 0,
-      options?.minComboCount ?? 0,
-    );
+  mixedSearch(
+    query: string,
+    options?: SearchOptions & FrecencyOptions,
+  ): Promise<Result<MixedSearchResult>> {
+    return this.request({ SearchMixed: { query, ...page(options) } });
   }
 
   /**
@@ -344,6 +433,9 @@ export class FileFinder implements FileFinderApi {
    * - `*.ts pattern` - Only search in TypeScript files
    * - `src/ pattern` - Only search in the src directory
    *
+   * A grep may take its `timeBudgetMs` beyond the instance's `timeoutMs`
+   * before it fails as unanswered.
+   *
    * @param query - Search query string
    * @param options - Grep options (mode, pagination, limits)
    * @returns Grep results with matched lines and file metadata
@@ -351,39 +443,32 @@ export class FileFinder implements FileFinderApi {
    * @example
    * ```typescript
    * // First page
-   * const result = finder.grep("TODO", { mode: "plain" });
+   * const result = await finder.grep("TODO", { mode: "plain" });
    * if (result.ok) {
    *   for (const match of result.value.items) {
    *     console.log(`${match.relativePath}:${match.lineNumber}: ${match.lineContent}`);
    *   }
    *   // Fetch next page
    *   if (result.value.nextCursor) {
-   *     const page2 = finder.grep("TODO", {
+   *     const page2 = await finder.grep("TODO", {
    *       cursor: result.value.nextCursor,
    *     });
    *   }
    * }
    * ```
    */
-  grep(query: string, options?: GrepOptions): Result<GrepResult> {
-    const guard = this.ensureAlive();
-    if (!guard.ok) return guard;
-
-    return ffiLiveGrep(
-      guard.value,
+  async grep(query: string, options?: GrepOptions & FrecencyOptions): Promise<Result<GrepResult>> {
+    const cursor = serviceCursor(options?.cursor);
+    if (!cursor.ok) return cursor;
+    const serviceOptions = grepOptions(options ?? {}, cursor.value);
+    if (!serviceOptions.ok) return serviceOptions;
+    const request = {
       query,
-      options?.mode ?? "plain",
-      options?.maxFileSize ?? 0,
-      options?.maxMatchesPerFile ?? 0,
-      options?.smartCase ?? true,
-      options?.cursor?._offset ?? 0,
-      options?.pageSize ?? 0,
-      options?.timeBudgetMs ?? 0,
-      options?.enforceTimeBudget ?? false,
-      options?.beforeContext ?? 0,
-      options?.afterContext ?? 0,
-      options?.classifyDefinitions ?? false,
-    );
+      mode: GREP_MODES[options?.mode ?? "plain"] ?? GREP_MODES.plain,
+      ai_syntax: false,
+      options: serviceOptions.value,
+    };
+    return grepResult(await this.request<GrepReply>({ Grep: request }));
   }
 
   /**
@@ -401,7 +486,7 @@ export class FileFinder implements FileFinderApi {
    *
    * @example
    * ```typescript
-   * const result = finder.multiGrep({
+   * const result = await finder.multiGrep({
    *   patterns: ["VideoFrame", "video_frame", "PreloadedImage"],
    * });
    * if (result.ok) {
@@ -411,132 +496,136 @@ export class FileFinder implements FileFinderApi {
    * }
    * ```
    */
-  multiGrep(options: MultiGrepOptions): Result<GrepResult> {
-    const guard = this.ensureAlive();
-    if (!guard.ok) return guard;
-
+  async multiGrep(options: MultiGrepOptions & FrecencyOptions): Promise<Result<GrepResult>> {
     if (!options.patterns || options.patterns.length === 0) {
-      return err("patterns array must have at least 1 element");
+      return err("patterns array must have at least 1 element", ErrorCode.invalidRequest);
     }
 
-    return ffiMultiGrep(
-      guard.value,
-      options.patterns.join("\n"),
-      options.constraints ?? "",
-      options.maxFileSize ?? 0,
-      options.maxMatchesPerFile ?? 0,
-      options.smartCase ?? true,
-      options.cursor?._offset ?? 0,
-      options.pageSize ?? 0,
-      options.timeBudgetMs ?? 0,
-      options.enforceTimeBudget ?? false,
-      options.beforeContext ?? 0,
-      options.afterContext ?? 0,
-      options.classifyDefinitions ?? false,
-    );
+    const cursor = serviceCursor(options.cursor);
+    if (!cursor.ok) return cursor;
+    const serviceOptions = grepOptions(options, cursor.value);
+    if (!serviceOptions.ok) return serviceOptions;
+    const request = {
+      patterns: options.patterns,
+      constraints: options.constraints || null,
+      options: serviceOptions.value,
+    };
+    return grepResult(await this.request<GrepReply>({ MultiGrep: request }));
   }
 
   /**
-   * Trigger a rescan of the indexed directory.
+   * Trigger a rescan of the shared index, coalesced with one already running.
    *
    * This is useful after major file system changes that the
    * background watcher might have missed.
    */
-  scanFiles(): Result<void> {
-    const guard = this.ensureAlive();
-    if (!guard.ok) return guard;
-    return ffiScanFiles(guard.value);
+  async scanFiles(): Promise<Result<void>> {
+    const done = await this.request<null>("Rescan");
+    return done.ok ? { ok: true, value: undefined } : done;
   }
 
   /**
-   * Check if a scan is currently in progress.
+   * Apply changes the program just made to files of the instance's directory, so
+   * that a search after the returned Promise resolves sees them, without waiting
+   * for the service's watcher or a rescan.
+   *
+   * Each path, absolute or relative to the instance's directory, is added or
+   * updated when it exists and the index does not ignore it, and removed, with
+   * any indexed files below it, when it does not exist; the content index
+   * follows. A symlink is not added unless the index follows symlinks, as its
+   * scan would not add it either. Report files rather than new directories: an index without a
+   * watcher does not walk a reported directory. Changes the watcher also
+   * delivers are applied once more, harmlessly. While the index scans, the
+   * changes are applied when the scan commits.
+   *
+   * @param paths - Files the program wrote, created, renamed or deleted
+   * @returns Nothing once the index holds the changes; `outsideScope` when a
+   *   path lies outside the instance's directory, which applies none of them
+   *
+   * @example
+   * ```typescript
+   * await writeFile(join(root, "src/new.ts"), source);
+   * await finder.notifyChanged(["src/new.ts"]);
+   * const found = await finder.fileSearch("new.ts"); // includes src/new.ts
+   * ```
    */
-  isScanning(): boolean {
-    if (this.handle === null) return false;
-    return ffiIsScanning(this.handle);
+  async notifyChanged(paths: string[]): Promise<Result<void>> {
+    const done = await this.request<null>({ Changed: { paths } });
+    return done.ok ? { ok: true, value: undefined } : done;
+  }
+
+  /**
+   * Check if a scan is currently in progress, or a requested rescan waits for one.
+   * An unreachable service reports false; `waitForScan` and `getScanProgress`
+   * report its error.
+   */
+  async isScanning(): Promise<boolean> {
+    const scanning = await this.scanning();
+    return scanning.ok && scanning.value;
+  }
+
+  private scanning(): Promise<Result<boolean>> {
+    return this.request<boolean>("IsScanning");
   }
 
   /**
    * Get the base path of the file picker (the root directory being indexed).
    */
   getBasePath(): Result<string | null> {
-    const guard = this.ensureAlive();
-    if (!guard.ok) return guard;
-    return ffiGetBasePath(guard.value);
+    if (this.handle === null) {
+      return err("FileFinder instance has been destroyed.", ErrorCode.destroyed);
+    }
+    return ffiGetBasePath(this.handle);
   }
 
   /**
    * Get the current scan progress.
+   *
+   * Once the index is ready, `scannedFilesCount` counts the files of the
+   * instance's directory. While the shared index scans, it counts the files
+   * scanned so far, which may include files outside that directory when the
+   * index covers a broader one.
    */
-  getScanProgress(): Result<ScanProgress> {
-    const guard = this.ensureAlive();
-    if (!guard.ok) return guard;
-    return ffiGetScanProgress(guard.value) as Result<ScanProgress>;
+  getScanProgress(): Promise<Result<ScanProgress>> {
+    return this.request<ScanProgress>("Progress");
   }
 
   /**
-   * Wait for the initial file scan to complete.
-   * Non-blocking: polls `isScanning` and yields to the event loop between checks.
+   * Wait for the initial file scan to complete, polling `isScanning`.
    *
    * @param timeoutMs - Maximum time to wait in milliseconds (default: 5000)
    * @returns true if scan completed, false if timed out
    *
    * @example
    * ```typescript
-   * const finder = FileFinder.create({ basePath: "/path/to/project" });
-   * if (finder.ok) {
-   *   const completed = await finder.value.waitForScan(10000);
-   *   if (!completed.ok || !completed.value) {
-   *     console.warn("Scan did not complete in time");
-   *   }
+   * const completed = await finder.waitForScan(10000);
+   * if (!completed.ok || !completed.value) {
+   *   console.warn("Scan did not complete in time");
    * }
    * ```
    */
   async waitForScan(timeoutMs: number = 5000): Promise<Result<boolean>> {
-    const guard = this.ensureAlive();
-    if (!guard.ok) return guard;
-
     const deadline = Date.now() + timeoutMs;
-    while (this.isScanning()) {
-      if (Date.now() >= deadline) {
-        return { ok: true, value: false };
-      }
-      await new Promise((resolve) => setTimeout(resolve, 50));
+    while (true) {
+      const scanning = await this.scanning();
+      if (!scanning.ok) return scanning;
+      if (!scanning.value) return { ok: true, value: true };
+      if (Date.now() >= deadline) return { ok: true, value: false };
+      await new Promise((resolve) => setTimeout(resolve, READY_POLL_MS));
     }
-    return { ok: true, value: true };
-  }
-
-  /**
-   * Wait for the initial file scan to complete, blocking the calling thread.
-   *
-   * Backed by the native `fff_wait_for_scan` call. Prefer {@link waitForScan}
-   * unless you specifically need synchronous blocking behaviour.
-   *
-   * @param timeoutMs - Maximum time to wait in milliseconds (default: 5000)
-   * @returns true if scan completed, false if timed out
-   */
-  waitForScanBlocking(timeoutMs: number = 5000): Result<boolean> {
-    const guard = this.ensureAlive();
-    if (!guard.ok) return guard;
-    return ffiWaitForScan(guard.value, timeoutMs);
   }
 
   /**
    * Wait until the index is fully ready: the scan has finished and the warmup
-   * (content indexing / bigram) phase has completed.
-   *
-   * Non-blocking: polls `getScanProgress` and yields to the event loop.
+   * (content indexing / bigram) phase has completed. Polls `getScanProgress`.
    *
    * @param timeoutMs - Maximum time to wait in milliseconds (default: 5000)
    * @returns true if the index became ready, false if timed out
    */
   async waitForIndexReady(timeoutMs: number = 5000): Promise<Result<boolean>> {
-    const guard = this.ensureAlive();
-    if (!guard.ok) return guard;
-
     const deadline = Date.now() + timeoutMs;
     while (true) {
-      const progress = this.getScanProgress();
+      const progress = await this.getScanProgress();
       if (!progress.ok) return progress;
       if (!progress.value.isScanning && progress.value.isWarmupComplete) {
         return { ok: true, value: true };
@@ -544,94 +633,45 @@ export class FileFinder implements FileFinderApi {
       if (Date.now() >= deadline) {
         return { ok: true, value: false };
       }
-      await new Promise((resolve) => setTimeout(resolve, 50));
+      await new Promise((resolve) => setTimeout(resolve, READY_POLL_MS));
     }
   }
 
   /**
-   * Change the indexed directory to a new path.
+   * Rescan the indexed directory.
    *
-   * This stops the current file watcher and starts indexing the new directory.
+   * A session stays on its directory, so another path fails; create a new
+   * instance for it.
    *
-   * @param newPath - New directory path to index
+   * @param newPath - The instance's directory
    */
-  reindex(newPath: string): Result<void> {
-    const guard = this.ensureAlive();
-    if (!guard.ok) return guard;
-    return ffiRestartIndex(guard.value, newPath);
+  reindex(newPath: string): Promise<Result<void>> {
+    return this.call((handle) => ffiRestartIndex(handle, newPath));
   }
 
   /**
-   * Refresh the git status cache.
-   *
-   * @returns Number of files with updated git status
+   * Unavailable: the shared service keeps git status current itself.
    */
   refreshGitStatus(): Result<number> {
-    const guard = this.ensureAlive();
-    if (!guard.ok) return guard;
-    return ffiRefreshGitStatus(guard.value);
+    return unavailable("refreshGitStatus");
   }
 
   /**
-   * Track query completion for smart suggestions.
-   *
-   * Call this when a user selects a file from search results.
-   * This helps improve future search rankings for similar queries.
-   *
-   * @param query - The search query that was used
-   * @param selectedFilePath - The file path that was selected
+   * Unavailable: query history has no shared service equivalent.
    */
-  trackQuery(query: string, selectedFilePath: string): Result<boolean> {
-    const guard = this.ensureAlive();
-    if (!guard.ok) return guard;
-    return ffiTrackQuery(guard.value, query, selectedFilePath);
+  trackQuery(_query: string, _selectedFilePath: string): Result<boolean> {
+    return unavailable("trackQuery");
   }
 
   /**
-   * Get a historical query by offset.
-   *
-   * @param offset - Offset from most recent (0 = most recent)
-   * @returns The historical query string, or null if not found
+   * Unavailable: query history has no shared service equivalent.
    */
-  getHistoricalQuery(offset: number): Result<string | null> {
-    const guard = this.ensureAlive();
-    if (!guard.ok) return guard;
-    return ffiGetHistoricalQuery(guard.value, offset);
+  getHistoricalQuery(_offset: number): Result<string | null> {
+    return unavailable("getHistoricalQuery");
   }
 
   /**
-   * Subscribe to filesystem changes matching `pattern`.
-   *
-   * Pattern semantics:
-   * - Wildcards (`*.rs`, `src/**`, `./**\/*.ts`) — glob matched against the
-   *   base-path-relative path. Absolute globs must be under the base path.
-   * - No wildcards — resolved against the base path (must stay inside it):
-   *   an existing directory subscribes to its whole subtree, anything else
-   *   is an exact file path.
-   * - Omitted — subscribes to the entire indexed tree: `watch(callback)`.
-   *
-   * Push-based: events are delivered by the native watcher through a single
-   * process-wide callback trampoline (no polling, no idle wakeups). The
-   * callback receives normalized batches of up to 128 events on the JS event
-   * loop, with each path appearing at most once.
-   *
-   * Requires the instance to be created with watching enabled (default).
-   *
-   * @param pattern - Glob pattern, exact file path, or directory
-   * @param callback - Invoked with each batch of events
-   * @param options - Watch options
-   * @returns Unsubscribe handle; call it to stop
-   *
-   * @example
-   * ```typescript
-   * const sub = finder.watch("**\/*.rs", (events) => {
-   *   for (const e of events) console.log(e.kind, e.path);
-   * });
-   * if (sub.ok) sub.value(); // unsubscribe
-   *
-   * // no pattern: everything under the indexed base path
-   * const all = finder.watch((events) => console.log(events.length));
-   * ```
+   * Unavailable: the shared service delivers no filesystem events to programs.
    */
   watch(callback: WatchBatchCallback, options?: WatchOptions): Result<WatchUnsubscribe>;
   watch(
@@ -639,52 +679,21 @@ export class FileFinder implements FileFinderApi {
     callback: WatchBatchCallback,
     options?: WatchOptions,
   ): Result<WatchUnsubscribe>;
-  watch(
-    patternOrCallback: string | WatchBatchCallback,
-    callbackOrOptions?: WatchBatchCallback | WatchOptions,
-    maybeOptions?: WatchOptions,
-  ): Result<WatchUnsubscribe> {
-    // Overload shift: watch(cb, opts?) -> empty pattern = whole tree.
-    const noPattern = typeof patternOrCallback === "function";
-    const pattern = noPattern ? "" : patternOrCallback;
-    const callback = noPattern
-      ? patternOrCallback
-      : (callbackOrOptions as WatchBatchCallback);
-    const options = noPattern
-      ? (callbackOrOptions as WatchOptions | undefined)
-      : maybeOptions;
-
-    if (typeof callback !== "function") {
-      return err("watch callback must be a function");
-    }
-
-    const guard = this.ensureAlive();
-    if (!guard.ok) return guard;
-
-    const created = ffiWatch(guard.value, pattern, options?.ignore ?? [], callback);
-    if (!created.ok) return created;
-
-    const watchId = created.value;
-    this.watchers.add(watchId);
-
-    return {
-      ok: true,
-      value: () => {
-        if (!this.watchers.delete(watchId)) return;
-        if (this.handle !== null) ffiUnwatch(this.handle, watchId);
-      },
-    };
+  watch(): Result<WatchUnsubscribe> {
+    return unavailable("watch");
   }
 
   /**
-   * Get health check information.
-   *
-   * Useful for debugging and verifying the file finder is working correctly.
+   * Get health check information, including the instance's index and git
+   * state as its service reports them.
    *
    * @param testPath - Optional path to test git repository detection
    */
-  healthCheck(testPath?: string): Result<HealthCheck> {
-    return ffiHealthCheck(this.handle, testPath || "") as Result<HealthCheck>;
+  healthCheck(testPath?: string): Promise<Result<HealthCheck>> {
+    return this.call(
+      (handle) =>
+        ffiHealthCheck(handle, testPath || "") as Promise<Result<HealthCheck>>,
+    );
   }
 
   /**
@@ -705,13 +714,12 @@ export class FileFinder implements FileFinderApi {
   }
 
   /**
-   * Get a health check without requiring an instance.
-   *
-   * Returns limited info (version + git only, no picker/frecency/query data).
+   * Get a health check without an instance: the library version and the git
+   * repository of `testPath`, without asking a service.
    *
    * @param testPath - Optional path to test git repository detection
    */
   static healthCheckStatic(testPath?: string): Result<HealthCheck> {
-    return ffiHealthCheck(null, testPath || "") as Result<HealthCheck>;
+    return ffiHealthCheckStatic(testPath || "") as Result<HealthCheck>;
   }
 }

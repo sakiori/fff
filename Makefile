@@ -16,7 +16,7 @@ SHELL := bash
 # string rather than the literal `-o` / `pipefail` tokens.
 .SHELLFLAGS := -o pipefail -euc
 
-.PHONY: build build-c-lib install uninstall test test-rust test-rescan test-rescan-known-defects rescan-probe test-c-smoke test-c-api test-lua test-lua-snap test-version test-bun test-node prepare-bun prepare-bun-packaged prepare-node set-npm-version header test-stress test-stress-seeded test-stress-random test-stress-regressions test-stress-repos test-node-stress sync-js-api sync-js-api-check bump-homebrew-formula bump-install-mcp-sh test-bun-compile bench-search bench-grep bench-definition
+.PHONY: build build-c-lib install uninstall test test-rust test-rescan test-rescan-known-defects rescan-probe test-c-smoke test-c-api test-lua test-lua-snap test-version test-bun test-node prepare-bun prepare-bun-packaged prepare-node build-node-native stage-node-platform set-npm-version header test-stress test-stress-seeded test-stress-random test-stress-regressions test-stress-repos test-node-stress sync-js-api sync-js-api-check bump-homebrew-formula bump-install-mcp-sh test-bun-compile bench-search bench-grep bench-definition
 
 all: format test lint
 
@@ -90,10 +90,10 @@ build-mcp:
 	cargo build --release -p fff-mcp
 
 test-mcp:
-	cargo test -p fff-mcp -p fff-search -- $(TEST_ARGS)
+	cargo test -p fff-mcp -p fff-service -p fff-search -- $(TEST_ARGS)
 
 lint-mcp:
-	cargo clippy -p fff-mcp -p fff-search --all-targets -- -D warnings
+	cargo clippy -p fff-mcp -p fff-service -p fff-search --all-targets -- -D warnings
 
 test-rust:
 	cargo test --workspace --no-default-features --features zlob --exclude fff-nvim --exclude fff-python -- $(TEST_ARGS)
@@ -182,11 +182,36 @@ prepare-bun: build-e2e sync-js-api
 	cp target/release/libfff_c.so packages/fff-bun/bin/ 2>/dev/null || true; \
 	cp target/release/fff_c.dll packages/fff-bun/bin/ 2>/dev/null || true
 
-prepare-node: build-e2e sync-js-api
+# fff-node loads libfff_c and starts the shared service from fff-mcp; both come from one tree
+# so that they share its build identity. Separate invocations keep fff-mcp's
+# dependency features out of libfff_c.
+build-node-native:
+	cargo build --release -p fff-mcp --no-default-features --features zlob
+	cargo build --release -p fff-c --no-default-features --features zlob
+
+prepare-node: build-node-native sync-js-api
 	mkdir -p packages/fff-node/bin
 	cp target/release/libfff_c.dylib packages/fff-node/bin/ 2>/dev/null || true; \
 	cp target/release/libfff_c.so packages/fff-node/bin/ 2>/dev/null || true; \
 	cp target/release/fff_c.dll packages/fff-node/bin/ 2>/dev/null || true
+	cp target/release/fff-mcp packages/fff-node/bin/ 2>/dev/null || true; \
+	cp target/release/fff-mcp.exe packages/fff-node/bin/ 2>/dev/null || true
+
+# Stages the host's build into its @sakiori/fff-bin-* package.
+stage-node-platform: build-node-native
+	@machine=$$(uname -m); \
+	case "$$machine" in \
+	  x86_64|amd64) arch=x64 ;; \
+	  aarch64|arm64) arch=arm64 ;; \
+	  *) echo "unsupported arch: $$machine" >&2; exit 1 ;; \
+	esac; \
+	case "$$(uname -s)" in \
+	  Darwin) pkg=fff-bin-darwin-$$arch ;; \
+	  Linux) case "$$(ldd --version 2>&1 || true)" in *[Mm][Uu][Ss][Ll]*) libc=musl ;; *) libc=gnu ;; esac; \
+	    pkg=fff-bin-linux-$$arch-$$libc ;; \
+	  *) echo "unsupported OS: $$(uname -s)" >&2; exit 1 ;; \
+	esac; \
+	node scripts/stage-node-platform.mjs target/release packages/$$pkg
 
 test-bun: prepare-bun
 	cd packages/fff-bun && bun test test/
@@ -203,7 +228,7 @@ prepare-bun-packaged: prepare-bun
 	case "$$(uname -s)" in \
 	  Darwin) lib=libfff_c.dylib; pkg=fff-bin-darwin-$$arch ;; \
 	  Linux) lib=libfff_c.so; \
-	    if ldd --version 2>&1 | grep -qi musl; then libc=musl; else libc=gnu; fi; \
+	    case "$$(ldd --version 2>&1 || true)" in *[Mm][Uu][Ss][Ll]*) libc=musl ;; *) libc=gnu ;; esac; \
 	    pkg=fff-bin-linux-$$arch-$$libc ;; \
 	  MINGW*|MSYS*|CYGWIN*|Windows_NT) lib=fff_c.dll; pkg=fff-bin-win32-$$arch ;; \
 	  *) echo "unsupported OS: $$(uname -s)" >&2; exit 1 ;; \
@@ -222,8 +247,8 @@ prepare-bun-packaged: prepare-bun
 test-bun-compile: prepare-bun-packaged
 	cd packages/fff-bun && \
 		if [ "$$(uname -s)" = "Linux" ]; then \
-		  if ldd --version 2>&1 | grep -qi musl; then DEFINE='--define FFF_LIBC="musl"'; \
-		  else DEFINE='--define FFF_LIBC="gnu"'; fi; \
+		  case "$$(ldd --version 2>&1 || true)" in *[Mm][Uu][Ss][Ll]*) DEFINE='--define FFF_LIBC="musl"' ;; \
+		  *) DEFINE='--define FFF_LIBC="gnu"' ;; esac; \
 		else DEFINE=""; fi; \
 		bun build --compile $$DEFINE ./examples/glob-bench.ts --outfile ./glob-bench-bin && \
 		EXE=./glob-bench-bin; [ -f "$$EXE.exe" ] && EXE="$$EXE.exe"; \
@@ -233,7 +258,7 @@ test-bun-compile: prepare-bun-packaged
 	rm -f packages/fff-bun/glob-bench-bin packages/fff-bun/glob-bench-bin.exe
 
 test-node: prepare-node
-	cd packages/fff-node && npm run build && node test/e2e.mjs && node test/watch.mjs
+	cd packages/fff-node && npm run build && npm test
 
 test-js: test-bun test-node
 

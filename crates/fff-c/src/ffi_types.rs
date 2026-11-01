@@ -10,9 +10,43 @@ use fff::{
     DirItem, DirSearchResult, FileItem, GrepMatch, GrepResult, Location, MixedItemRef,
     MixedSearchResult, Score, SearchResult,
 };
+use fff_service::program as service;
 
 /// Current used version of [`FffCreateOptions`].
 pub const FFF_CREATE_OPTIONS_VERSION: u32 = 2;
+
+/// `int_value` of a failed call on a service-backed instance without a more
+/// specific kind.
+pub const FFF_ERROR_FAILED: i64 = 0;
+
+/// `int_value` of a failed call whose instance lost its service: it did not
+/// answer in time, could not be reached or started, or the connection broke.
+/// The instance's next call opens a new session.
+pub const FFF_ERROR_LOST_SERVICE: i64 = 1;
+
+/// `int_value` of a failed grep whose cursor belongs to an index the session
+/// no longer uses; search again without it.
+pub const FFF_ERROR_STALE_CURSOR: i64 = 2;
+
+/// `int_value` of a failed call that has no equivalent over the shared service.
+pub const FFF_ERROR_UNAVAILABLE: i64 = 3;
+
+/// `int_value` of a failed call whose directory cannot be served: it is
+/// missing or inaccessible, or it is the home directory or filesystem root
+/// without the option that allows indexing it.
+pub const FFF_ERROR_SCOPE_UNAVAILABLE: i64 = 4;
+
+/// `int_value` of a failed call whose request the library or the service
+/// refused as invalid.
+pub const FFF_ERROR_INVALID_REQUEST: i64 = 5;
+
+/// `int_value` of a failed call that names a path outside the instance's
+/// directory.
+pub const FFF_ERROR_OUTSIDE_SCOPE: i64 = 6;
+
+/// `int_value` of a failed call that met the index while its coverage changed;
+/// the same call succeeds when retried.
+pub const FFF_ERROR_RETRY: i64 = 7;
 
 /// Options for `fff_create_instance_with`.
 ///
@@ -160,6 +194,20 @@ impl FffFileItem {
 }
 
 impl FffFileItem {
+    pub fn from_entry(entry: &service::FileEntry) -> Self {
+        FffFileItem {
+            relative_path: cstring_new(&entry.relative_path),
+            file_name: cstring_new(&entry.file_name),
+            git_status: git_status_string(entry.git_status),
+            size: entry.size,
+            modified: entry.modified,
+            access_frecency_score: entry.access_frecency_score.into(),
+            modification_frecency_score: entry.modification_frecency_score.into(),
+            total_frecency_score: total_frecency(entry),
+            is_binary: entry.is_binary,
+        }
+    }
+
     /// ## Safety
     /// All string pointers must have been allocated by `CString::into_raw`.
     pub unsafe fn free_strings(&mut self) {
@@ -207,6 +255,24 @@ impl From<&Score> for FffScore {
             path_alignment_bonus: score.path_alignment_bonus,
             exact_match: score.exact_match,
             match_type: cstring_new(score.match_type),
+        }
+    }
+}
+
+impl From<&service::Score> for FffScore {
+    fn from(score: &service::Score) -> Self {
+        FffScore {
+            total: score.total,
+            base_score: score.base_score,
+            filename_bonus: score.filename_bonus,
+            special_filename_bonus: score.special_filename_bonus,
+            frecency_boost: score.frecency_boost,
+            distance_penalty: score.distance_penalty,
+            current_file_penalty: score.current_file_penalty,
+            combo_match_boost: score.combo_match_boost,
+            path_alignment_bonus: score.path_alignment_bonus,
+            exact_match: score.exact_match,
+            match_type: cstring_new(&score.match_type),
         }
     }
 }
@@ -270,6 +336,17 @@ impl From<Option<&Location>> for FffLocation {
     }
 }
 
+impl From<Option<service::Location>> for FffLocation {
+    fn from(location: Option<service::Location>) -> Self {
+        let location = location.map(|location| match location {
+            service::Location::Line(line) => Location::Line(line),
+            service::Location::Position { line, col } => Location::Position { line, col },
+            service::Location::Range { start, end } => Location::Range { start, end },
+        });
+        FffLocation::from(location.as_ref())
+    }
+}
+
 /// Search result returned by `fff_search`; free with `fff_free_search_result`.
 #[repr(C)]
 pub struct FffSearchResult {
@@ -308,6 +385,22 @@ impl FffSearchResult {
             total_matched: result.total_matched as u32,
             total_files: result.total_files as u32,
             location: FffLocation::from(result.location.as_ref()),
+        }))
+    }
+}
+
+impl FffSearchResult {
+    pub fn from_service(result: &service::FileResults) -> *mut Self {
+        let items = result.items.iter().map(FffFileItem::from_entry).collect();
+        let scores = result.scores.iter().map(FffScore::from).collect();
+        let (items, scores, count) = raw_pair(items, scores);
+        Box::into_raw(Box::new(FffSearchResult {
+            items,
+            scores,
+            count,
+            total_matched: result.total_matched as u32,
+            total_files: result.total_files as u32,
+            location: FffLocation::from(result.location),
         }))
     }
 }
@@ -397,6 +490,41 @@ impl FffGrepMatch {
         }
     }
 
+    fn from_service(m: &service::GrepMatch, file: &service::FileEntry) -> Self {
+        let ranges: Vec<FffMatchRange> = m
+            .match_ranges
+            .iter()
+            .map(|&(start, end)| FffMatchRange { start, end })
+            .collect();
+        let (match_ranges, match_ranges_count) = vec_to_raw(ranges);
+        let (context_before, context_before_count) = strings_to_raw(&m.context_before);
+        let (context_after, context_after_count) = strings_to_raw(&m.context_after);
+        FffGrepMatch {
+            relative_path: cstring_new(&file.relative_path),
+            file_name: cstring_new(&file.file_name),
+            git_status: git_status_string(file.git_status),
+            line_content: cstring_new(&m.line_content),
+            match_ranges,
+            context_before,
+            context_after,
+            size: file.size,
+            modified: file.modified,
+            total_frecency_score: total_frecency(file),
+            access_frecency_score: file.access_frecency_score.into(),
+            modification_frecency_score: file.modification_frecency_score.into(),
+            line_number: m.line_number,
+            byte_offset: m.byte_offset,
+            col: m.col as u32,
+            match_ranges_count,
+            context_before_count,
+            context_after_count,
+            fuzzy_score: m.fuzzy_score.unwrap_or(0),
+            has_fuzzy_score: m.fuzzy_score.is_some(),
+            is_binary: file.is_binary,
+            is_definition: m.is_definition,
+        }
+    }
+
     /// ## Safety
     /// All pointers must have been allocated by the corresponding `from_core`.
     pub unsafe fn free_fields(&mut self) {
@@ -469,6 +597,35 @@ impl FffGrepResult {
             total_files: result.total_files as u32,
             filtered_file_count: result.filtered_file_count as u32,
             next_file_offset: result.next_file_offset as u32,
+            regex_fallback_error: match &result.regex_fallback_error {
+                Some(e) => cstring_new(e),
+                None => ptr::null_mut(),
+            },
+        }))
+    }
+}
+
+impl FffGrepResult {
+    /// A match whose file index is out of range would be a service bug; it is dropped.
+    pub fn from_service(result: &service::GrepResults) -> *mut Self {
+        let items: Vec<FffGrepMatch> = result
+            .matches
+            .iter()
+            .filter_map(|m| {
+                let file = result.files.get(m.file)?;
+                Some(FffGrepMatch::from_service(m, file))
+            })
+            .collect();
+        let total_matched = items.len() as u32;
+        let (items_ptr, count) = vec_to_raw(items);
+        Box::into_raw(Box::new(FffGrepResult {
+            items: items_ptr,
+            count,
+            total_matched,
+            total_files_searched: result.total_files_searched as u32,
+            total_files: result.total_files as u32,
+            filtered_file_count: result.filtered_file_count as u32,
+            next_file_offset: result.next_cursor.as_ref().map_or(0, |c| c.offset as u32),
             regex_fallback_error: match &result.regex_fallback_error {
                 Some(e) => cstring_new(e),
                 None => ptr::null_mut(),
@@ -558,11 +715,17 @@ impl FffResult {
 
     /// Create an error result, returned as heap pointer.
     pub fn err(error: &str) -> *mut Self {
+        Self::err_with(error, 0)
+    }
+
+    /// A failure whose `int_value` classifies it, such as a service instance that lost its
+    /// service.
+    pub fn err_with(error: &str, int_value: i64) -> *mut Self {
         Box::into_raw(Box::new(FffResult {
             success: false,
             error: CString::new(error).unwrap_or_default().into_raw(),
             handle: ptr::null_mut(),
-            int_value: 0,
+            int_value,
         }))
     }
 }
@@ -582,6 +745,14 @@ impl FffDirItem {
             relative_path: cstring_new(&item.relative_path(picker)),
             dir_name: cstring_new(&item.dir_name(picker)),
             max_access_frecency: item.max_access_frecency(),
+        }
+    }
+
+    pub fn from_entry(entry: &service::DirEntry) -> Self {
+        FffDirItem {
+            relative_path: cstring_new(&entry.relative_path),
+            dir_name: cstring_new(&entry.dir_name),
+            max_access_frecency: entry.max_access_frecency,
         }
     }
 
@@ -639,6 +810,21 @@ impl FffDirSearchResult {
     }
 }
 
+impl FffDirSearchResult {
+    pub fn from_service(result: &service::DirResults) -> *mut Self {
+        let items = result.items.iter().map(FffDirItem::from_entry).collect();
+        let scores = result.scores.iter().map(FffScore::from).collect();
+        let (items, scores, count) = raw_pair(items, scores);
+        Box::into_raw(Box::new(FffDirSearchResult {
+            items,
+            scores,
+            count,
+            total_matched: result.total_matched as u32,
+            total_dirs: result.total_dirs as u32,
+        }))
+    }
+}
+
 /// A single item in a mixed (files + directories) search result.
 /// `item_type`: 0 = file, 1 = directory. Strings are owned by the parent
 /// `FffMixedSearchResult`.
@@ -687,6 +873,35 @@ impl FffMixedItem {
                 access_frecency_score: dir.max_access_frecency() as i64,
                 modification_frecency_score: 0,
                 total_frecency_score: dir.max_access_frecency() as i64,
+                is_binary: false,
+            },
+        }
+    }
+
+    pub fn from_entry(entry: &service::MixedEntry) -> Self {
+        match entry {
+            service::MixedEntry::File(file) => FffMixedItem {
+                item_type: 0,
+                relative_path: cstring_new(&file.relative_path),
+                display_name: cstring_new(&file.file_name),
+                git_status: git_status_string(file.git_status),
+                size: file.size,
+                modified: file.modified,
+                access_frecency_score: file.access_frecency_score.into(),
+                modification_frecency_score: file.modification_frecency_score.into(),
+                total_frecency_score: total_frecency(file),
+                is_binary: file.is_binary,
+            },
+            service::MixedEntry::Dir(dir) => FffMixedItem {
+                item_type: 1,
+                relative_path: cstring_new(&dir.relative_path),
+                display_name: cstring_new(&dir.dir_name),
+                git_status: cstring_new(""),
+                size: 0,
+                modified: 0,
+                access_frecency_score: dir.max_access_frecency.into(),
+                modification_frecency_score: 0,
+                total_frecency_score: dir.max_access_frecency.into(),
                 is_binary: false,
             },
         }
@@ -755,6 +970,23 @@ impl FffMixedSearchResult {
     }
 }
 
+impl FffMixedSearchResult {
+    pub fn from_service(result: &service::MixedResults) -> *mut Self {
+        let items = result.items.iter().map(FffMixedItem::from_entry).collect();
+        let scores = result.scores.iter().map(FffScore::from).collect();
+        let (items, scores, count) = raw_pair(items, scores);
+        Box::into_raw(Box::new(FffMixedSearchResult {
+            items,
+            scores,
+            count,
+            total_matched: result.total_matched as u32,
+            total_files: result.total_files as u32,
+            total_dirs: result.total_dirs as u32,
+            location: FffLocation::from(result.location),
+        }))
+    }
+}
+
 /// Scan progress returned by `fff_get_scan_progress`.
 /// The caller must free this with `fff_free_scan_progress`.
 #[repr(C)]
@@ -774,6 +1006,36 @@ impl From<fff::file_picker::ScanProgress> for FffScanProgress {
             is_warmup_complete: p.is_warmup_complete,
         }
     }
+}
+
+impl From<service::ScanProgress> for FffScanProgress {
+    fn from(p: service::ScanProgress) -> Self {
+        Self {
+            scanned_files_count: p.files as u64,
+            is_scanning: p.scanning,
+            is_watcher_ready: p.watcher_ready,
+            is_warmup_complete: p.warmup_complete,
+        }
+    }
+}
+
+fn git_status_string(bits: Option<u32>) -> *mut c_char {
+    cstring_new(crate::packed::git_status(bits))
+}
+
+fn total_frecency(entry: &service::FileEntry) -> i64 {
+    crate::packed::total_frecency(entry)
+}
+
+// Both arrays are freed with one count, so they are cut to the same length.
+fn raw_pair<I, S>(mut items: Vec<I>, mut scores: Vec<S>) -> (*mut I, *mut S, u32) {
+    let len = items.len().min(scores.len());
+    items.truncate(len);
+    scores.truncate(len);
+    let count = len as u32;
+    let (items, _) = vec_to_raw(items);
+    let (scores, _) = vec_to_raw(scores);
+    (items, scores, count)
 }
 
 #[cfg(test)]

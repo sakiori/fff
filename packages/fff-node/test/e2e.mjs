@@ -2,7 +2,8 @@ import { after, before, describe, it } from "node:test";
 import { strict as assert } from "node:assert";
 import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
-import { FileFinder } from "../dist/index.js";
+import { ErrorCode, FileFinder } from "../dist/index.js";
+import { disposableNamespace, removeStateRoot } from "./support.mjs";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const REPO_ROOT = resolve(__dirname, "..", "..", "..");
@@ -10,33 +11,36 @@ const normalizePath = (p) => p.replace(/\\/g, "/");
 
 /** @type {import("../dist/finder.js").FileFinder | null} */
 let finder = null;
+const namespace = disposableNamespace();
 
 describe("fff-node", { concurrency: 1 }, () => {
   before(async () => {
-    const result = FileFinder.create({ basePath: REPO_ROOT });
+    const result = await FileFinder.create({ basePath: REPO_ROOT, ...namespace.options });
     assert.ok(result.ok, `create failed: ${!result.ok ? result.error : ""}`);
     finder = result.value;
 
-    const wait = await finder.waitForScan(5_000);
+    const wait = await finder.waitForIndexReady(30_000);
     if (!wait.ok) {
-      assert.ok(wait.ok, `waitForScan failed: ${wait.error}`);
+      assert.ok(wait.ok, `waitForIndexReady failed: ${wait.error}`);
     }
 
-    assert.equal(wait.value, true, "scan should finish within 5s");
+    assert.equal(wait.value, true, "the index should be ready within 30s");
   });
 
-  after(() => {
+  after(async () => {
     if (finder && !finder.isDestroyed) {
-      finder.destroy();
+      await finder.destroy();
     }
+    namespace.cleanup();
+    removeStateRoot();
   });
 
-  it("isAvailable returns true when the native library is loadable", () => {
+  it("isAvailable returns true when the native library is loadable", async () => {
     assert.equal(FileFinder.isAvailable(), true);
   });
 
-  it("getScanProgress reports >100 indexed files", () => {
-    const r = finder.getScanProgress();
+  it("getScanProgress reports >100 indexed files", async () => {
+    const r = await finder.getScanProgress();
     assert.ok(r.ok, "getScanProgress failed");
     assert.equal(typeof r.value.scannedFilesCount, "number");
     assert.ok(
@@ -48,8 +52,8 @@ describe("fff-node", { concurrency: 1 }, () => {
   });
 
   describe("search", { concurrency: 1 }, () => {
-    it("finds the root Cargo.toml", () => {
-      const r = finder.fileSearch("Cargo.toml", { pageSize: 10 });
+    it("finds the root Cargo.toml", async () => {
+      const r = await finder.fileSearch("Cargo.toml", { pageSize: 10 });
       assert.ok(r.ok, `search failed: ${!r.ok ? r.error : ""}`);
       const paths = r.value.items.map((i) => i.relativePath);
       assert.ok(
@@ -58,8 +62,8 @@ describe("fff-node", { concurrency: 1 }, () => {
       );
     });
 
-    it("finds crates/fff-c/src/lib.rs", () => {
-      const r = finder.fileSearch("lib.rs", { pageSize: 20 });
+    it("finds crates/fff-c/src/lib.rs", async () => {
+      const r = await finder.fileSearch("lib.rs", { pageSize: 20 });
       assert.ok(r.ok);
       const paths = r.value.items.map((i) => i.relativePath);
       assert.ok(
@@ -68,8 +72,8 @@ describe("fff-node", { concurrency: 1 }, () => {
       );
     });
 
-    it("respects pageSize", () => {
-      const r = finder.fileSearch("lua", { pageSize: 3 });
+    it("respects pageSize", async () => {
+      const r = await finder.fileSearch("lua", { pageSize: 3 });
       assert.ok(r.ok);
       assert.ok(
         r.value.items.length <= 3,
@@ -77,8 +81,8 @@ describe("fff-node", { concurrency: 1 }, () => {
       );
     });
 
-    it("items contain all required fields", () => {
-      const r = finder.fileSearch("Cargo.toml", { pageSize: 1 });
+    it("items contain all required fields", async () => {
+      const r = await finder.fileSearch("Cargo.toml", { pageSize: 1 });
       assert.ok(r.ok);
       const item = r.value.items[0];
       for (const f of ["relativePath", "fileName", "gitStatus"]) {
@@ -89,8 +93,8 @@ describe("fff-node", { concurrency: 1 }, () => {
       }
     });
 
-    it("scores contain all required fields", () => {
-      const r = finder.fileSearch("Cargo.toml", { pageSize: 1 });
+    it("scores contain all required fields", async () => {
+      const r = await finder.fileSearch("Cargo.toml", { pageSize: 1 });
       assert.ok(r.ok);
       assert.ok(r.value.scores.length > 0);
       const s = r.value.scores[0];
@@ -100,8 +104,8 @@ describe("fff-node", { concurrency: 1 }, () => {
       assert.equal(typeof s.matchType, "string");
     });
 
-    it("exact filename query decodes exactMatch=true (#888)", () => {
-      const r = finder.fileSearch("Cargo.toml", { pageSize: 5 });
+    it("exact filename query decodes exactMatch=true (#888)", async () => {
+      const r = await finder.fileSearch("Cargo.toml", { pageSize: 5 });
       assert.ok(r.ok);
       const idx = r.value.items.findIndex((i) => i.relativePath === "Cargo.toml");
       assert.ok(idx >= 0, "root Cargo.toml should be in results");
@@ -111,24 +115,24 @@ describe("fff-node", { concurrency: 1 }, () => {
       assert.equal(typeof s.pathAlignmentBonus, "number");
     });
 
-    it("totalMatched <= totalFiles", () => {
-      const r = finder.fileSearch("rs", { pageSize: 1 });
+    it("totalMatched <= totalFiles", async () => {
+      const r = await finder.fileSearch("rs", { pageSize: 1 });
       assert.ok(r.ok);
       assert.ok(r.value.totalMatched > 0);
       assert.ok(r.value.totalFiles > 100);
       assert.ok(r.value.totalFiles >= r.value.totalMatched);
     });
 
-    it("empty query returns files", () => {
-      const r = finder.fileSearch("", { pageSize: 5 });
+    it("empty query returns files", async () => {
+      const r = await finder.fileSearch("", { pageSize: 5 });
       assert.ok(r.ok, `empty query failed: ${!r.ok ? r.error : ""}`);
       assert.equal(typeof r.value.totalFiles, "number");
     });
   });
 
   describe("glob", { concurrency: 1 }, () => {
-    it("filters by extension via raw glob pattern", () => {
-      const r = finder.glob("**/*.rs", { pageSize: 50 });
+    it("filters by extension via raw glob pattern", async () => {
+      const r = await finder.glob("**/*.rs", { pageSize: 50 });
       assert.ok(r.ok, `glob failed: ${!r.ok ? r.error : ""}`);
       assert.ok(r.value.items.length > 0, "expected at least one .rs file");
       for (const item of r.value.items) {
@@ -139,29 +143,30 @@ describe("fff-node", { concurrency: 1 }, () => {
       }
     });
 
-    it("returns empty result for non-matching pattern", () => {
-      const r = finder.glob("**/this-extension-does-not-exist-anywhere.zzz");
+    it("returns empty result for non-matching pattern", async () => {
+      const r = await finder.glob("**/this-extension-does-not-exist-anywhere.zzz");
       assert.ok(r.ok);
       assert.equal(r.value.items.length, 0);
     });
 
-    it("rejects empty pattern", () => {
-      const r = finder.glob("");
+    it("rejects empty pattern", async () => {
+      const r = await finder.glob("");
       assert.equal(r.ok, false);
+      assert.equal(r.code, ErrorCode.invalidRequest, r.error);
     });
 
-    it("respects pageSize", () => {
-      const r = finder.glob("**/*.rs", { pageSize: 3 });
+    it("respects pageSize", async () => {
+      const r = await finder.glob("**/*.rs", { pageSize: 3 });
       assert.ok(r.ok);
       assert.ok(r.value.items.length <= 3);
     });
   });
 
   describe("grep", { concurrency: 1 }, () => {
-    it("finds FffResult in Rust sources", () => {
+    it("finds FffResult in Rust sources", async () => {
       // Constrain to .rs files so the assertion doesn't depend on result ordering
       // or content-indexing timing for other file types.
-      const rustResults = finder.grep("*.rs FffResult", { mode: "plain" });
+      const rustResults = await finder.grep("*.rs FffResult", { mode: "plain" });
       assert.ok(
         rustResults.ok,
         `grep failed: ${!rustResults.ok ? rustResults.error : ""}`,
@@ -174,7 +179,7 @@ describe("fff-node", { concurrency: 1 }, () => {
         rustResults.value.items.some((m) => m.relativePath.endsWith(".rs")),
       );
 
-      const cResults = finder.grep("!**/*.{js,ts,rs} FffResult", {
+      const cResults = await finder.grep("!**/*.{js,ts,rs} FffResult", {
         mode: "plain",
       });
       assert.ok(
@@ -190,8 +195,8 @@ describe("fff-node", { concurrency: 1 }, () => {
       );
     });
 
-    it("match items contain all required fields", () => {
-      const r = finder.grep("FffResult", { mode: "plain" });
+    it("match items contain all required fields", async () => {
+      const r = await finder.grep("FffResult", { mode: "plain" });
       assert.ok(r.ok);
       const m = r.value.items[0];
       assert.equal(typeof m.relativePath, "string");
@@ -205,8 +210,8 @@ describe("fff-node", { concurrency: 1 }, () => {
       console.log(m.matchRanges);
     });
 
-    it("plain grep on text files never reports binary/definition/fuzzy flags (#888)", () => {
-      const r = finder.grep("FffResult", { mode: "plain", pageSize: 100 });
+    it("plain grep on text files never reports binary/definition/fuzzy flags (#888)", async () => {
+      const r = await finder.grep("FffResult", { mode: "plain", pageSize: 100 });
       assert.ok(r.ok);
       assert.ok(r.value.items.length > 1);
       for (const m of r.value.items) {
@@ -216,8 +221,8 @@ describe("fff-node", { concurrency: 1 }, () => {
       }
     });
 
-    it("fuzzy grep decodes fuzzyScore as u16", () => {
-      const r = finder.grep("FfRslt", { mode: "fuzzy", pageSize: 20 });
+    it("fuzzy grep decodes fuzzyScore as u16", async () => {
+      const r = await finder.grep("FfRslt", { mode: "fuzzy", pageSize: 20 });
       assert.ok(r.ok);
       assert.ok(r.value.items.length > 0);
       for (const m of r.value.items) {
@@ -226,19 +231,19 @@ describe("fff-node", { concurrency: 1 }, () => {
       }
     });
 
-    it("pagination returns a second page", () => {
-      const r = finder.grep("fn", { mode: "plain" });
+    it("pagination returns a second page", async () => {
+      const r = await finder.grep("fn", { mode: "plain" });
       assert.ok(r.ok);
       if (r.value.nextCursor) {
-        const r2 = finder.grep("fn", { cursor: r.value.nextCursor });
+        const r2 = await finder.grep("fn", { cursor: r.value.nextCursor });
         assert.ok(r2.ok, `page 2 failed: ${!r2.ok ? r2.error : ""}`);
         assert.equal(typeof r2.value.totalMatched, "number");
       }
     });
 
-    it("respects pageSize", () => {
+    it("respects pageSize", async () => {
       // Cap to one match per file so pageSize bounds the total deterministically.
-      const unbounded = finder.grep("fn", {
+      const unbounded = await finder.grep("fn", {
         mode: "plain",
         maxMatchesPerFile: 1,
       });
@@ -248,7 +253,7 @@ describe("fff-node", { concurrency: 1 }, () => {
       );
       assert.ok(unbounded.value.items.length > 2);
 
-      const limited = finder.grep("fn", {
+      const limited = await finder.grep("fn", {
         mode: "plain",
         maxMatchesPerFile: 1,
         pageSize: 2,
@@ -265,14 +270,14 @@ describe("fff-node", { concurrency: 1 }, () => {
       assert.ok(limited.value.nextCursor !== null, "nextCursor should be set");
     });
 
-    it("regex mode matches pub fn declarations", () => {
-      const r = finder.grep("pub fn \\w+", { mode: "regex" });
+    it("regex mode matches pub fn declarations", async () => {
+      const r = await finder.grep("pub fn \\w+", { mode: "regex" });
       assert.ok(r.ok, `regex grep failed: ${!r.ok ? r.error : ""}`);
       assert.ok(r.value.items.length > 0);
     });
 
-    it("decodes before/after context lines", () => {
-      const r = finder.grep(
+    it("decodes before/after context lines", async () => {
+      const r = await finder.grep(
         "LOLLOWOIEJIWOIUOIWUIWUIOUWE", // the random text visible here
         {
           mode: "plain",
@@ -293,50 +298,45 @@ describe("fff-node", { concurrency: 1 }, () => {
           .map((m) => normalizePath(m.relativePath))
           .join(", ")}`,
       );
-      assert.deepEqual(match.contextBefore, ["      const r = finder.grep("]);
+      assert.deepEqual(match.contextBefore, ["      const r = await finder.grep("]);
       assert.deepEqual(match.contextAfter, ["        {"]);
     });
   });
 
   describe("multiGrep", { concurrency: 1 }, () => {
-    it("finds lines matching any of the C FFI function names", () => {
-      const r = finder.multiGrep({
+    it("finds lines matching any of the C FFI function names", async () => {
+      const r = await finder.multiGrep({
         patterns: ["fff_create_instance", "fff_destroy", "fff_search"],
       });
       assert.ok(r.ok, `multiGrep failed: ${!r.ok ? r.error : ""}`);
       assert.ok(r.value.items.length > 0);
     });
 
-    it("rejects empty patterns array", () => {
-      const r = finder.multiGrep({ patterns: [] });
+    it("rejects empty patterns array", async () => {
+      const r = await finder.multiGrep({ patterns: [] });
       assert.ok(!r.ok);
+      assert.equal(r.code, ErrorCode.invalidRequest);
     });
   });
 
-  it("refreshGitStatus returns a positive count", () => {
-    const r = finder.refreshGitStatus();
-    assert.ok(r.ok, `refreshGitStatus failed: ${!r.ok ? r.error : ""}`);
-    assert.equal(typeof r.value, "number");
-    assert.ok(r.value > 0);
-  });
-
-  it("isScanning returns a boolean", () => {
-    assert.equal(typeof finder.isScanning(), "boolean");
+  it("isScanning returns a boolean", async () => {
+    assert.equal(typeof await finder.isScanning(), "boolean");
   });
 
   describe("healthCheck", { concurrency: 1 }, () => {
-    it("reports initialized state with instance", () => {
-      const r = finder.healthCheck(REPO_ROOT);
+    it("reports initialized state with instance", async () => {
+      const r = await finder.healthCheck(REPO_ROOT);
       assert.ok(r.ok, `healthCheck failed: ${!r.ok ? r.error : ""}`);
       assert.equal(typeof r.value.version, "string");
       assert.ok(r.value.version.length > 0);
       assert.equal(r.value.git.available, true);
       assert.equal(r.value.git.repositoryFound, true);
+      assert.equal(typeof r.value.git.workdir, "string");
       assert.equal(r.value.filePicker.initialized, true);
       assert.ok(r.value.filePicker.indexedFiles > 100);
     });
 
-    it("static check works without instance", () => {
+    it("static check works without instance", async () => {
       const r = FileFinder.healthCheckStatic(REPO_ROOT);
       assert.ok(r.ok, `static healthCheck failed: ${!r.ok ? r.error : ""}`);
       assert.equal(typeof r.value.version, "string");
@@ -345,40 +345,42 @@ describe("fff-node", { concurrency: 1 }, () => {
     });
   });
 
-  it("create rejects a non-existent path", () => {
-    const r = FileFinder.create({ basePath: "/nonexistent/fff-test-path" });
+  it("create rejects a non-existent path", async () => {
+    const r = await FileFinder.create({
+      basePath: "/nonexistent/fff-test-path",
+      ...namespace.options,
+    });
     assert.ok(!r.ok);
-    assert.ok(
-      r.error.toLowerCase().includes("invalid path") ||
-        r.error.toLowerCase().includes("not exist"),
-      `unexpected error: ${r.error}`,
-    );
+    assert.equal(r.code, ErrorCode.scopeUnavailable, r.error);
+    assert.ok(r.error.toLowerCase().includes("not exist"), `unexpected error: ${r.error}`);
   });
 
   // This must be the last describe block since it destroys the shared instance.
   describe("after destroy", { concurrency: 1 }, () => {
-    before(() => {
-      finder.destroy();
+    before(async () => {
+      await finder.destroy();
     });
 
-    it("isDestroyed is true", () => {
+    it("isDestroyed is true", async () => {
       assert.equal(finder.isDestroyed, true);
     });
 
-    it("search returns an error", () => {
-      const r = finder.fileSearch("test");
+    it("search returns an error", async () => {
+      const r = await finder.fileSearch("test");
       assert.ok(!r.ok);
+      assert.equal(r.code, ErrorCode.destroyed);
       assert.ok(r.error.includes("destroyed"));
     });
 
-    it("grep returns an error", () => {
-      const r = finder.grep("test");
+    it("grep returns an error", async () => {
+      const r = await finder.grep("test");
       assert.ok(!r.ok);
+      assert.equal(r.code, ErrorCode.destroyed);
       assert.ok(r.error.includes("destroyed"));
     });
 
-    it("double destroy is a safe no-op", () => {
-      finder.destroy();
+    it("double destroy is a safe no-op", async () => {
+      await finder.destroy();
       assert.equal(finder.isDestroyed, true);
     });
   });

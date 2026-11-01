@@ -116,6 +116,11 @@ discovery state, and reject incompatible protocols.
 - **WHEN** a service stops or exits idle after a replacement service started in a new namespace directory at the same path
 - **THEN** the replacement's discovery file and socket stay in place and clients can connect to it
 
+#### Scenario: Service started from an application
+- **WHEN** a client whose process inherited open descriptors, a working directory and an environment from an application starts the service
+- **THEN** the service holds none of those descriptors, runs in `/` and keeps only the environment variables it uses
+- **AND** when the client's executable lives inside the running AppImage, the service runs from a copy in its namespace
+
 #### Scenario: Unobservable parent
 - **WHEN** a client cannot observe its parent process and receives no MCP traffic for the idle period
 - **THEN** the client exits and releases its session

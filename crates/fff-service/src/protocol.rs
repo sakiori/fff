@@ -5,14 +5,15 @@ use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
-use crate::shared_index::{IndexOptions, Readiness, Watcher};
-
-// Bump whenever a message below changes shape.
-pub(crate) const PROTOCOL: u32 = 2;
-pub(crate) const MAX_MESSAGE_BYTES: usize = 64 * 1024;
+// Bump whenever a message below or a program frame changes shape.
+pub const PROTOCOL: u32 = 4;
+/// Largest hello the service reads.
+pub const MAX_MESSAGE_BYTES: usize = 64 * 1024;
+/// Largest reply a client reads; a status lists every index and session.
+pub const MAX_REPLY_LINE_BYTES: usize = 64 * 1024 * 1024;
 
 #[derive(Serialize, Deserialize)]
-pub(crate) struct Endpoint {
+pub struct Endpoint {
     pub name: String,
     pub token: String,
     pub protocol: u32,
@@ -21,7 +22,7 @@ pub(crate) struct Endpoint {
 }
 
 #[derive(Serialize, Deserialize)]
-pub(crate) struct Hello {
+pub struct Hello {
     pub token: String,
     pub protocol: u32,
     pub request: Request,
@@ -29,15 +30,22 @@ pub(crate) struct Hello {
 
 // Authentication fields are checked before the version-specific request is decoded.
 #[derive(Deserialize)]
-pub(crate) struct HelloHeader {
+pub struct HelloHeader {
     pub token: String,
     pub protocol: u32,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(tag = "request", rename_all = "snake_case")]
-pub(crate) enum Request {
+pub enum Request {
+    /// An MCP session: after `ready` the connection carries MCP messages.
     Session {
+        scope: PathBuf,
+        options: IndexOptions,
+    },
+    /// A program session: after `ready` the connection carries length-prefixed
+    /// MessagePack frames, see `program`.
+    Program {
         scope: PathBuf,
         options: IndexOptions,
     },
@@ -47,7 +55,7 @@ pub(crate) enum Request {
 
 #[derive(Serialize, Deserialize)]
 #[serde(tag = "reply", rename_all = "snake_case")]
-pub(crate) enum Reply {
+pub enum Reply {
     Ready { warnings: Vec<String> },
     Status(ServiceStatus),
     Stopped,
@@ -56,7 +64,7 @@ pub(crate) enum Reply {
 
 #[derive(Clone, Debug, PartialEq, Eq, thiserror::Error, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
-pub(crate) enum ServiceError {
+pub enum ServiceError {
     #[error("the namespace token does not match the running service")]
     Unauthorized,
     #[error("service protocol {service} is incompatible with client protocol {client}")]
@@ -75,6 +83,9 @@ pub(crate) enum ServiceError {
     Index { root: PathBuf, reason: String },
     #[error("the service registry is unavailable")]
     RegistryUnavailable,
+    #[error("the service reported an error this client does not know")]
+    #[serde(other)]
+    Unknown,
 }
 
 impl ServiceError {
@@ -87,8 +98,38 @@ impl ServiceError {
     }
 }
 
+/// What a session asks of the index that serves it.
+#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct IndexOptions {
+    pub warmup: bool,
+    pub content_indexing: bool,
+    pub watch: bool,
+    pub follow_symlinks: bool,
+    pub max_cached_files: Option<usize>,
+    pub frecency_db: Option<String>,
+    pub enable_home_scan: bool,
+    pub enable_root_scan: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Readiness {
+    Scanning,
+    Ready,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Watcher {
+    Disabled,
+    Starting,
+    Ready,
+    Failed,
+    Stopped,
+}
+
 #[derive(Serialize, Deserialize)]
-pub(crate) struct ServiceStatus {
+pub struct ServiceStatus {
     pub pid: u32,
     pub build: String,
     pub protocol: u32,
@@ -98,56 +139,68 @@ pub(crate) struct ServiceStatus {
 }
 
 #[derive(Serialize, Deserialize)]
-pub(crate) struct IndexStatus {
+pub struct IndexStatus {
     pub id: String,
     pub root: PathBuf,
     pub repository: Option<PathBuf>,
+    pub options: IndexOptions,
     pub state: Readiness,
     pub watcher: Watcher,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SessionKind {
+    Mcp,
+    Program,
+}
+
 #[derive(Serialize, Deserialize)]
-pub(crate) struct SessionStatus {
+pub struct SessionStatus {
+    pub kind: SessionKind,
     pub scope: PathBuf,
     pub index: String,
     pub root: PathBuf,
 }
 
 #[derive(Debug, thiserror::Error)]
-pub(crate) enum MessageError {
+pub enum MessageError {
     #[error("connection closed")]
     Closed,
-    #[error("message exceeds {MAX_MESSAGE_BYTES} bytes")]
-    TooLarge,
+    #[error("message exceeds {0} bytes")]
+    TooLarge(usize),
     #[error("malformed message: {0}")]
     Malformed(#[from] serde_json::Error),
     #[error(transparent)]
     Io(#[from] io::Error),
 }
 
-pub(crate) async fn read_line<R: AsyncBufRead + Unpin>(
+/// Reads one line of at most `limit` bytes.
+pub async fn read_line<R: AsyncBufRead + Unpin>(
     reader: &mut R,
+    limit: usize,
 ) -> Result<Vec<u8>, MessageError> {
     let mut bytes = Vec::new();
     reader
-        .take(MAX_MESSAGE_BYTES as u64 + 1)
+        .take(limit as u64 + 1)
         .read_until(b'\n', &mut bytes)
         .await?;
     match bytes.last() {
         None => Err(MessageError::Closed),
         Some(b'\n') => Ok(bytes),
-        Some(_) if bytes.len() > MAX_MESSAGE_BYTES => Err(MessageError::TooLarge),
+        Some(_) if bytes.len() > limit => Err(MessageError::TooLarge(limit)),
         Some(_) => Err(MessageError::Closed),
     }
 }
 
-pub(crate) async fn read_message<T: DeserializeOwned, R: AsyncBufRead + Unpin>(
+pub async fn read_message<T: DeserializeOwned, R: AsyncBufRead + Unpin>(
     reader: &mut R,
+    limit: usize,
 ) -> Result<T, MessageError> {
-    Ok(serde_json::from_slice(&read_line(reader).await?)?)
+    Ok(serde_json::from_slice(&read_line(reader, limit).await?)?)
 }
 
-pub(crate) async fn send_message<T: Serialize, W: AsyncWrite + Unpin>(
+pub async fn send_message<T: Serialize, W: AsyncWrite + Unpin>(
     writer: &mut W,
     value: &T,
 ) -> io::Result<()> {
@@ -164,11 +217,19 @@ mod tests {
     #[tokio::test]
     async fn oversized_and_truncated_messages_are_rejected() {
         let oversized = vec![b'x'; MAX_MESSAGE_BYTES + 10];
-        let result = read_line(&mut &oversized[..]).await;
-        assert!(matches!(result, Err(MessageError::TooLarge)));
-        let result = read_line(&mut &b"{\"partial\""[..]).await;
+        let result = read_line(&mut &oversized[..], MAX_MESSAGE_BYTES).await;
+        assert!(matches!(result, Err(MessageError::TooLarge(_))));
+        let mut status = vec![b'x'; MAX_MESSAGE_BYTES + 10];
+        status.push(b'\n');
+        let line = read_line(&mut &status[..], MAX_REPLY_LINE_BYTES)
+            .await
+            .unwrap();
+        assert_eq!(line.len(), status.len());
+        let result = read_line(&mut &b"{\"partial\""[..], MAX_MESSAGE_BYTES).await;
         assert!(matches!(result, Err(MessageError::Closed)));
-        let line = read_line(&mut &b"{}\nrest"[..]).await.unwrap();
+        let line = read_line(&mut &b"{}\nrest"[..], MAX_MESSAGE_BYTES)
+            .await
+            .unwrap();
         assert_eq!(line, b"{}\n");
     }
 

@@ -583,6 +583,7 @@ fn test_multi_grep_search() {
         trim_whitespace: false,
         abort_signal: None,
         scope: Default::default(),
+        exclude_frecency: false,
     };
     let no_cancel = AtomicBool::new(false);
 
@@ -858,6 +859,7 @@ fn test_grep_no_duplicates_with_overflow_trailing_bits() {
         trim_whitespace: false,
         abort_signal: Some(std::sync::Arc::new(AtomicBool::new(false))),
         scope: Default::default(),
+        exclude_frecency: false,
     };
     let result = picker.grep(&query, &options);
 

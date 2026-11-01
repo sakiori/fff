@@ -35,6 +35,7 @@ fn run_grep(picker: &FilePicker, query: &str, iters: usize) {
         trim_whitespace: false,
         abort_signal: None,
         scope: Default::default(),
+        exclude_frecency: false,
     };
 
     let parsed = parse_grep_query(query);

@@ -40,6 +40,7 @@ fn run_fuzzy_query(picker: &FilePicker, query: &str, label: &str) {
         trim_whitespace: false,
         abort_signal: None,
         scope: Default::default(),
+        exclude_frecency: false,
     };
 
     let parsed = parse_grep_query(query);

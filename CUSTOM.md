@@ -65,7 +65,9 @@ as a single change; it does not replace functional verification.
 
 Each MCP stdio process connects to a shared service for the current OS user.
 The service owns file indexes, content caches and filesystem watchers. The stdio
-processes retain only transport and parent-lifetime handling.
+processes retain only transport and parent-lifetime handling. The service
+client, its protocol and the namespace checks live in the `fff-service` library
+crate, so programs other than `fff-mcp` can reach the service the same way.
 
 Compatible clients share an index for the same directory or covered descendants.
 Canonical paths resolve aliases. A repository index can serve its subdirectories;
@@ -76,12 +78,30 @@ coverage later, because its watcher indexed a new directory or a rescan
 included one: the service consolidates on that change instead of waiting for
 another client, and releases the index that is no longer used. When a client's
 directory is removed, its tool calls report the scope as unavailable until the
-directory is restored. Separate repository contexts and conflicting
-indexing options retain separate indexes in the service. Built-in directory
-exclusions apply at any depth with both walker backends, so a parent index
-serves a descendant with the same files a standalone index would contain.
-Clients using `--no-watch` keep their original snapshot when broader coverage
-arrives.
+directory is restored. Built-in directory exclusions apply at any depth with
+both walker backends, so a parent index serves a descendant with the same files
+a standalone index would contain.
+
+An index is reused for whatever a request needs rather than for equal options.
+Options that decide which files it holds must match: separate repository
+contexts and different `--follow-symlinks` settings keep separate indexes.
+Content indexing, watching, warmup and the content cache budget
+(`--max-cached-files`) are capabilities an index may offer beyond the request: a
+client without content indexing uses a content index, a `--no-watch` client
+uses a watched index, and a client with a smaller cache budget uses an index
+with a larger one. A budget left to the core caches between the core's smallest
+and largest size-based budgets, so it serves a request up to the smallest one
+and is served by an explicit budget of at least the largest. A client that
+needs a capability the covering index lacks gets an index of its own, which
+also offers every capability of the indexes at the same root that it can
+replace, those no `--no-watch` client keeps; once it is ready, compatible clients move to it as they move to
+broader coverage, and the index they leave is released. The frecency database
+belongs to the index and is chosen by the client that creates it; a client that
+names one only shares indexes that use the same one, and both clients send it
+in one spelling, absolute with its directory resolved. Permission
+to index the home directory or the filesystem root is checked for each client
+and does not separate indexes. Clients using `--no-watch` keep their original
+binding when broader coverage arrives.
 
 Watched indexes track empty directories created or restored after the initial
 scan, including nested directories. The core notifies subscribers whenever the
@@ -110,6 +130,14 @@ after the content index read a file stays searchable. These scan and watcher
 changes are in the core crate and apply to every fff consumer, not only the
 MCP service.
 
+File, directory, mixed and glob searches take an `exclude_frecency` option in
+`FuzzySearchOptions`, and grep and multi-grep take one in `GrepSearchOptions`.
+With it, a search ranks as an index without a frecency database would, although
+the index keeps the frecency scores other searches use: a query without fuzzy
+text then lists its entries in path order, so pages stay stable, and grep
+searches files by modification time alone. This is a core option, available to
+every fff consumer.
+
 Concurrent searches from different clients share one bounded search pool
 without waiting for each other: a search that has finished its own work returns
 even while another client's search is still running. Results, offsets and
@@ -120,6 +148,195 @@ directory, mixed, glob and content searches, including fallback searches.
 Returned paths and query path constraints are relative to the client's
 directory. Each client has independent cursors; cursors for different searches
 coexist, and a changed index binding invalidates the old ones.
+
+### Program sessions
+
+Programs reach the shared service through the `fff-service` library. A program
+session is opened like an MCP session, for a directory and index options, and
+follows the same index reuse rules; service status marks each session as `mcp`
+or `program`. After the service accepts it, the connection carries one request
+at a time as a big-endian 32-bit length followed by a MessagePack body, and the
+service answers each with one frame. Requests are file, directory and mixed
+fuzzy search, glob, grep and multi-grep, a readiness wait with a timeout of at
+most an hour, whether the index is scanning, its scan progress, a rescan
+coalesced with any running one, the git work tree containing the directory,
+reported changes, and close. Reported changes name files the program changed,
+absolute or relative to its directory; the service applies them to the
+session's index through the core's watcher path, as `apply_reported_changes`
+of `SharedFilePicker`, without a rescan. What a report guarantees:
+
+- Each reported file that exists is in the index, added or updated, with its
+  content indexed, when the reply arrives, unless the index's ignore rules
+  exclude it; each that no longer exists is gone from it, with any indexed
+  files below it. While the index scans, the changes wait with the scan's held
+  events and are applied when it commits, after the reply.
+- Report files, not directories. A reported new directory is walked only by a
+  watched index, by its watcher and after the reply; an index without a
+  watcher does not index it.
+- A reported `.gitignore` or `.ignore` file requests a rescan, as the watcher's
+  event does, and the new rules apply once it has run.
+- Paths are normalised lexically, so `a/../b` names `b`, and then spelled as on
+  disk: every component in its on-disk case, with a symlink kept as the link.
+  Where the filesystem ignores case, a deleted path matches the indexed entry
+  regardless of ASCII case only: a deleted file with a non-ASCII name, reported
+  in another case, stays indexed until the watcher's own event or the next
+  rescan removes it. Matching it as APFS does would need Unicode case folding
+  and normalisation for a rare case the watcher already covers. A path that
+  resolves outside the session's directory, also through a symlink, refuses the
+  whole request (`OutsideScope`).
+- An index that does not follow symlinks, which is the default, holds none, as
+  its scan skips them: a reported symlink is not added, and a reported path that
+  became a symlink is removed.
+
+The readiness wait and the scanning state count a scan until its
+post-scan phase ends and a requested rescan until it has run. Scan progress
+counts the files of the session's directory once the index is ready, and the
+files the shared index has scanned so far before. The scanning state and scan
+progress never wait for searches or index updates: while those hold the index,
+progress repeats the session's last count. Results are the core's:
+paths relative to the session's directory, scores, totals and, for grep, line
+numbers, line content, byte match ranges, the number of files searched, the
+regex fallback error and the next cursor, which names the index that issued
+it beside the core's file offset. Every search, grep included, can exclude
+frecency. A grep with a cursor of another index than the session's current
+one fails, also after the session grepped on the new index, and the program
+searches again without it. Searches never wait for the initial scan, unlike
+tool calls: they answer from what the index holds so far, nothing before the
+walk is committed, as an in-process instance does. The
+session ends when the program closes it or its connection ends, also when the
+program exits without closing it or while the service works on its request,
+which stops a grep in progress.
+
+`fff_service::session::ProgramSession` is the blocking client: it connects to
+the service of its own build in the configured namespace, or in the one
+`FFF_MCP_SERVICE_DIR` names, or in the default namespace, and starts the
+service from the `fff-mcp` executable it is given when none runs. Relative
+paths of the directory, executable, log file and frecency database are
+resolved against the program's working directory. Every call is bounded:
+opening the session takes at most its connect timeout, 90 seconds by default,
+and a call at most its response timeout, 30 seconds by default, beyond what it
+asks for itself, a readiness wait's timeout or a grep's time budget; closing
+waits at most five seconds. A call that times out or finds the connection
+broken drops the connection, and the session's next call opens a new session
+for the same directory and options, starting the service again if none runs,
+within that call's own bound: one deadline covers reopening and the call. A
+service that is busy cannot be told from one that hangs, so a grep that may
+run longer than the response timeout passes a time budget.
+A write to a service that died fails the call instead of raising `SIGPIPE` in
+the host. A host program that starts a service collects it when it exits,
+without leaving a zombie process.
+
+### C library and Node package
+
+`fff_create_service_instance` in the C library opens a program session for the
+instance's directory and returns the handle that in-process instances use. The
+create options choose the index as the corresponding MCP flags do; it also
+takes the `fff-mcp` executable that starts the service, an optional namespace
+and a timeout that replaces both bounds of the session. Calls on one
+service-backed instance may come from any thread and are serialized;
+`fff_destroy` must not overlap them. A failed call on a service-backed
+instance carries its kind in `int_value`, one of the `FFF_ERROR_*` constants:
+the instance lost its service (`FFF_ERROR_LOST_SERVICE`, also for the health
+check at the first of its two calls that loses it), a grep cursor of an index
+the session left (`FFF_ERROR_STALE_CURSOR`), a call without a service
+equivalent (`FFF_ERROR_UNAVAILABLE`), a directory the service cannot serve
+(`FFF_ERROR_SCOPE_UNAVAILABLE`), an invalid request
+(`FFF_ERROR_INVALID_REQUEST`), a path outside the instance's directory
+(`FFF_ERROR_OUTSIDE_SCOPE`), an index whose coverage changed during the call,
+which a retry resolves (`FFF_ERROR_RETRY`), or another failure
+(`FFF_ERROR_FAILED`). A directory the service cannot index counts as one it
+cannot serve. The
+kind follows from the error the session or the service returns, which the
+program protocol already distinguishes. Search, glob, grep, scan, wait, scan progress, base path and health
+functions work on both kinds of instance and return the same result structs;
+the health check reports the git work tree from the session's repository state.
+Watching, query tracking and history, git status refresh and a restart in
+another directory fail on a service-backed instance with an error naming the
+call as unavailable over the shared service; a restart in the same directory is
+a rescan. Searches and greps have `_ex` variants (`_ex2` for the greps) that
+exclude frecency per call, for either kind of instance. On a service-backed
+instance the integer offset of the grep functions continues only the
+instance's last grep page. `fff_service_call` sends one program request as
+JSON and returns the whole reply as one JSON document with the field names of
+the result structs, so a binding decodes a result of any size in one pass;
+its grep cursors name their index. String arguments of the service functions
+that are not UTF-8 fail the call. The in-process functions are unchanged for
+the other bindings.
+
+The fork's Node package is `@sakiori/fff-node`. Its platform packages
+`@sakiori/fff-bin-darwin-arm64`, `@sakiori/fff-bin-linux-x64-gnu` and
+`@sakiori/fff-bin-linux-x64-musl` each carry the native library and the
+`fff-mcp` executable of one build at their root; the other `packages/fff-bin-*`
+directories stay upstream's and are not published by the fork. The Node
+package depends on all three, and they declare no `os`, `cpu` or `libc`, since
+a registry may serve neither optional dependencies nor those fields; the package
+picks the running platform's one, on Linux by glibc or musl.
+`FileFinder.create` always opens a service-backed instance with the
+executable of the platform package, starting the service when none of that
+build runs, and returns the service's error when it cannot start or be reached
+instead of building a private index. `create` and every method that reaches
+the service (searches, glob, grep and multi-grep, scan state, waits, rescans,
+the health check and `destroy`) return a Promise of the `Result` the method
+returned before and run their native call on one of at most four worker
+threads the package starts when needed, so a slow or unresponsive service
+blocks neither the event loop of the host, typically a server, nor the libuv
+thread pool its file system, DNS, crypto and zlib calls use. Idle workers do
+not keep the process alive; a worker that dies fails its call and is replaced.
+Workers load the library file the main thread resolved, including its
+`.asar.unpacked` copy. Calls and replies use a message channel of their own,
+not the worker's parent port, where Node posts messages of its own, such as
+the modules a worker requires under `node --watch`. Workers start without the
+host's Node.js flags, which could change how they read their source, as
+`--input-type=module` does. The package does not
+implement upstream's synchronous `FileFinderApi`, and `waitForScanBlocking` is
+gone; `getBasePath`, `isDestroyed`, the unavailable methods and the static
+helpers stay synchronous. Each instance queues its calls and sends one at a time, as the
+session serializes them anyway, so an instance holds at most one worker; when
+a call finds the service lost, the calls queued behind it fail with its error
+at once, and the next call reconnects. No call takes longer than its bound
+once a worker runs it, waiting in the instance's queue or for one of the four
+workers aside: `create` 90 seconds, a call 30 seconds plus the time it asks
+for, a grep's `timeBudgetMs` included, and `timeoutMs` replaces both. The
+health check makes two calls, so it can take up to twice the bound. `destroy` lets earlier calls finish, refuses later ones and
+always frees the native instance; `nativeInstanceCount` reports the instances
+not yet freed.
+Every failed `Result` of the package carries a `code` beside the `error` text,
+one of the `ErrorCode` constants the package exports: `lostService`,
+`staleCursor`, `unavailable`, `scopeUnavailable`, `invalidRequest`,
+`outsideScope` and `retry` map the library's kinds, and `unsupportedPlatform`, `libraryUnavailable`, `destroyed`
+and `failed` come from the package. The package exports its own `Result`,
+`Failure`, `ok` and `err`, whose failures carry the code, in place of the
+shared API's. It loads ffi-rs only after finding the platform's native files,
+so importing it on a platform ffi-rs has no binary for still works and
+`FileFinder.create` reports `unsupportedPlatform`.
+`notifyChanged(paths)` reports files the program changed, so that a search
+after it resolves sees them without the watcher or a rescan.
+`fileSearch`, `directorySearch`, `mixedSearch`, `glob`, `grep` and `multiGrep`
+take `excludeFrecency`. Searches, greps, scan state and waits go through
+`fff_service_call`; `waitForScan`, `waitForIndexReady` and `getScanProgress`
+return the error of a service that went away. `watch`, `trackQuery`,
+`getHistoricalQuery` and `refreshGitStatus` return an error naming them as
+unavailable over the shared service, `reindex` rescans the instance's own
+directory, and `historyDbPath` is refused. `serviceDir`, or `FFF_MCP_SERVICE_DIR`, selects the namespace, and
+`FFF_MCP_IDLE_TIMEOUT_SECS` the idle timeout of a service the package starts.
+The package finds the library and the executable together once per process:
+the library `FFF_C_LIB` names, with the executable beside it, or else both in
+its platform package or a development build. It maps the directory holding
+them from an `.asar` archive to its `.asar.unpacked` counterpart when that
+exists, so Electron applications need no patches; it reports an error when
+only one of the files is unpacked, and names the supported platforms on any
+other. It ships as an ES module whose CommonJS `require` entry is the same
+module, which needs Node 20.19 or 22.12 and later.
+
+`make prepare-node` builds the executable and the library in separate cargo
+invocations and stages them for the package's development build;
+`make test-node` runs the package's tests, each against a service in a
+disposable namespace with a temporary state directory, including overlapping
+calls on one and on several instances and a service stopped with `SIGSTOP`,
+whose calls fail within their bound while a timer keeps firing and, with more
+instances than workers, file reads keep their latency.
+`make stage-node-platform` copies the same build into the host's platform
+package.
 
 ### Building and running
 
@@ -138,16 +355,32 @@ service makes no update request and adds no notice to its instructions or tool
 results; `--no-update-check` is still accepted, so existing client
 configurations keep working.
 
-The first client starts the service automatically. A client completes MCP
+The first client starts the service automatically, detached from itself: in
+its own process group, with `/` as its working directory, standard streams on
+`/dev/null` and its startup log, only the variables of the client's environment
+it uses (home, user, path, locale, time zone, temporary and XDG directories,
+`FFF_` and `RUST_` settings, and nix-ld's `NIX_LD` and `NIX_LD_LIBRARY_PATH`
+on NixOS; no `LD_*` or `DYLD_*`, which would load an application's libraries),
+and none of the client's descriptors beyond the standard streams: the child
+marks them close-on-exec before exec, with `close_range` on Linux, otherwise up
+to the soft descriptor limit, or the system's per-process maximum when that is
+unlimited, computed before the fork. So the service holds nothing of the
+application that started its client, such as the pipe through which an
+AppImage keeps its mount alive. A client whose executable lives inside the
+running AppImage (`$APPDIR`) starts a copy in the namespace instead, since the
+mount ends with the application: it installs the copy of its build once and
+reuses it, retries a start the freshly written file briefly refuses, and
+removes copies of other builds that no service runs and no client is
+starting. Other transient locations, such as a mounted disk image, are not
+detected. A client completes MCP
 initialization as soon as its session is registered; the index keeps scanning in
 the service. Tool calls wait up to 30 seconds for the initial scan and, for
 watched sessions, the filesystem watcher, and otherwise ask the caller to retry.
 If the watcher cannot start, the index keeps serving searches without live
 updates and service status reports the watcher state. A frecency database that
 cannot be opened produces a warning instead of a failed session. The existing
-MCP tools and stdio configuration remain available. `--no-warmup`,
-`--content-indexing`, `--no-content-indexing`, `--no-watch`, `--follow-symlinks`,
-`--max-cached-files` and `--frecency-db` participate in index compatibility.
+MCP tools and stdio configuration remain available. Service status lists each
+index with the options it was built with.
 
 - `--service-status` lists every service in the namespace with its active scopes,
   index bindings and process, and marks the service of the current build.
@@ -166,15 +399,30 @@ namespace directory must be owned by the user with no group or other access, and
 every parent directory must be owned by the user or root and not writable by
 others unless it is a root-owned sticky directory. Symlinks are refused, state
 files are opened relative to the verified directory, and both ends of a
-connection check the peer's user. Choose a short namespace directory: socket
-paths have a platform-defined length limit. On Windows, protected ACLs also
+connection check the peer's user. When the socket path in the namespace
+would exceed the platform's limit (104 bytes on macOS, 108 on Linux, including
+the terminator), as under a long `HOME`, the service listens in a private
+per-user runtime directory instead, under a name derived from a hash of the
+namespace path and the build. It tries `$XDG_RUNTIME_DIR/fff` on Linux when
+that is set, then `/tmp/fff-<uid>`. A runtime directory is created with mode
+0700 and must be owned by the user, private and not a symlink; one that is
+not, or cannot be created, is skipped, and only when none is usable does the
+service refuse to start, naming each refusal. The namespace's state, including
+the endpoint that names the socket, stays in the namespace. The service renews
+the times of that socket and its directory every hour, so age-based cleaners
+of `/tmp` such as systemd-tmpfiles keep them. On Windows, protected ACLs also
 allow SYSTEM and Administrators; directory and file ACLs are validated
 independently, and the pipe receives an explicit ACL.
 
 Local connections require the namespace token and a matching protocol version.
-Each executable build runs its own service in the namespace, so a new build can
-start while clients of an older build keep running; the older service exits once
-it is idle. A client retries through the startup lock when a service shuts down
+Each build runs its own service in the namespace, so a new build can start
+while clients of an older build keep running; the older service exits once it
+is idle. A build is identified by the `fff-service` version, the commit and the
+walker backend, compiled in when it is built; a build from a tree with
+uncommitted changes adds a hash of those changes. A copy of an executable that
+was moved or re-signed therefore joins the original's service. A client that
+starts a service checks that the executable is of its own build and reports
+the mismatch otherwise. A client retries through the startup lock when a service shuts down
 before accepting its session. A crashed service fails current clients visibly;
 subsequent launches recover stale discovery state. A service that clients can no
 longer reach, because its namespace directory, discovery file or socket was
@@ -193,15 +441,31 @@ scanning the entire filesystem.
 
 ### Verification
 
-`make test-mcp` runs the MCP tests and core search regression suite.
-`make lint-mcp` checks both crates and their test targets without relaxing lints.
+`make test-mcp` runs the MCP and service client tests and the core search
+regression suite. `make lint-mcp` checks these crates and their test targets
+without relaxing lints.
 The shared-service tests use isolated namespaces and cover concurrent startup,
 scoped tools and fallbacks, watcher updates, consolidation when an index gains
 coverage through a rescan or a directory its watcher indexes, removed scopes,
 concurrent searches over one index, cursor isolation, disconnects, parent exit,
-side-by-side builds, handshake rejection, namespace permissions, stale discovery
+side-by-side builds, copied executables, handshake rejection, namespace permissions, stale discovery
 recovery, unreachable services, shutdown races, idle cleanup and the absence of
-an upstream update check. Each test stops
+an upstream update check. Program session tests compare every search with an
+in-process index of the same directory and cover cursors across a move to a
+broader index, sharing with an MCP session, a program that exits without
+closing its session or while it waits for the index, one frecency database
+spelled two ways, rescans and repository state, searches while the index
+builds, scan state while a search holds the index, a watched request beside a
+snapshot index, a build tag collision, a session that starts the service
+itself, a call that times out and the reconnect after it, a reconnect to a
+stopped service within the call's bound, and a namespace whose socket path
+exceeds the platform limit. In debug builds, `FFF_MCP_TEST_RUNTIME_DIR` replaces
+the runtime directories, so tests never write to the shared ones. In debug builds, indexes stay building
+while the file named by `FFF_MCP_TEST_HOLD_READINESS` exists, and program searches
+hold their index locked for writing while the file named by
+`FFF_MCP_TEST_HOLD_SEARCH` exists. In debug builds, `FFF_MCP_TEST_BUILD_ID` gives
+the executable another build identity, so one test binary stands in for two
+releases. Each test stops
 the services of its namespace when it ends, also when it fails. In debug
 builds, watchers leave new directories unindexed while the file named by
 `FFF_TEST_HOLD_DIR_INDEXING` exists, so the watcher consolidation test orders

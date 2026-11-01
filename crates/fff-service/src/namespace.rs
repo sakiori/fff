@@ -11,10 +11,10 @@ mod unix;
 mod windows;
 
 #[cfg(unix)]
-pub(crate) use unix::FileId;
+pub use unix::FileId;
 
 // A private per-user directory holding service discovery, lock and log files.
-pub(crate) struct Namespace {
+pub struct Namespace {
     path: PathBuf,
     #[cfg(unix)]
     dir: std::os::fd::OwnedFd,
@@ -40,6 +40,19 @@ impl Namespace {
             windows::prepare(&path).map_err(annotate)?;
             Ok(Self { path })
         }
+    }
+
+    // A private directory in an existing shared parent such as /tmp, which must not be a
+    // symlink, for sockets whose namespace path is too long.
+    #[cfg(unix)]
+    pub fn open_in_parent(path: &Path) -> io::Result<Self> {
+        let (path, dir) = unix::open_private_dir_in_parent(path).map_err(|error| {
+            io::Error::new(
+                error.kind(),
+                format!("Cannot open socket directory {}: {error}", path.display()),
+            )
+        })?;
+        Ok(Self { path, dir })
     }
 
     pub fn path(&self) -> &Path {
@@ -115,6 +128,32 @@ impl Namespace {
         result.map_err(|error| self.error("write", name, error))
     }
 
+    // Replaces `name` with a private executable copy of `source`, returning its path.
+    #[cfg(unix)]
+    pub fn install_executable(&self, name: &str, source: &Path) -> io::Result<PathBuf> {
+        use std::os::unix::fs::PermissionsExt;
+        let temporary = format!(".{name}.{}.tmp", uuid::Uuid::new_v4().simple());
+        let result = (|| {
+            let mut file = self.create_new(&temporary)?;
+            io::copy(&mut File::open(source)?, &mut file)?;
+            file.set_permissions(std::fs::Permissions::from_mode(0o700))?;
+            file.sync_all()?;
+            drop(file);
+            self.rename(&temporary, name)
+        })();
+        if result.is_err() {
+            let _ = self.remove_file(&temporary);
+        }
+        result.map_err(|error| self.error("install", name, error))?;
+        Ok(self.path.join(name))
+    }
+
+    // Sets the access and modification times of `name`, or of the directory for ".", to now.
+    #[cfg(unix)]
+    pub fn touch(&self, name: &str) -> io::Result<()> {
+        unix::touch(&self.dir, name).map_err(|error| self.error("touch", name, error))
+    }
+
     pub fn remove_file(&self, name: &str) -> io::Result<()> {
         #[cfg(unix)]
         let result = unix::remove_file(&self.dir, name);
@@ -171,7 +210,7 @@ impl Namespace {
     }
 }
 
-pub(crate) fn listener_options(options: ListenerOptions<'_>) -> io::Result<ListenerOptions<'_>> {
+pub fn listener_options(options: ListenerOptions<'_>) -> io::Result<ListenerOptions<'_>> {
     #[cfg(unix)]
     {
         Ok(options)
@@ -184,7 +223,7 @@ pub(crate) fn listener_options(options: ListenerOptions<'_>) -> io::Result<Liste
 }
 
 // Rejects a local socket peer running as another user.
-pub(crate) fn verify_peer(stream: &Stream) -> io::Result<()> {
+pub fn verify_peer(stream: &Stream) -> io::Result<()> {
     #[cfg(unix)]
     {
         unix::verify_peer(stream)

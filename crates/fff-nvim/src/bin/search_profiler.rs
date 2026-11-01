@@ -101,6 +101,7 @@ fn main() {
                         limit: 100,
                     },
                     scope: Default::default(),
+                    exclude_frecency: false,
                 },
             );
 

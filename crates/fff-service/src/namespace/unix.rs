@@ -21,7 +21,39 @@ pub(super) fn open_private_dir(path: &Path) -> io::Result<(PathBuf, OwnedFd)> {
         .recursive(true)
         .mode(PRIVATE_DIR_MODE)
         .create(&absolute)?;
-    let canonical = absolute.canonicalize()?;
+    walk_private_dir(absolute.canonicalize()?)
+}
+
+// Like `open_private_dir` in an existing parent, but a symlink in place of the directory
+// itself is refused rather than followed, for directories in shared places such as /tmp.
+pub(super) fn open_private_dir_in_parent(path: &Path) -> io::Result<(PathBuf, OwnedFd)> {
+    use std::os::unix::fs::DirBuilderExt;
+    let absolute = std::path::absolute(path)?;
+    let (Some(parent), Some(name)) = (absolute.parent(), absolute.file_name()) else {
+        return Err(private_error("A private directory needs a parent"));
+    };
+    match std::fs::DirBuilder::new()
+        .mode(PRIVATE_DIR_MODE)
+        .create(&absolute)
+    {
+        Err(error) if error.kind() != io::ErrorKind::AlreadyExists => return Err(error),
+        _ => {}
+    }
+    walk_private_dir(parent.canonicalize()?.join(name)).map_err(|error| {
+        match std::fs::symlink_metadata(&absolute) {
+            Ok(metadata) if metadata.is_symlink() => private_error(&format!(
+                "{} is a symlink, which a private directory must not be",
+                absolute.display()
+            )),
+            Ok(metadata) if !metadata.is_dir() => {
+                private_error(&format!("{} is not a directory", absolute.display()))
+            }
+            _ => error,
+        }
+    })
+}
+
+fn walk_private_dir(canonical: PathBuf) -> io::Result<(PathBuf, OwnedFd)> {
     let flags = OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC;
     let mut dir = rustix::fs::open("/", flags, Mode::empty())?;
     let parts: Vec<_> = canonical
@@ -85,6 +117,24 @@ pub(super) fn rename(dir: &OwnedFd, from: &str, to: &str) -> io::Result<()> {
     Ok(rustix::fs::renameat(dir, from, dir, to)?)
 }
 
+// Sets an entry's access and modification times to now, without following a symlink.
+pub(super) fn touch(dir: &OwnedFd, name: &str) -> io::Result<()> {
+    let now = rustix::fs::Timespec {
+        tv_sec: 0,
+        tv_nsec: rustix::fs::UTIME_NOW,
+    };
+    let times = rustix::fs::Timestamps {
+        last_access: now,
+        last_modification: now,
+    };
+    Ok(rustix::fs::utimensat(
+        dir,
+        name,
+        &times,
+        AtFlags::SYMLINK_NOFOLLOW,
+    )?)
+}
+
 pub(super) fn remove_file(dir: &OwnedFd, name: &str) -> io::Result<()> {
     Ok(rustix::fs::unlinkat(dir, name, AtFlags::empty())?)
 }
@@ -111,7 +161,7 @@ pub(super) fn names_dir(dir: &OwnedFd, path: &Path) -> io::Result<bool> {
 
 // Identity of a namespace entry; it changes when the name is replaced by another file.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) struct FileId {
+pub struct FileId {
     dev: rustix::fs::Dev,
     ino: u64,
 }

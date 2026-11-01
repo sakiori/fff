@@ -125,6 +125,34 @@ older services exit when their clients leave. Compared with rejecting mismatched
 builds, this keeps searches available during an upgrade at the cost of one
 index set per running build.
 
+A client starts the service detached from itself, since the service outlives it
+and serves every client of the namespace. On Unix the service gets its own
+process group, `/` as its working directory, standard streams on `/dev/null`
+and its startup log, and only the variables of the client's environment it uses
+(home, user, path, locale, time zone, temporary and XDG directories, and its own
+`FFF_` and `RUST_` settings); a client's loader, git or application variables
+would otherwise apply to every client. Between fork and exec the child marks
+every descriptor above the standard streams close-on-exec, with `close_range`
+on Linux and a loop up to the descriptor limit elsewhere, so the service holds
+nothing the client inherited without that flag, such as the pipe through which
+an AppImage runtime keeps its mount alive. Marking rather than closing keeps the
+pipe through which the standard library reports a failed exec. Once the service
+no longer holds that pipe, the AppImage's mount ends with its application, and
+a service still executing from it would fail on its next page-in; an executable
+inside the running AppImage (`$APPDIR`) is therefore copied into the namespace
+first and started from there. A copy is the same build, so it joins the same
+service; it is installed atomically under its build's name, reused by later
+starts, and removed by a client of another build once no service of its build
+runs and no client of it is starting, which both hold that build's locks. The
+environment excludes `LD_*` and `DYLD_*`: the glibc build needs only the system
+loader, which finds glibc through its own configuration, while an application's
+library path would load the application's libraries into the service; nix-ld's
+`NIX_LD` variables stay, without which NixOS cannot start a binary built
+elsewhere. Without `close_range`, the child walks every descriptor up to a
+bound computed before the fork, since nothing between fork and exec may
+allocate. Other transient locations, such as a mounted disk image, are not
+detected; the service runs from the path it is given.
+
 A private namespace, an authenticated typed handshake and an exclusive ownership
 lock protect discovery and stale-socket recovery. The launching client removes
 stale discovery state under the startup lock, the endpoint is replaced

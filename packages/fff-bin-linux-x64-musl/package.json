@@ -1,19 +1,16 @@
 {
-  "name": "@ff-labs/fff-bin-linux-x64-musl",
+  "name": "@sakiori/fff-bin-linux-x64-musl",
   "version": "0.0.0",
-  "description": "fff native binary for Linux x64 (musl)",
-  "os": ["linux"],
-  "cpu": ["x64"],
+  "description": "fff native library and shared service executable for Linux x64 (musl)",
   "main": "libfff_c.so",
-  "files": ["libfff_c.so"],
+  "files": ["libfff_c.so", "fff-mcp"],
   "publishConfig": {
     "access": "public"
   },
   "license": "MIT",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/dmtrKovalenko/fff.git",
+    "url": "git+https://gitlab.com/sakiori-oss/fff.git",
     "directory": "packages/fff-bin-linux-x64-musl"
-  },
-  "libc": ["musl"]
+  }
 }

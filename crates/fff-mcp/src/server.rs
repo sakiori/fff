@@ -92,6 +92,7 @@ fn make_grep_options(
             trim_whitespace: false,
             abort_signal: None,
             scope: scope.clone(),
+            exclude_frecency: false,
         },
         auto_expand,
     )
@@ -690,6 +691,7 @@ impl FffServer {
                         limit: 1,
                     },
                     scope: &target.scope,
+                    exclude_frecency: false,
                 };
                 let file_result = picker.fuzzy_search(&file_query, None, file_opts);
                 if let (Some(top), Some(score)) =
@@ -911,6 +913,7 @@ impl FffServer {
                 limit: max_results,
             },
             scope: &target.scope,
+            exclude_frecency: false,
         };
 
         let parser = QueryParser::default();

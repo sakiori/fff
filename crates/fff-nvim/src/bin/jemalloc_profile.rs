@@ -101,6 +101,7 @@ fn test_search_memory_pattern(
                             limit: 50 + (i % 50),
                         },
                         scope: Default::default(),
+                        exclude_frecency: false,
                     },
                 );
                 (search_result.items.len(), search_result.total_matched)

@@ -101,6 +101,7 @@ impl<'a> GrepBench<'a> {
                 trim_whitespace: false,
                 abort_signal: None,
                 scope: Default::default(),
+                exclude_frecency: false,
             },
         }
     }
@@ -425,6 +426,7 @@ fn main() {
             trim_whitespace: false,
             abort_signal: None,
             scope: Default::default(),
+            exclude_frecency: false,
         };
         let start = Instant::now();
         let result = picker.grep(&parsed, &opts);

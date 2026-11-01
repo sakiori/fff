@@ -170,6 +170,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         limit: 5,
                     },
                     scope: Default::default(),
+                    exclude_frecency: false,
                 },
             );
 

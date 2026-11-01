@@ -11,13 +11,19 @@
 //! text, 1 = regex, 2 = fuzzy; multi-grep patterns are `\n`-separated.
 
 use std::ffi::{CStr, CString, c_char, c_void};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use fff::shared::SharedQueryTracker;
+use fff_service::program::{
+    GlobRequest, GrepOptions, GrepRequest, MultiGrepRequest, SearchRequest,
+};
+use fff_service::protocol::IndexOptions;
 
 mod accessors;
 mod ffi_types;
+mod packed;
+mod service;
 mod watch;
 
 use fff::file_picker::FilePicker;
@@ -26,13 +32,19 @@ use fff::query_tracker::QueryTracker;
 use fff::{DbHealthChecker, FFFMode, FuzzySearchOptions, PaginationArgs, QueryParser};
 use fff::{SharedFilePicker, SharedFrecency};
 use ffi_types::{
-    FFF_CREATE_OPTIONS_VERSION, FffCreateOptions, FffDirItem, FffDirSearchResult, FffFileItem,
-    FffGrepMatch, FffGrepResult, FffMixedItem, FffMixedSearchResult, FffResult, FffScanProgress,
-    FffScore, FffSearchResult,
+    FFF_CREATE_OPTIONS_VERSION, FFF_ERROR_INVALID_REQUEST, FFF_ERROR_SCOPE_UNAVAILABLE,
+    FffCreateOptions, FffDirItem, FffDirSearchResult, FffFileItem, FffGrepMatch, FffGrepResult,
+    FffMixedItem, FffMixedSearchResult, FffResult, FffScanProgress, FffScore, FffSearchResult,
 };
 
 /// Opaque handle holding all per-instance state; freed by `fff_destroy`.
-struct FffInstance {
+enum FffInstance {
+    Local(LocalInstance),
+    Service(Box<service::ServiceInstance>),
+}
+
+// An instance owning its index in this process.
+struct LocalInstance {
     picker: SharedFilePicker,
     frecency: SharedFrecency,
     query_tracker: SharedQueryTracker,
@@ -54,6 +66,21 @@ unsafe fn optional_cstr<'a>(s: *const c_char) -> Option<&'a str> {
     unsafe { cstr_to_str(s) }.filter(|s| !s.is_empty())
 }
 
+// An optional string of the service functions: `None` if null or empty, an error if not UTF-8.
+unsafe fn optional_arg<'a>(
+    s: *const c_char,
+    name: &str,
+) -> Result<Option<&'a str>, *mut FffResult> {
+    if s.is_null() {
+        return Ok(None);
+    }
+    match unsafe { CStr::from_ptr(s) }.to_str() {
+        Ok("") => Ok(None),
+        Ok(s) => Ok(Some(s)),
+        Err(_) => Err(FffResult::err(&format!("{name} is not valid UTF-8"))),
+    }
+}
+
 /// Recover a `&FffInstance` from the opaque pointer; error `FffResult` if null.
 pub(crate) unsafe fn instance_ref<'a>(
     fff_handle: *mut c_void,
@@ -67,12 +94,34 @@ pub(crate) unsafe fn instance_ref<'a>(
     }
 }
 
+// The in-process instance behind the handle; `call` names the function a
+// service-backed instance cannot serve.
+pub(crate) unsafe fn local_instance<'a>(
+    fff_handle: *mut c_void,
+    call: &str,
+) -> Result<&'a LocalInstance, *mut FffResult> {
+    match unsafe { instance_ref(fff_handle) }? {
+        FffInstance::Local(local) => Ok(local),
+        FffInstance::Service(_) => Err(service::unavailable(call)),
+    }
+}
+
 /// Decode a `u8` grep mode into the core enum.
 fn grep_mode_from_u8(mode: u8) -> fff::GrepMode {
     match mode {
         1 => fff::GrepMode::Regex,
         2 => fff::GrepMode::Fuzzy,
         _ => fff::GrepMode::PlainText,
+    }
+}
+
+fn service_definition_mode(mode: fff::DefinitionMode) -> fff_service::program::DefinitionMode {
+    use fff_service::program::DefinitionMode;
+    match mode {
+        fff::DefinitionMode::Off => DefinitionMode::Off,
+        fff::DefinitionMode::Classify => DefinitionMode::Classify,
+        fff::DefinitionMode::DefinitionOnly => DefinitionMode::DefinitionOnly,
+        fff::DefinitionMode::UsageOnly => DefinitionMode::UsageOnly,
     }
 }
 
@@ -273,12 +322,12 @@ pub unsafe extern "C" fn fff_create_instance_with(opts: *const FffCreateOptions)
         return FffResult::err(&format!("Failed to init file picker: {}", e));
     }
 
-    let instance = Box::new(FffInstance {
+    let instance = Box::new(FffInstance::Local(LocalInstance {
         picker: shared_picker,
         frecency: shared_frecency,
         query_tracker,
         watch_callback: std::sync::Arc::new(watch::WatchCallbackSlot::default()),
-    });
+    }));
 
     let fff_handle = Box::into_raw(instance) as *mut c_void;
     FffResult::ok_handle(fff_handle)
@@ -295,6 +344,163 @@ pub unsafe extern "C" fn fff_create_instance_with_value(opts: FffCreateOptions) 
     unsafe { fff_create_instance_with(&opts as *const FffCreateOptions) }
 }
 
+/// Create an instance whose index lives in the shared fff service of this
+/// library's build, starting that service from `executable` when none runs.
+///
+/// The instance takes the same handle as in-process instances and works with
+/// every search, grep, scan and health function. Functions without a service
+/// equivalent (watching, query tracking and history, git status refresh,
+/// restarting in another directory) return an error naming them as
+/// unavailable over the shared service.
+///
+/// From `opts`: `base_path`, `frecency_db_path`, `enable_mmap_cache` (warmup),
+/// `enable_content_indexing`, `watch`, `ai_mode` (grep constraint syntax),
+/// `cache_budget_max_files`, `enable_fs_root_scanning`,
+/// `enable_home_dir_scanning` and `follow_symlinks` choose the index the
+/// session uses; `log_file_path` and `log_level` configure a service this call
+/// starts. `history_db_path` is refused; the other cache budgets are ignored.
+///
+/// `executable` is the `fff-mcp` executable built with this library.
+/// `service_dir` selects the service namespace; NULL/empty takes
+/// `FFF_MCP_SERVICE_DIR` or the default namespace. A service this call starts
+/// exits after `FFF_MCP_IDLE_TIMEOUT_SECS` without clients, one hour by default.
+///
+/// `timeout_ms` bounds the wait for a service that does not answer: opening
+/// the session, which may start the service, and each call beyond the time the
+/// call itself asks for (a readiness wait's timeout, a grep's time budget). 0
+/// takes the defaults, 90 seconds to open and 30 seconds per call. A call that
+/// times out or loses the service fails, and the instance's next call opens a
+/// new session for the same directory within that call's own bound.
+///
+/// Calls on one service instance may come from any thread; they are
+/// serialized. `fff_destroy` must not overlap another call on the instance.
+///
+/// On such an instance, the `file_offset` of the grep functions continues only
+/// its last grep page; the cursors of [`fff_service_call`] name the index they
+/// belong to. A string argument that is not valid UTF-8 fails the call.
+///
+/// ## Safety
+/// * `opts` as in [`fff_create_instance_with`].
+/// * `executable` and `service_dir` must be null-terminated strings or NULL.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn fff_create_service_instance(
+    opts: *const FffCreateOptions,
+    executable: *const c_char,
+    service_dir: *const c_char,
+    timeout_ms: u64,
+) -> *mut FffResult {
+    if opts.is_null() {
+        return FffResult::err("opts is null");
+    }
+    let opts = unsafe { &*opts };
+    if opts.version == 0 || opts.version > FFF_CREATE_OPTIONS_VERSION {
+        return FffResult::err(&format!(
+            "Unsupported FffCreateOptions version {} (library understands up to {})",
+            opts.version, FFF_CREATE_OPTIONS_VERSION
+        ));
+    }
+    match unsafe { service_settings(opts, executable, service_dir, timeout_ms) } {
+        Ok(settings) => match service::ServiceInstance::open(settings) {
+            Ok(instance) => {
+                let instance = Box::new(FffInstance::Service(Box::new(instance)));
+                FffResult::ok_handle(Box::into_raw(instance) as *mut c_void)
+            }
+            Err(error) => service::failure(&error, "Failed to open a shared service session: "),
+        },
+        Err(error) => error,
+    }
+}
+
+unsafe fn service_settings(
+    opts: &FffCreateOptions,
+    executable: *const c_char,
+    service_dir: *const c_char,
+    timeout_ms: u64,
+) -> Result<service::ServiceSettings, *mut FffResult> {
+    let arg = |s, name| unsafe { optional_arg(s, name) };
+    let Some(base_path) = arg(opts.base_path, "opts.base_path")? else {
+        return Err(FffResult::err("opts.base_path is null or empty"));
+    };
+    let scope_error = |message: String| FffResult::err_with(&message, FFF_ERROR_SCOPE_UNAVAILABLE);
+    if !Path::new(base_path).exists() {
+        return Err(scope_error(format!("Path does not exist: {base_path}")));
+    }
+    let base_path = fff::path_utils::canonicalize(base_path)
+        .map_err(|e| scope_error(format!("Failed to canonicalize path: {e}")))?;
+    if arg(opts.history_db_path, "opts.history_db_path")?.is_some() {
+        return Err(service::unavailable("Query history (history_db_path)"));
+    }
+    let Some(executable) = arg(executable, "executable")? else {
+        return Err(FffResult::err("executable is null or empty"));
+    };
+    let options = IndexOptions {
+        warmup: opts.enable_mmap_cache,
+        content_indexing: opts.enable_content_indexing,
+        watch: opts.watch,
+        follow_symlinks: opts.version >= 2 && opts.follow_symlinks,
+        max_cached_files: (opts.cache_budget_max_files > 0)
+            .then_some(opts.cache_budget_max_files as usize),
+        frecency_db: arg(opts.frecency_db_path, "opts.frecency_db_path")?.map(str::to_owned),
+        enable_home_scan: opts.enable_home_dir_scanning,
+        enable_root_scan: opts.enable_fs_root_scanning,
+    };
+    Ok(service::ServiceSettings {
+        base_path,
+        options,
+        ai_syntax: opts.ai_mode,
+        executable: PathBuf::from(executable),
+        service_dir: arg(service_dir, "service_dir")?.map(PathBuf::from),
+        log_file: arg(opts.log_file_path, "opts.log_file_path")?.map(PathBuf::from),
+        log_level: arg(opts.log_level, "opts.log_level")?.map(str::to_owned),
+        timeout: (timeout_ms > 0).then(|| std::time::Duration::from_millis(timeout_ms)),
+    })
+}
+
+/// Send one request of the shared service's program protocol to a service
+/// instance and return the whole reply as one JSON document, a C string in
+/// `handle` to free with `fff_free_string`.
+///
+/// `request_json` is the JSON form of `fff_service::program::ProgramRequest` of
+/// this library's build, for example
+/// `{"SearchFiles":{"query":"main","current_file":null,"offset":0,"limit":100,"exclude_frecency":false}}`.
+/// Replies to searches, globs and greps carry every item with the fields of the
+/// result structs in camelCase; a grep page's `nextCursor` is passed back
+/// unchanged as the next request's `cursor`. A scan progress reply has the
+/// fields of `FffScanProgress` in camelCase; readiness and scanning replies are
+/// booleans, a repository reply is a path or null and other replies are null.
+/// Grep constraints use the syntax of the instance's `ai_mode`. Close the
+/// instance with `fff_destroy`, not with a request.
+///
+/// A failure carries its kind in `int_value`, one of the `FFF_ERROR_*`
+/// constants: [`FFF_ERROR_LOST_SERVICE`] when the instance lost its service,
+/// whose next call opens a new session, [`FFF_ERROR_STALE_CURSOR`] for a grep
+/// cursor of an index the session no longer uses, and so on.
+///
+/// ## Safety
+/// * `fff_handle` must be a valid instance pointer from `fff_create_service_instance`.
+/// * `request_json` must be a null-terminated string.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn fff_service_call(
+    fff_handle: *mut c_void,
+    request_json: *const c_char,
+) -> *mut FffResult {
+    let service = match unsafe { instance_ref(fff_handle) } {
+        Ok(FffInstance::Service(service)) => service,
+        Ok(FffInstance::Local(_)) => {
+            return FffResult::err_with(
+                "fff_service_call needs an instance of the shared service",
+                FFF_ERROR_INVALID_REQUEST,
+            );
+        }
+        Err(e) => return e,
+    };
+    match unsafe { optional_arg(request_json, "request_json") } {
+        Ok(Some(request)) => service.call_json(request),
+        Ok(None) => FffResult::err("request_json is null or empty"),
+        Err(error) => error,
+    }
+}
+
 /// Destroy a file finder instance and free all its resources.
 ///
 /// ## Safety
@@ -305,7 +511,10 @@ pub unsafe extern "C" fn fff_destroy(fff_handle: *mut c_void) {
         return;
     }
 
-    let instance = unsafe { Box::from_raw(fff_handle as *mut FffInstance) };
+    let instance = match *unsafe { Box::from_raw(fff_handle as *mut FffInstance) } {
+        FffInstance::Local(local) => local,
+        FffInstance::Service(service) => return (*service).close(),
+    };
 
     // The C callback and user_data may be freed as soon as this returns.
     instance.picker.shutdown_watches_and_wait();
@@ -345,6 +554,38 @@ pub unsafe extern "C" fn fff_search(
     combo_boost_multiplier: i32,
     min_combo_count: u32,
 ) -> *mut FffResult {
+    unsafe {
+        fff_search_ex(
+            fff_handle,
+            query,
+            current_file,
+            max_threads,
+            page_index,
+            page_size,
+            combo_boost_multiplier,
+            min_combo_count,
+            false,
+        )
+    }
+}
+
+/// [`fff_search`] plus `exclude_frecency`: rank as an index without a frecency
+/// database would; a query without fuzzy text then lists files in path order.
+///
+/// ## Safety
+/// Same as [`fff_search`].
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn fff_search_ex(
+    fff_handle: *mut c_void,
+    query: *const c_char,
+    current_file: *const c_char,
+    max_threads: u32,
+    page_index: u32,
+    page_size: u32,
+    combo_boost_multiplier: i32,
+    min_combo_count: u32,
+    exclude_frecency: bool,
+) -> *mut FffResult {
     let inst = match unsafe { instance_ref(fff_handle) } {
         Ok(i) => i,
         Err(e) => return e,
@@ -359,6 +600,18 @@ pub unsafe extern "C" fn fff_search(
     let page_size = default_u32(page_size, 100) as usize;
     let min_combo_count = default_u32(min_combo_count, 3);
     let combo_boost_multiplier = default_i32(combo_boost_multiplier, 100);
+    let inst = match inst {
+        FffInstance::Local(local) => local,
+        FffInstance::Service(service) => {
+            return service.search(search_request(
+                query_str,
+                current_file_str,
+                page_index,
+                page_size,
+                exclude_frecency,
+            ));
+        }
+    };
 
     let picker_guard = match inst.picker.read() {
         Ok(g) => g,
@@ -396,6 +649,7 @@ pub unsafe extern "C" fn fff_search(
                 limit: page_size,
             },
             scope: Default::default(),
+            exclude_frecency,
         },
     );
 
@@ -421,6 +675,33 @@ pub unsafe extern "C" fn fff_glob(
     page_index: u32,
     page_size: u32,
 ) -> *mut FffResult {
+    unsafe {
+        fff_glob_ex(
+            fff_handle,
+            pattern,
+            current_file,
+            max_threads,
+            page_index,
+            page_size,
+            false,
+        )
+    }
+}
+
+/// [`fff_glob`] plus `exclude_frecency`, which lists matches in path order.
+///
+/// ## Safety
+/// Same as [`fff_glob`].
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn fff_glob_ex(
+    fff_handle: *mut c_void,
+    pattern: *const c_char,
+    current_file: *const c_char,
+    max_threads: u32,
+    page_index: u32,
+    page_size: u32,
+    exclude_frecency: bool,
+) -> *mut FffResult {
     let inst = match unsafe { instance_ref(fff_handle) } {
         Ok(i) => i,
         Err(e) => return e,
@@ -433,6 +714,18 @@ pub unsafe extern "C" fn fff_glob(
 
     let current_file_str = unsafe { optional_cstr(current_file) };
     let page_size = default_u32(page_size, 100) as usize;
+    let inst = match inst {
+        FffInstance::Local(local) => local,
+        FffInstance::Service(service) => {
+            return service.glob(GlobRequest {
+                pattern: pattern_str.to_owned(),
+                current_file: current_file_str.map(str::to_owned),
+                offset: page_index as usize,
+                limit: page_size,
+                exclude_frecency,
+            });
+        }
+    };
 
     let picker_guard = match inst.picker.read() {
         Ok(g) => g,
@@ -459,6 +752,7 @@ pub unsafe extern "C" fn fff_glob(
                 limit: page_size,
             },
             scope: Default::default(),
+            exclude_frecency,
         },
     );
 
@@ -483,6 +777,33 @@ pub unsafe extern "C" fn fff_search_directories(
     page_index: u32,
     page_size: u32,
 ) -> *mut FffResult {
+    unsafe {
+        fff_search_directories_ex(
+            fff_handle,
+            query,
+            current_file,
+            max_threads,
+            page_index,
+            page_size,
+            false,
+        )
+    }
+}
+
+/// [`fff_search_directories`] plus `exclude_frecency`, as in [`fff_search_ex`].
+///
+/// ## Safety
+/// Same as [`fff_search_directories`].
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn fff_search_directories_ex(
+    fff_handle: *mut c_void,
+    query: *const c_char,
+    current_file: *const c_char,
+    max_threads: u32,
+    page_index: u32,
+    page_size: u32,
+    exclude_frecency: bool,
+) -> *mut FffResult {
     let inst = match unsafe { instance_ref(fff_handle) } {
         Ok(i) => i,
         Err(e) => return e,
@@ -495,6 +816,18 @@ pub unsafe extern "C" fn fff_search_directories(
 
     let current_file_str = unsafe { optional_cstr(current_file) };
     let page_size = default_u32(page_size, 100) as usize;
+    let inst = match inst {
+        FffInstance::Local(local) => local,
+        FffInstance::Service(service) => {
+            return service.search_directories(search_request(
+                query_str,
+                current_file_str,
+                page_index,
+                page_size,
+                exclude_frecency,
+            ));
+        }
+    };
 
     let picker_guard = match inst.picker.read() {
         Ok(g) => g,
@@ -524,6 +857,7 @@ pub unsafe extern "C" fn fff_search_directories(
                 limit: page_size,
             },
             scope: Default::default(),
+            exclude_frecency,
         },
     );
 
@@ -550,6 +884,37 @@ pub unsafe extern "C" fn fff_search_mixed(
     combo_boost_multiplier: i32,
     min_combo_count: u32,
 ) -> *mut FffResult {
+    unsafe {
+        fff_search_mixed_ex(
+            fff_handle,
+            query,
+            current_file,
+            max_threads,
+            page_index,
+            page_size,
+            combo_boost_multiplier,
+            min_combo_count,
+            false,
+        )
+    }
+}
+
+/// [`fff_search_mixed`] plus `exclude_frecency`, as in [`fff_search_ex`].
+///
+/// ## Safety
+/// Same as [`fff_search_mixed`].
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn fff_search_mixed_ex(
+    fff_handle: *mut c_void,
+    query: *const c_char,
+    current_file: *const c_char,
+    max_threads: u32,
+    page_index: u32,
+    page_size: u32,
+    combo_boost_multiplier: i32,
+    min_combo_count: u32,
+    exclude_frecency: bool,
+) -> *mut FffResult {
     let inst = match unsafe { instance_ref(fff_handle) } {
         Ok(i) => i,
         Err(e) => return e,
@@ -564,6 +929,18 @@ pub unsafe extern "C" fn fff_search_mixed(
     let page_size = default_u32(page_size, 100) as usize;
     let min_combo_count = default_u32(min_combo_count, 3);
     let combo_boost_multiplier = default_i32(combo_boost_multiplier, 100);
+    let inst = match inst {
+        FffInstance::Local(local) => local,
+        FffInstance::Service(service) => {
+            return service.search_mixed(search_request(
+                query_str,
+                current_file_str,
+                page_index,
+                page_size,
+                exclude_frecency,
+            ));
+        }
+    };
 
     let picker_guard = match inst.picker.read() {
         Ok(g) => g,
@@ -600,6 +977,7 @@ pub unsafe extern "C" fn fff_search_mixed(
                 limit: page_size,
             },
             scope: Default::default(),
+            exclude_frecency,
         },
     );
 
@@ -674,6 +1052,48 @@ pub unsafe extern "C" fn fff_live_grep_ex(
     after_context: u32,
     classify_definitions: u8,
 ) -> *mut FffResult {
+    unsafe {
+        fff_live_grep_ex2(
+            fff_handle,
+            query,
+            mode,
+            max_file_size,
+            max_matches_per_file,
+            smart_case,
+            file_offset,
+            page_limit,
+            time_budget_ms,
+            enforce_time_budget,
+            before_context,
+            after_context,
+            classify_definitions,
+            false,
+        )
+    }
+}
+
+/// [`fff_live_grep_ex`] plus `exclude_frecency`: files are searched in the
+/// order an index without a frecency database gives, newest first.
+///
+/// ## Safety
+/// Same as [`fff_live_grep`].
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn fff_live_grep_ex2(
+    fff_handle: *mut c_void,
+    query: *const c_char,
+    mode: u8,
+    max_file_size: u64,
+    max_matches_per_file: u32,
+    smart_case: bool,
+    file_offset: u32,
+    page_limit: u32,
+    time_budget_ms: u64,
+    enforce_time_budget: bool,
+    before_context: u32,
+    after_context: u32,
+    classify_definitions: u8,
+    exclude_frecency: bool,
+) -> *mut FffResult {
     let Some(classify_definitions) = fff::DefinitionMode::from_u8(classify_definitions) else {
         return FffResult::err(
             "classify_definitions must be 0 (off), 1 (classify), 2 (definition_only), or 3 (usage_only)",
@@ -687,6 +1107,36 @@ pub unsafe extern "C" fn fff_live_grep_ex(
     let query_str = match unsafe { cstr_to_str(query) } {
         Some(s) => s,
         None => return FffResult::err("Query is null or invalid UTF-8"),
+    };
+    let inst = match inst {
+        FffInstance::Local(local) => local,
+        FffInstance::Service(service) => {
+            return service.grep(GrepRequest {
+                query: query_str.to_owned(),
+                mode: match grep_mode_from_u8(mode) {
+                    fff::GrepMode::PlainText => fff_service::program::GrepMode::PlainText,
+                    fff::GrepMode::Regex => fff_service::program::GrepMode::Regex,
+                    fff::GrepMode::Fuzzy => fff_service::program::GrepMode::Fuzzy,
+                },
+                ai_syntax: service.ai_syntax(),
+                options: GrepOptions {
+                    max_file_size: default_u64(max_file_size, 10 * 1024 * 1024),
+                    max_matches_per_file: max_matches_per_file as usize,
+                    smart_case,
+                    cursor: match service.cursor(file_offset) {
+                        Ok(cursor) => cursor,
+                        Err(error) => return error,
+                    },
+                    page_size: default_u32(page_limit, 50) as usize,
+                    time_budget_ms,
+                    enforce_time_budget,
+                    before_context: before_context as usize,
+                    after_context: after_context as usize,
+                    classify_definitions: service_definition_mode(classify_definitions),
+                    exclude_frecency,
+                },
+            });
+        }
     };
 
     let picker_guard = match inst.picker.read() {
@@ -724,6 +1174,7 @@ pub unsafe extern "C" fn fff_live_grep_ex(
         trim_whitespace: false,
         abort_signal: None,
         scope: Default::default(),
+        exclude_frecency,
     };
 
     let result = picker.grep(&parsed, &options);
@@ -794,6 +1245,47 @@ pub unsafe extern "C" fn fff_multi_grep_ex(
     after_context: u32,
     classify_definitions: u8,
 ) -> *mut FffResult {
+    unsafe {
+        fff_multi_grep_ex2(
+            fff_handle,
+            patterns_joined,
+            constraints,
+            max_file_size,
+            max_matches_per_file,
+            smart_case,
+            file_offset,
+            page_limit,
+            time_budget_ms,
+            enforce_time_budget,
+            before_context,
+            after_context,
+            classify_definitions,
+            false,
+        )
+    }
+}
+
+/// [`fff_multi_grep_ex`] plus `exclude_frecency`, as in [`fff_live_grep_ex2`].
+///
+/// ## Safety
+/// Same as [`fff_multi_grep`].
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn fff_multi_grep_ex2(
+    fff_handle: *mut c_void,
+    patterns_joined: *const c_char,
+    constraints: *const c_char,
+    max_file_size: u64,
+    max_matches_per_file: u32,
+    smart_case: bool,
+    file_offset: u32,
+    page_limit: u32,
+    time_budget_ms: u64,
+    enforce_time_budget: bool,
+    before_context: u32,
+    after_context: u32,
+    classify_definitions: u8,
+    exclude_frecency: bool,
+) -> *mut FffResult {
     let Some(classify_definitions) = fff::DefinitionMode::from_u8(classify_definitions) else {
         return FffResult::err(
             "classify_definitions must be 0 (off), 1 (classify), 2 (definition_only), or 3 (usage_only)",
@@ -815,6 +1307,31 @@ pub unsafe extern "C" fn fff_multi_grep_ex(
     }
 
     let constraints_str = unsafe { optional_cstr(constraints) };
+    let inst = match inst {
+        FffInstance::Local(local) => local,
+        FffInstance::Service(service) => {
+            return service.multi_grep(MultiGrepRequest {
+                patterns: patterns.iter().map(|p| (*p).to_owned()).collect(),
+                constraints: constraints_str.map(str::to_owned),
+                options: GrepOptions {
+                    max_file_size: default_u64(max_file_size, 10 * 1024 * 1024),
+                    max_matches_per_file: max_matches_per_file as usize,
+                    smart_case,
+                    cursor: match service.cursor(file_offset) {
+                        Ok(cursor) => cursor,
+                        Err(error) => return error,
+                    },
+                    page_size: default_u32(page_limit, 50) as usize,
+                    time_budget_ms,
+                    enforce_time_budget,
+                    before_context: before_context as usize,
+                    after_context: after_context as usize,
+                    classify_definitions: service_definition_mode(classify_definitions),
+                    exclude_frecency,
+                },
+            });
+        }
+    };
 
     let picker_guard = match inst.picker.read() {
         Ok(g) => g,
@@ -853,6 +1370,7 @@ pub unsafe extern "C" fn fff_multi_grep_ex(
         trim_whitespace: false,
         abort_signal: None,
         scope: Default::default(),
+        exclude_frecency,
     };
 
     let result = picker.multi_grep(&patterns, constraint_refs, &options);
@@ -867,7 +1385,8 @@ pub unsafe extern "C" fn fff_multi_grep_ex(
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn fff_scan_files(fff_handle: *mut c_void) -> *mut FffResult {
     let inst = match unsafe { instance_ref(fff_handle) } {
-        Ok(i) => i,
+        Ok(FffInstance::Local(local)) => local,
+        Ok(FffInstance::Service(service)) => return service.rescan(),
         Err(e) => return e,
     };
 
@@ -886,7 +1405,8 @@ pub unsafe extern "C" fn fff_scan_files(fff_handle: *mut c_void) -> *mut FffResu
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn fff_is_scanning(fff_handle: *mut c_void) -> bool {
     let inst = match unsafe { instance_ref(fff_handle) } {
-        Ok(i) => i,
+        Ok(FffInstance::Local(local)) => local,
+        Ok(FffInstance::Service(service)) => return service.is_scanning(),
         Err(_) => return false,
     };
 
@@ -905,7 +1425,10 @@ pub unsafe extern "C" fn fff_is_scanning(fff_handle: *mut c_void) -> bool {
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn fff_get_base_path(fff_handle: *mut c_void) -> *mut FffResult {
     let inst = match unsafe { instance_ref(fff_handle) } {
-        Ok(i) => i,
+        Ok(FffInstance::Local(local)) => local,
+        Ok(FffInstance::Service(service)) => {
+            return FffResult::ok_string(&service.base_path().to_string_lossy());
+        }
         Err(e) => return e,
     };
 
@@ -929,7 +1452,8 @@ pub unsafe extern "C" fn fff_get_base_path(fff_handle: *mut c_void) -> *mut FffR
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn fff_get_scan_progress(fff_handle: *mut c_void) -> *mut FffResult {
     let inst = match unsafe { instance_ref(fff_handle) } {
-        Ok(i) => i,
+        Ok(FffInstance::Local(local)) => local,
+        Ok(FffInstance::Service(service)) => return service.scan_progress(),
         Err(e) => return e,
     };
 
@@ -956,8 +1480,11 @@ pub unsafe extern "C" fn fff_wait_for_scan(
     fff_handle: *mut c_void,
     timeout_ms: u64,
 ) -> *mut FffResult {
-    let FffInstance { picker, .. } = match unsafe { instance_ref(fff_handle) } {
-        Ok(i) => i,
+    let picker = match unsafe { instance_ref(fff_handle) } {
+        Ok(FffInstance::Local(local)) => &local.picker,
+        Ok(FffInstance::Service(service)) => {
+            return service.wait_ready(Duration::from_millis(timeout_ms));
+        }
         Err(e) => return e,
     };
 
@@ -974,8 +1501,12 @@ pub unsafe extern "C" fn fff_wait_for_watcher(
     fff_handle: *mut c_void,
     timeout_ms: u64,
 ) -> *mut FffResult {
+    // A service session is ready once its watcher settled.
     let inst = match unsafe { instance_ref(fff_handle) } {
-        Ok(i) => i,
+        Ok(FffInstance::Local(local)) => local,
+        Ok(FffInstance::Service(service)) => {
+            return service.wait_ready(Duration::from_millis(timeout_ms));
+        }
         Err(e) => return e,
     };
 
@@ -1013,6 +1544,10 @@ pub unsafe extern "C" fn fff_restart_index(
     let canonical_path = match fff::path_utils::canonicalize(&path) {
         Ok(p) => p,
         Err(e) => return FffResult::err(&format!("Failed to canonicalize path: {}", e)),
+    };
+    let inst = match inst {
+        FffInstance::Local(local) => local,
+        FffInstance::Service(service) => return service.restart(&canonical_path),
     };
 
     let guard = match inst.picker.write() {
@@ -1069,7 +1604,7 @@ pub unsafe extern "C" fn fff_restart_index(
 /// `fff_handle` must be a valid instance pointer from `fff_create_instance`.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn fff_refresh_git_status(fff_handle: *mut c_void) -> *mut FffResult {
-    let inst = match unsafe { instance_ref(fff_handle) } {
+    let inst = match unsafe { local_instance(fff_handle, "fff_refresh_git_status") } {
         Ok(i) => i,
         Err(e) => return e,
     };
@@ -1091,7 +1626,7 @@ pub unsafe extern "C" fn fff_track_query(
     query: *const c_char,
     file_path: *const c_char,
 ) -> *mut FffResult {
-    let inst = match unsafe { instance_ref(fff_handle) } {
+    let inst = match unsafe { local_instance(fff_handle, "fff_track_query") } {
         Ok(i) => i,
         Err(e) => return e,
     };
@@ -1148,7 +1683,7 @@ pub unsafe extern "C" fn fff_get_historical_query(
     fff_handle: *mut c_void,
     offset: u64,
 ) -> *mut FffResult {
-    let inst = match unsafe { instance_ref(fff_handle) } {
+    let inst = match unsafe { local_instance(fff_handle, "fff_get_historical_query") } {
         Ok(i) => i,
         Err(e) => return e,
     };
@@ -1183,6 +1718,10 @@ pub unsafe extern "C" fn fff_get_historical_query(
 
 /// Get health check information.
 ///
+/// On a service-backed instance the check asks the service for the index's
+/// state and repository; when the instance lost its service, the check fails
+/// with [`FFF_ERROR_LOST_SERVICE`] as [`fff_service_call`] does.
+///
 /// ## Safety
 /// * `fff_handle` must be a valid instance pointer from `fff_create_instance`, or null for
 ///   a limited health check (version + git only).
@@ -1192,9 +1731,7 @@ pub unsafe extern "C" fn fff_health_check(
     fff_handle: *mut c_void,
     test_path: *const c_char,
 ) -> *mut FffResult {
-    let test_path = unsafe { optional_cstr(test_path) }
-        .map(PathBuf::from)
-        .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
+    let test_path = unsafe { optional_cstr(test_path) }.map(PathBuf::from);
 
     let mut health = serde_json::Map::new();
     health.insert(
@@ -1202,48 +1739,22 @@ pub unsafe extern "C" fn fff_health_check(
         serde_json::Value::String(env!("CARGO_PKG_VERSION").to_string()),
     );
 
-    // Git info
-    let mut git_info = serde_json::Map::new();
-    let git_version = git2::Version::get();
-    let (major, minor, rev) = git_version.libgit2_version();
-    git_info.insert(
-        "libgit2_version".to_string(),
-        serde_json::Value::String(format!("{}.{}.{}", major, minor, rev)),
-    );
-
-    match git2::Repository::discover(&test_path) {
-        Ok(repo) => {
-            git_info.insert("available".to_string(), serde_json::Value::Bool(true));
-            git_info.insert(
-                "repository_found".to_string(),
-                serde_json::Value::Bool(true),
-            );
-            if let Some(workdir) = repo.workdir() {
-                git_info.insert(
-                    "workdir".to_string(),
-                    serde_json::Value::String(workdir.to_string_lossy().to_string()),
-                );
-            }
-        }
-        Err(e) => {
-            git_info.insert("available".to_string(), serde_json::Value::Bool(true));
-            git_info.insert(
-                "repository_found".to_string(),
-                serde_json::Value::Bool(false),
-            );
-            git_info.insert(
-                "error".to_string(),
-                serde_json::Value::String(e.message().to_string()),
-            );
-        }
-    }
-    health.insert("git".to_string(), serde_json::Value::Object(git_info));
-
-    let inst: Option<&FffInstance> = if fff_handle.is_null() {
+    let inst: Option<&LocalInstance> = if fff_handle.is_null() {
         None
     } else {
-        Some(unsafe { &*(fff_handle as *const FffInstance) })
+        match unsafe { &*(fff_handle as *const FffInstance) } {
+            FffInstance::Local(local) => Some(local),
+            FffInstance::Service(service) => {
+                return match service.health(test_path.as_deref(), &mut health) {
+                    Ok(()) => health_result(&health),
+                    Err(failure) => failure,
+                };
+            }
+        }
     };
+
+    let test_path = test_path.unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
+    health.insert("git".to_string(), git_health(discover_workdir(&test_path)));
 
     // File picker info
     let mut picker_info = serde_json::Map::new();
@@ -1363,10 +1874,7 @@ pub unsafe extern "C" fn fff_health_check(
         serde_json::Value::Object(query_info),
     );
 
-    match serde_json::to_string(&health) {
-        Ok(json) => FffResult::ok_string(&json),
-        Err(e) => FffResult::err(&format!("Failed to serialize health check: {}", e)),
-    }
+    health_result(&health)
 }
 
 /// Free a search result returned by `fff_search`: the struct, its `items`
@@ -1690,4 +2198,61 @@ pub unsafe extern "C" fn fff_mixed_search_result_get_score(
         return std::ptr::null();
     }
     unsafe { result.scores.add(index as usize) }
+}
+
+fn search_request(
+    query: &str,
+    current_file: Option<&str>,
+    page_index: u32,
+    page_size: usize,
+    exclude_frecency: bool,
+) -> SearchRequest {
+    SearchRequest {
+        query: query.to_owned(),
+        current_file: current_file.map(str::to_owned),
+        offset: page_index as usize,
+        limit: page_size,
+        exclude_frecency,
+    }
+}
+
+// The work tree of the repository containing `path`, or git's reason for none.
+pub(crate) fn discover_workdir(path: &Path) -> Result<Option<PathBuf>, String> {
+    git2::Repository::discover(path)
+        .map(|repo| repo.workdir().map(Path::to_path_buf))
+        .map_err(|e| e.message().to_string())
+}
+
+pub(crate) fn git_health(workdir: Result<Option<PathBuf>, String>) -> serde_json::Value {
+    let (major, minor, rev) = git2::Version::get().libgit2_version();
+    let mut git_info = serde_json::Map::new();
+    git_info.insert(
+        "libgit2_version".to_string(),
+        serde_json::Value::String(format!("{}.{}.{}", major, minor, rev)),
+    );
+    git_info.insert("available".to_string(), serde_json::Value::Bool(true));
+    git_info.insert(
+        "repository_found".to_string(),
+        serde_json::Value::Bool(workdir.is_ok()),
+    );
+    match workdir {
+        Ok(Some(workdir)) => {
+            git_info.insert(
+                "workdir".to_string(),
+                serde_json::Value::String(workdir.to_string_lossy().to_string()),
+            );
+        }
+        Ok(None) => {}
+        Err(error) => {
+            git_info.insert("error".to_string(), serde_json::Value::String(error));
+        }
+    }
+    serde_json::Value::Object(git_info)
+}
+
+fn health_result(health: &serde_json::Map<String, serde_json::Value>) -> *mut FffResult {
+    match serde_json::to_string(health) {
+        Ok(json) => FffResult::ok_string(&json),
+        Err(e) => FffResult::err(&format!("Failed to serialize health check: {}", e)),
+    }
 }

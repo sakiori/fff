@@ -15,12 +15,13 @@ path = "src/main.rs"
 [features]
 # Pure-Rust walker by default; opt into zlob explicitly (needs Zig).
 default = ["ripgrep"]
-ripgrep = ["fff/ripgrep", "fff-query-parser/ripgrep"]
-zlob = ["fff/zlob", "fff-query-parser/zlob"]
+ripgrep = ["fff/ripgrep", "fff-query-parser/ripgrep", "fff-service/ripgrep"]
+zlob = ["fff/zlob", "fff-query-parser/zlob", "fff-service/zlob"]
 
 [dependencies]
 fff = { package = "fff-search", path = "../fff-core", default-features = false , version = "0.11.0", features = ["definitions", "mimalloc-collect"] }
 fff-query-parser = { path = "../fff-query-parser", default-features = false , version = "0.11.0" }
+fff-service = { path = "../fff-service", version = "0.11.0" }
 mimalloc = { workspace = true }
 rmcp = { version = "1.7.0", features = ["server", "transport-io"] }
 schemars = "1.0"
@@ -34,26 +35,24 @@ rayon = { workspace = true }
 globset = { workspace = true }
 clap = { version = "4", features = ["derive", "env"] }
 interprocess = { version = "2.4", features = ["tokio"] }
-blake3 = "1"
 uuid = { version = "1", features = ["v4"] }
 parking_lot = { workspace = true }
 thiserror = { workspace = true }
 constant_time_eq = "0.4"
 
 [target.'cfg(unix)'.dependencies]
+libc = "0.2"
 rustix = { version = "1.1", features = ["fs", "process"] }
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61", features = [
     "Win32_Foundation",
-    "Win32_Security",
-    "Win32_Security_Authorization",
-    "Win32_Storage_FileSystem",
-    "Win32_System_SystemServices",
     "Win32_System_Threading",
     "Win32_System_Diagnostics_ToolHelp",
-    "Win32_System_Console",
 ] }
 
 [dev-dependencies]
 tempfile = "3.8"
+
+[target.'cfg(unix)'.dev-dependencies]
+rustix = { version = "1.1", features = ["pipe"] }

@@ -26,6 +26,9 @@ scripts/benchmark-results/
 *.so
 *.dll
 *.pdb
+packages/fff-node/bin/
+packages/fff-bin-*/fff-mcp
+packages/fff-bin-*/fff-mcp.exe
 
 # Instruments traces
 *.trace/

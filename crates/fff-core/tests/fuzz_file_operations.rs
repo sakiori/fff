@@ -628,6 +628,7 @@ fn grep_plain_opts() -> GrepSearchOptions {
         trim_whitespace: false,
         abort_signal: None,
         scope: Default::default(),
+        exclude_frecency: false,
     }
 }
 

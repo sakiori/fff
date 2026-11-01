@@ -971,6 +971,7 @@ pub struct ScoringContext<'a> {
     pub combo_boost_score_multiplier: i32,
     pub min_combo_count: u32,
     pub pagination: PaginationArgs,
+    pub exclude_frecency: bool,
 }
 
 impl ScoringContext<'_> {
@@ -1064,13 +1065,18 @@ impl ContentCacheBudget {
             || self.cached_bytes.load(Ordering::Relaxed) >= self.max_bytes
     }
 
+    /// Fewest files the size-based budget of [`Self::new_for_repo`] caches.
+    pub const AUTO_MIN_FILES: usize = 5_000;
+    /// Most files the size-based budget of [`Self::new_for_repo`] caches.
+    pub const AUTO_MAX_FILES: usize = 30_000;
+
     pub fn new_for_repo(file_count: usize) -> Self {
         let max_files = if file_count > 50_000 {
-            5_000
+            Self::AUTO_MIN_FILES
         } else if file_count > 10_000 {
             10_000
         } else {
-            30_000 // effectively unlimited for small repos
+            Self::AUTO_MAX_FILES // effectively unlimited for small repos
         };
 
         let max_bytes = if file_count > 50_000 {

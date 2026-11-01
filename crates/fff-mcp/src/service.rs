@@ -4,8 +4,14 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
+use fff_service::namespace::Namespace;
+use fff_service::protocol::{
+    Endpoint, Hello, HelloHeader, MAX_MESSAGE_BYTES, MessageError, PROTOCOL, Reply, Request,
+    ServiceError, ServiceStatus, SessionKind, read_line, send_message,
+};
+use fff_service::{Build, ServiceFiles, socket_name};
 use interprocess::local_socket::{
-    ListenerOptions, Name,
+    ListenerOptions,
     tokio::{Listener, Stream, prelude::*},
 };
 use parking_lot::Mutex;
@@ -13,11 +19,6 @@ use rmcp::{ServiceExt, transport::async_rw::AsyncRwTransport};
 use tokio::io::BufReader;
 use tokio::sync::{Notify, mpsc, oneshot};
 
-use crate::namespace::Namespace;
-use crate::protocol::{
-    Endpoint, Hello, HelloHeader, MessageError, PROTOCOL, Reply, Request, ServiceError,
-    ServiceStatus, read_line, send_message,
-};
 use crate::registry::Registry;
 
 // Time a client has to send its hello after connecting.
@@ -31,94 +32,23 @@ const DISCOVERY_CHECK_TIMEOUT: Duration = Duration::from_secs(5);
 const SHUTDOWN_GRACE: Duration = Duration::from_secs(2);
 const ACCEPT_BACKOFF_MIN: Duration = Duration::from_millis(10);
 const ACCEPT_BACKOFF_MAX: Duration = Duration::from_secs(1);
-const BUILD_TAG_LEN: usize = 16;
-const ENDPOINT_PREFIX: &str = "endpoint-";
-const ENDPOINT_SUFFIX: &str = ".json";
-
-// Identity of this executable; services of different builds run side by side.
-pub(crate) struct Build {
-    id: String,
-}
-
-impl Build {
-    pub fn current() -> io::Result<Self> {
-        let mut hasher = blake3::Hasher::new();
-        hasher.update_reader(File::open(std::env::current_exe()?)?)?;
-        Ok(Self {
-            id: hasher.finalize().to_hex().to_string(),
-        })
-    }
-
-    pub fn id(&self) -> &str {
-        &self.id
-    }
-
-    pub fn files(&self) -> ServiceFiles {
-        ServiceFiles {
-            tag: self.id[..BUILD_TAG_LEN].to_owned(),
-        }
-    }
-}
-
-// Namespace file names of one build's service, derived from a short build tag.
-pub(crate) struct ServiceFiles {
-    tag: String,
-}
-
-impl ServiceFiles {
-    pub fn from_endpoint(name: &str) -> Option<Self> {
-        let tag = name
-            .strip_prefix(ENDPOINT_PREFIX)?
-            .strip_suffix(ENDPOINT_SUFFIX)?;
-        Some(Self {
-            tag: tag.to_owned(),
-        })
-    }
-
-    pub fn endpoint_pattern() -> (&'static str, &'static str) {
-        (ENDPOINT_PREFIX, ENDPOINT_SUFFIX)
-    }
-
-    pub fn endpoint(&self) -> String {
-        format!("{ENDPOINT_PREFIX}{}{ENDPOINT_SUFFIX}", self.tag)
-    }
-
-    pub fn startup_lock(&self) -> String {
-        format!("startup-{}.lock", self.tag)
-    }
-
-    pub fn owner_lock(&self) -> String {
-        format!("owner-{}.lock", self.tag)
-    }
-
-    pub fn stderr(&self) -> String {
-        format!("service-{}.stderr", self.tag)
-    }
-
-    #[cfg(unix)]
-    fn socket(&self) -> String {
-        format!("{}.sock", self.tag)
-    }
-}
-
 pub(crate) fn directory(args: &crate::Args) -> PathBuf {
     args.service_dir
         .clone()
-        .unwrap_or_else(|| crate::state_dir().join("fff").join("service"))
-}
-
-pub(crate) fn socket_name(name: &str) -> io::Result<Name<'_>> {
-    #[cfg(unix)]
-    {
-        name.to_fs_name::<interprocess::local_socket::GenericFilePath>()
-    }
-    #[cfg(windows)]
-    {
-        name.to_ns_name::<interprocess::local_socket::GenericNamespaced>()
-    }
+        .unwrap_or_else(fff_service::default_directory)
 }
 
 pub(crate) async fn run(args: &crate::Args, build: &Build) -> io::Result<()> {
+    if let Some(expected) = &args.service_build
+        && expected != build.id()
+    {
+        return Err(io::Error::other(format!(
+            "{} is service build {}, but the client needs build {expected}; \
+             use the service executable of the client's release",
+            std::env::current_exe()?.display(),
+            build.id(),
+        )));
+    }
     let namespace = Arc::new(Namespace::open(&directory(args))?);
     let files = build.files();
     let startup = namespace.open_file(&files.startup_lock(), true)?;
@@ -171,8 +101,13 @@ impl Service {
         startup: File,
         idle: Option<Duration>,
     ) -> io::Result<(Self, Listener, mpsc::Receiver<StopRequest>)> {
-        let name = endpoint_name(&namespace, files);
-        let mut listener = crate::namespace::listener_options(
+        #[cfg(unix)]
+        let socket = fff_service::socket::SocketPlace::open(&namespace, files)?;
+        #[cfg(unix)]
+        let name = socket.path(&namespace).to_string_lossy().into_owned();
+        #[cfg(windows)]
+        let name = format!("fff-{}", uuid::Uuid::new_v4().simple());
+        let mut listener = fff_service::namespace::listener_options(
             ListenerOptions::new()
                 .name(socket_name(&name)?)
                 .try_overwrite(true),
@@ -189,11 +124,11 @@ impl Service {
         // Dropping the listener would unlink its path, which a successor may have bound by then.
         listener.do_not_reclaim_name_on_drop();
         #[cfg(unix)]
-        let socket = files.socket();
-        #[cfg(unix)]
-        let socket_id = namespace
-            .file_id(&socket)?
-            .ok_or_else(|| namespace.error("find", &socket, io::ErrorKind::NotFound.into()))?;
+        let socket_id = {
+            let dir = socket.dir(&namespace);
+            dir.file_id(socket.name())?
+                .ok_or_else(|| dir.error("find", socket.name(), io::ErrorKind::NotFound.into()))?
+        };
         let token = uuid::Uuid::new_v4().simple().to_string();
         let endpoint = Endpoint {
             name,
@@ -387,9 +322,9 @@ struct Discovery {
     content: Vec<u8>,
     token: String,
     #[cfg(unix)]
-    socket: String,
+    socket: fff_service::socket::SocketPlace,
     #[cfg(unix)]
-    socket_id: crate::namespace::FileId,
+    socket_id: fff_service::namespace::FileId,
 }
 
 impl Discovery {
@@ -404,7 +339,13 @@ impl Discovery {
         }
         #[cfg(unix)]
         {
-            Ok(self.namespace.file_id(&self.socket)? == Some(self.socket_id))
+            let dir = self.socket.dir(&self.namespace);
+            let reachable = dir.names_opened_directory()?
+                && dir.file_id(self.socket.name())? == Some(self.socket_id);
+            if reachable && let Err(error) = self.socket.keep_fresh() {
+                tracing::warn!(%error, "Cannot renew the times of the service socket");
+            }
+            Ok(reachable)
         }
         #[cfg(windows)]
         {
@@ -454,9 +395,9 @@ impl Discovery {
 
     #[cfg(unix)]
     fn remove_socket(&self) -> io::Result<()> {
-        if self.namespace.names_opened_directory()? {
-            self.namespace
-                .remove_file_if(&self.socket, self.socket_id)?;
+        let dir = self.socket.dir(&self.namespace);
+        if dir.names_opened_directory()? {
+            dir.remove_file_if(self.socket.name(), self.socket_id)?;
         }
         Ok(())
     }
@@ -497,10 +438,15 @@ impl DiscoveryCheck {
 
 impl Context {
     async fn handle(self: Arc<Self>, stream: Stream) -> io::Result<()> {
-        crate::namespace::verify_peer(&stream)?;
+        fff_service::namespace::verify_peer(&stream)?;
         let (recv, mut send) = stream.split();
         let mut recv = BufReader::new(recv);
-        let line = match tokio::time::timeout(HELLO_TIMEOUT, read_line(&mut recv)).await {
+        let line = match tokio::time::timeout(
+            HELLO_TIMEOUT,
+            read_line(&mut recv, MAX_MESSAGE_BYTES),
+        )
+        .await
+        {
             Err(_) => return Err(io::Error::new(io::ErrorKind::TimedOut, "No service hello")),
             Ok(Err(MessageError::Io(error))) => return Err(error),
             Ok(Err(MessageError::Closed)) => return Ok(()),
@@ -516,7 +462,7 @@ impl Context {
             Ok(request) => request,
             Err(error) => return send_message(&mut send, &Reply::Error { error }).await,
         };
-        let session = match request {
+        let (scope, options, kind) = match request {
             Request::Status => return send_message(&mut send, &Reply::Status(self.status())).await,
             Request::Stop => {
                 let reply = match self.stop().await {
@@ -525,19 +471,22 @@ impl Context {
                 };
                 return send_message(&mut send, &reply).await;
             }
-            Request::Session { scope, options } => {
-                let registered = match self.activity.try_lease() {
-                    Ok(lease) => self.registry.register(scope, options, lease).await,
-                    Err(error) => Err(error),
-                };
-                match registered {
-                    Ok(session) => session,
-                    Err(error) => return send_message(&mut send, &Reply::Error { error }).await,
-                }
-            }
+            Request::Session { scope, options } => (scope, options, SessionKind::Mcp),
+            Request::Program { scope, options } => (scope, options, SessionKind::Program),
+        };
+        let registered = match self.activity.try_lease() {
+            Ok(lease) => self.registry.register(scope, options, kind, lease).await,
+            Err(error) => Err(error),
+        };
+        let session = match registered {
+            Ok(session) => session,
+            Err(error) => return send_message(&mut send, &Reply::Error { error }).await,
         };
         let warnings = session.snapshot().index.warnings.clone();
         send_message(&mut send, &Reply::Ready { warnings }).await?;
+        if kind == SessionKind::Program {
+            return crate::program::serve(session, recv, send).await;
+        }
         let server = crate::server::FffServer::new(session);
         let transport =
             crate::handshake::ProbeTolerantTransport::new(AsyncRwTransport::new_server(recv, send));
@@ -644,22 +593,6 @@ impl Drop for Lease {
     }
 }
 
-fn endpoint_name(namespace: &Namespace, files: &ServiceFiles) -> String {
-    #[cfg(unix)]
-    {
-        namespace
-            .path()
-            .join(files.socket())
-            .to_string_lossy()
-            .into_owned()
-    }
-    #[cfg(windows)]
-    {
-        let _ = (namespace, files);
-        format!("fff-{}", uuid::Uuid::new_v4().simple())
-    }
-}
-
 // Only errors that mean the listening socket itself is unusable end the service.
 fn is_listener_dead(error: &io::Error) -> bool {
     #[cfg(unix)]
@@ -705,16 +638,6 @@ mod tests {
         assert!(activity.try_lease().is_ok());
     }
 
-    #[test]
-    fn endpoint_names_round_trip_to_service_files() {
-        let files = ServiceFiles {
-            tag: "0123456789abcdef".into(),
-        };
-        let parsed = ServiceFiles::from_endpoint(&files.endpoint()).unwrap();
-        assert_eq!(parsed.owner_lock(), files.owner_lock());
-        assert!(ServiceFiles::from_endpoint("owner-0123.lock").is_none());
-    }
-
     #[cfg(unix)]
     #[test]
     fn only_unusable_listeners_are_fatal() {
@@ -744,9 +667,7 @@ mod tests {
         async fn start(temp: &Path) -> Self {
             let path = temp.join("service");
             let namespace = Arc::new(Namespace::open(&path).unwrap());
-            let files = ServiceFiles {
-                tag: "0123456789abcdef".into(),
-            };
+            let files = ServiceFiles::from_endpoint("endpoint-0123456789abcdef.json").unwrap();
             let startup = namespace.open_file(&files.startup_lock(), true).unwrap();
             let (mut service, listener, commands) =
                 Service::bind(namespace.clone(), &files, "test", startup, None).unwrap();

@@ -175,6 +175,7 @@ fn run_fff_full(picker: &FilePicker, query: &str) -> (usize, Duration) {
         trim_whitespace: false,
         abort_signal: None,
         scope: Default::default(),
+        exclude_frecency: false,
     };
     let start = Instant::now();
     let result = picker.grep(&parsed, &options);
@@ -201,6 +202,7 @@ fn run_fff_page(picker: &FilePicker, query: &str) -> (usize, Duration) {
         trim_whitespace: false,
         abort_signal: None,
         scope: Default::default(),
+        exclude_frecency: false,
     };
     let start = Instant::now();
     let result = picker.grep(&parsed, &options);

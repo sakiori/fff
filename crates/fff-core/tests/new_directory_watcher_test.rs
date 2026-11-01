@@ -146,6 +146,7 @@ fn grep_plain_count(picker: &FilePicker, query: &str) -> usize {
         trim_whitespace: false,
         abort_signal: None,
         scope: Default::default(),
+        exclude_frecency: false,
     };
     picker.grep(&parsed, &opts).matches.len()
 }

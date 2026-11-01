@@ -1,6 +1,6 @@
-import { FileFinder } from "@ff-labs/fff-node";
+import { FileFinder } from "@sakiori/fff-node";
 
-const finder = FileFinder.create({ basePath: "~/dev/linux-root" });
+const finder = await FileFinder.create({ basePath: "~/dev/linux-root" });
 if (!finder.ok) {
   throw new Error(`Failed to create FileFinder: ${finder.error}`);
 }
@@ -11,11 +11,11 @@ if (!scan.ok) {
 }
 
 // 5ms on m1 mac at the linux kernel repo root
-const result = finder.value.grep("hardwre", { mode: "plain" });
+const result = await finder.value.grep("hardwre", { mode: "plain" });
 for (const match of result.value.items) {
   console.log(`${match.relativePath}:${match.lineNumber}: ${match.lineContent}`);
 }
 
 console.log(`\n${result.value.totalMatched} matches across ${result.value.totalFilesSearched} files`);
 
-finder.value.destroy();
+await finder.value.destroy();

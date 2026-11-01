@@ -288,6 +288,9 @@ pub(crate) fn fuzzy_match_and_score_files<'a>(
 ) -> (Vec<&'a FileItem>, Vec<Score>, usize) {
     let slices = Slice::split(files, base_count, arenas, scope);
     if fuzzy_parts(context.query).is_none() {
+        if context.exclude_frecency {
+            return rank_by_path(&slices, context, arenas);
+        }
         return rank_by_frecency(&slices, context, arenas);
     }
 
@@ -342,6 +345,33 @@ fn rank_by_frecency<'a>(
         .map(|file| frecency_score(file, context, arenas.select(file.is_overflow())))
         .collect();
     (items, scores, total_matched)
+}
+
+fn rank_by_path<'a>(
+    slices: &[Slice<'a, '_>],
+    context: &ScoringContext,
+    arenas: Arenas,
+) -> (Vec<&'a FileItem>, Vec<Score>, usize) {
+    let mut files = Vec::new();
+    for slice in slices {
+        let Some(working_files) = slice.select(context) else {
+            continue;
+        };
+        files.extend(
+            (0..working_files.len())
+                .map(|index| working_files.index(index))
+                .filter(|file| !file.is_deleted()),
+        );
+    }
+    paginate_by_path(files, context, |file, out| {
+        file.path
+            .append_to_string(arenas.select(file.is_overflow()), out)
+    })
+}
+
+/// Whether ranking ignores frecency and lists matches in path order.
+pub(crate) fn orders_by_path(query: &FFFQuery<'_>, exclude_frecency: bool) -> bool {
+    exclude_frecency && fuzzy_parts(query).is_none()
 }
 
 fn fuzzy_parts<'q>(query: &'q FFFQuery<'q>) -> Option<&'q [&'q str]> {
@@ -636,7 +666,7 @@ pub(crate) fn fuzzy_match_and_score_dirs<'a>(
         FuzzyQuery::Text(t) if t.len() >= 2 => std::slice::from_ref(t),
         FuzzyQuery::Parts(parts) if !parts.is_empty() => parts.as_slice(),
         _ => {
-            return score_dirs_by_frecency(dirs, &working_dirs, context);
+            return score_dirs_without_text(dirs, &working_dirs, context, arenas);
         }
     };
 
@@ -647,7 +677,7 @@ pub(crate) fn fuzzy_match_and_score_dirs<'a>(
         .collect();
 
     if valid_parts.is_empty() {
-        return score_dirs_by_frecency(dirs, &working_dirs, context);
+        return score_dirs_without_text(dirs, &working_dirs, context, arenas);
     }
 
     let has_uppercase = valid_parts
@@ -702,7 +732,11 @@ pub(crate) fn fuzzy_match_and_score_dirs<'a>(
             let dir = &dirs[working_dirs[path_match.index as usize] as usize];
             let dir_arena = arenas.select(dir.is_overflow());
             let base_score = path_match.score as i32;
-            let frecency_boost = base_score.saturating_mul(dir.max_access_frecency()) / 100;
+            let frecency_boost = if context.exclude_frecency {
+                0
+            } else {
+                base_score.saturating_mul(dir.max_access_frecency()) / 100
+            };
 
             // Distance penalty from current file's directory.
             let distance_penalty = if let Some(distance) = &distance {
@@ -765,6 +799,22 @@ pub(crate) fn fuzzy_match_and_score_dirs<'a>(
         .collect();
 
     sort_and_paginate_dirs(results, context)
+}
+
+fn score_dirs_without_text<'a>(
+    dirs: &'a [DirItem],
+    working_dirs: &[u32],
+    context: &ScoringContext,
+    arenas: Arenas,
+) -> (Vec<&'a DirItem>, Vec<Score>, usize) {
+    if !context.exclude_frecency {
+        return score_dirs_by_frecency(dirs, working_dirs, context);
+    }
+    let items: Vec<&DirItem> = working_dirs.iter().map(|&i| &dirs[i as usize]).collect();
+    paginate_by_path(items, context, |dir, out| {
+        dir.path
+            .append_to_string(arenas.select(dir.is_overflow()), out)
+    })
 }
 
 fn score_dirs_by_frecency<'a>(
@@ -944,7 +994,11 @@ fn match_and_score_working_files<'a, const WITH_CURRENT_FILE: bool>(
             let file = working_files.index(file_idx);
 
             let base_score = path_match.score as i32;
-            let frecency_boost = base_score.saturating_mul(file.total_frecency_score()) / 100;
+            let frecency_boost = if context.exclude_frecency {
+                0
+            } else {
+                base_score.saturating_mul(file.total_frecency_score()) / 100
+            };
 
             let git_status_boost = if file.git_status.is_some_and(is_modified_status) {
                 base_score * 15 / 100
@@ -1336,6 +1390,51 @@ where
     )
 }
 
+// Pages items by relative path with zero scores; paths are unique, so the order is total.
+fn paginate_by_path<'a, T>(
+    items: Vec<&'a T>,
+    context: &ScoringContext,
+    append_path: impl Fn(&T, &mut String),
+) -> (Vec<&'a T>, Vec<Score>, usize) {
+    let total_matched = items.len();
+    let offset = context.pagination.offset;
+    if offset >= total_matched {
+        return (vec![], vec![], total_matched);
+    }
+    let limit = match context.pagination.limit {
+        0 => total_matched,
+        limit => limit,
+    };
+    let mut paths = String::new();
+    let mut ends = Vec::with_capacity(total_matched);
+    for item in &items {
+        append_path(item, &mut paths);
+        ends.push(paths.len());
+    }
+    let path = |index: u32| {
+        let index = index as usize;
+        let start = index.checked_sub(1).map_or(0, |previous| ends[previous]);
+        &paths[start..ends[index]]
+    };
+    let mut order: Vec<u32> = (0..total_matched as u32).collect();
+    let needed = offset.saturating_add(limit).min(total_matched);
+    let compare = |a: &u32, b: &u32| path(*a).cmp(path(*b));
+    if needed < total_matched {
+        order.select_nth_unstable_by(needed - 1, compare);
+        order.truncate(needed);
+    }
+    order.sort_unstable_by(compare);
+    let page: Vec<&T> = order[offset..].iter().map(|&i| items[i as usize]).collect();
+    let scores = vec![
+        Score {
+            match_type: "path",
+            ..Default::default()
+        };
+        page.len()
+    ];
+    (page, scores, total_matched)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1482,6 +1581,7 @@ mod tests {
                     combo_boost_score_multiplier: 100,
                     min_combo_count: 3,
                     pagination: PaginationArgs::default(),
+                    exclude_frecency: false,
                 };
                 let mut parallel = match_all_in_arena(&files, &context, arena);
                 context.max_threads = 1;
@@ -1543,6 +1643,7 @@ mod tests {
                 offset: 0,
                 limit: 50,
             },
+            exclude_frecency: false,
         };
         for count in [0, 1, 1000, 33_000] {
             let items = FileItems::All(&files[..count]);
@@ -1624,6 +1725,7 @@ mod tests {
                         combo_boost_score_multiplier: 0,
                         min_combo_count: 0,
                         pagination: PaginationArgs { offset, limit },
+                        exclude_frecency: false,
                     };
                     let expected_page: Vec<_> = expected
                         .iter()
@@ -1677,6 +1779,7 @@ mod tests {
                 combo_boost_score_multiplier: 0,
                 min_combo_count: 0,
                 pagination: PaginationArgs { offset, limit: 8 },
+                exclude_frecency: false,
             };
             sort_and_paginate(results, &context, |s| s.total).0
         };
@@ -1794,6 +1897,7 @@ mod tests {
                 offset: 0,
                 limit: 0,
             },
+            exclude_frecency: false,
         };
 
         // Test with full sort - returns all results sorted descending
@@ -1845,6 +1949,7 @@ mod tests {
                 offset: 0,
                 limit: 0,
             },
+            exclude_frecency: false,
         };
 
         let (items, scores, _) = sort_and_paginate(results, &context, |s| s.total);
@@ -1894,6 +1999,7 @@ mod tests {
                 offset: 0,
                 limit: 0,
             },
+            exclude_frecency: false,
         };
 
         // Returns all results sorted descending
@@ -1964,6 +2070,7 @@ mod filename_bonus_tests {
                 offset: 0,
                 limit: 50,
             },
+            exclude_frecency: false,
         };
         let results = super::tests::match_all_in_arena(&files, &context, arena);
         assert_eq!(results.len(), files.len());
@@ -2042,6 +2149,7 @@ mod filename_bonus_tests {
                 offset: 0,
                 limit: 100,
             },
+            exclude_frecency: false,
         };
         let (items, scores, _) =
             fuzzy_match_and_score_files(files, &ctx, files.len(), Arenas::single(arena), None);
@@ -2284,6 +2392,7 @@ mod git_recency_scoring_tests {
                 offset: 0,
                 limit: 100,
             },
+            exclude_frecency: false,
         };
         let (items, scores, _) =
             fuzzy_match_and_score_files(files, &ctx, files.len(), Arenas::single(arena), None);
@@ -2373,6 +2482,7 @@ mod typo_resistance_tests {
                 offset: 0,
                 limit: 100,
             },
+            exclude_frecency: false,
         };
         let (items, _, _) =
             fuzzy_match_and_score_files(files, &ctx, files.len(), Arenas::single(arena), None);
@@ -2482,6 +2592,7 @@ mod constraint_only_query_tests {
                 offset: 0,
                 limit: 50,
             },
+            exclude_frecency: false,
         };
 
         let (items, _scores, total_matched) =
@@ -2533,6 +2644,7 @@ mod constraint_only_query_tests {
                 offset: 0,
                 limit: 50,
             },
+            exclude_frecency: false,
         };
 
         let (items, _scores, total_matched) =

@@ -3,10 +3,9 @@ mod cursor;
 mod file_search;
 mod handshake;
 mod healthcheck;
-mod namespace;
 mod output;
 mod parent;
-mod protocol;
+mod program;
 mod registry;
 mod scope;
 mod server;
@@ -49,6 +48,10 @@ pub(crate) struct Args {
 
     #[arg(long, hide = true)]
     service: bool,
+
+    // The build identity the launching client expects of this service.
+    #[arg(long, hide = true, requires = "service")]
+    service_build: Option<String>,
 
     /// Report the shared services in the namespace without starting one.
     #[arg(long)]
@@ -179,43 +182,8 @@ fn resolve_defaults(args: &mut Args) {
 // Own subdirectory: log rotation read_dir's the parent on every startup, and the
 // per-session `<stem>+<ts>+<pid>.log` files otherwise pile up in its root.
 fn default_log_file() -> PathBuf {
-    state_dir().join("fff").join("fff_mcp.log")
+    fff_service::state_dir().join("fff").join("fff_mcp.log")
 }
-
-// Per-user state root shared by logs and the default service namespace.
-#[cfg(not(windows))]
-pub(crate) fn state_dir() -> PathBuf {
-    absolute_env("XDG_STATE_HOME").unwrap_or_else(|| dirs_home().join(".local").join("state"))
-}
-
-#[cfg(windows)]
-pub(crate) fn state_dir() -> PathBuf {
-    absolute_env("LOCALAPPDATA").unwrap_or_else(|| dirs_home().join("AppData").join("Local"))
-}
-
-// XDG spec: a non-absolute value must be ignored as if unset.
-fn absolute_env(key: &str) -> Option<PathBuf> {
-    std::env::var_os(key)
-        .map(PathBuf::from)
-        .filter(|value| value.is_absolute())
-}
-
-// Relative homes would break the absolute-path contract of the default above,
-// and TMPDIR can be relative too, so every fallback is filtered for absoluteness.
-fn dirs_home() -> PathBuf {
-    absolute_env("HOME")
-        .or_else(|| absolute_env("USERPROFILE"))
-        .or_else(|| {
-            let tmp = std::env::temp_dir();
-            tmp.is_absolute().then_some(tmp)
-        })
-        .unwrap_or_else(|| PathBuf::from(FALLBACK_ROOT))
-}
-
-#[cfg(not(windows))]
-const FALLBACK_ROOT: &str = "/tmp";
-#[cfg(windows)]
-const FALLBACK_ROOT: &str = "C:\\Windows\\Temp";
 
 fn main() -> std::process::ExitCode {
     let args = Args::parse();
@@ -264,7 +232,7 @@ async fn run(mut args: Args) -> Result<(), Box<dyn std::error::Error>> {
         ),
     }
 
-    let build = service::Build::current()?;
+    let build = fff_service::Build::current();
     if args.service {
         if !args.no_update_check {
             update_check::spawn_update_check();

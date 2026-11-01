@@ -97,6 +97,9 @@ pub struct FuzzySearchOptions<'a> {
     /// Directory the search is limited to; query paths and highlight offsets
     /// are relative to it. Defaults to the whole index.
     pub scope: &'a SearchScope,
+    /// Rank as if the index had no frecency database; a query without fuzzy
+    /// text then lists entries in path order.
+    pub exclude_frecency: bool,
 }
 
 #[derive(Debug)]
@@ -1190,6 +1193,7 @@ impl FilePicker {
             combo_boost_score_multiplier: options.combo_boost_score_multiplier,
             min_combo_count: options.min_combo_count,
             pagination: options.pagination,
+            exclude_frecency: options.exclude_frecency,
         };
 
         let time = std::time::Instant::now();
@@ -1266,6 +1270,7 @@ impl FilePicker {
             combo_boost_score_multiplier: 0,
             min_combo_count: 0,
             pagination: options.pagination,
+            exclude_frecency: options.exclude_frecency,
         };
 
         let time = std::time::Instant::now();
@@ -1393,8 +1398,15 @@ impl FilePicker {
             merged.push((MixedItemRef::Dir(dir), score));
         }
 
-        // Sort merged results by total score descending.
-        merged.sort_unstable_by_key(|b| std::cmp::Reverse(b.1.total));
+        if crate::score::orders_by_path(query, options.exclude_frecency) {
+            merged.sort_by_cached_key(|(item, _)| match item {
+                MixedItemRef::File(file) => file.relative_path(self),
+                MixedItemRef::Dir(dir) => dir.relative_path(self),
+            });
+        } else {
+            // Sort merged results by total score descending.
+            merged.sort_unstable_by_key(|b| std::cmp::Reverse(b.1.total));
+        }
 
         // Paginate.
         if page_offset >= merged.len() {
@@ -2091,7 +2103,11 @@ impl FilePicker {
 
     /// Returns a lock-free view of the background scan and watcher progress.
     pub fn background_status(&self) -> crate::scan::BackgroundStatus {
-        crate::scan::BackgroundStatus::new(self.signals.clone(), self.watch)
+        crate::scan::BackgroundStatus::new(
+            self.signals.clone(),
+            self.watch,
+            Arc::clone(&self.scanned_files_count),
+        )
     }
 
     /// Convert an absolute path to a relative path string (relative to base_path).

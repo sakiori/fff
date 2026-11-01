@@ -14,10 +14,21 @@ use std::process::{Child, ChildStdin, Command, Stdio};
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
+use fff::file_picker::{FFFMode, FilePicker};
+use fff::types::PaginationArgs;
+use fff::{FilePickerOptions, FuzzySearchOptions, QueryParser};
+use fff_service::client::ClientError;
+use fff_service::program::{
+    GlobRequest, GrepCursor, GrepMode, GrepOptions, GrepRequest, GrepResults, MixedEntry,
+    MultiGrepRequest, ProgramError, SearchRequest,
+};
+use fff_service::protocol::IndexOptions;
+use fff_service::session::{CONNECT_TIMEOUT, ProgramConfig, ProgramSession, RESPONSE_TIMEOUT};
 use interprocess::local_socket::{Stream, prelude::*};
 use serde_json::{Value, json};
 
 const BIN: &str = env!("CARGO_BIN_EXE_fff-mcp");
+const PROTOCOL: u32 = fff_service::protocol::PROTOCOL;
 const EVENTUAL: Duration = Duration::from_secs(15);
 // Services watch through the polling backend, so watcher tests do not depend on
 // the OS event service delivering events.
@@ -171,7 +182,17 @@ fn client_command(
 }
 
 fn cli(binary: &str, flag: &str, service: &Path) -> std::process::Output {
+    cli_with(binary, flag, service, &[])
+}
+
+fn cli_with(
+    binary: &str,
+    flag: &str,
+    service: &Path,
+    env: &[(&str, &str)],
+) -> std::process::Output {
     Command::new(binary)
+        .envs(env.iter().copied())
         .arg(flag)
         .arg("--service-dir")
         .arg(service)
@@ -269,8 +290,13 @@ fn fixture(root: &Path) -> (PathBuf, PathBuf) {
 }
 
 fn start_daemon(service: &Path, idle: &str) -> Daemon {
+    start_daemon_with(service, idle, &[])
+}
+
+fn start_daemon_with(service: &Path, idle: &str, env: &[(&str, &Path)]) -> Daemon {
     let mut child = Daemon(
         Command::new(BIN)
+            .envs(env.iter().copied())
             .args([
                 "--service",
                 "--no-update-check",
@@ -829,7 +855,8 @@ fn incompatible_options_keep_separate_indexes_in_one_service() {
     let (project, _) = fixture(tmp.path());
     // Idle exit is disabled so only the explicit stop can end the service.
     let first = Client::start_configured(BIN, &project, &service, "0", &[], &[]);
-    let second = Client::start_configured(BIN, &project, &service, "0", &["--no-watch"], &[]);
+    let second =
+        Client::start_configured(BIN, &project, &service, "0", &["--follow-symlinks"], &[]);
     let stats = status(&service);
     assert_eq!(stats["index_count"], 2);
     assert_eq!(stats["sessions"].as_array().unwrap().len(), 2);
@@ -852,6 +879,172 @@ fn incompatible_options_keep_separate_indexes_in_one_service() {
         "{}",
         String::from_utf8_lossy(&stopped.stderr)
     );
+    wait_stopped(&service, &pids);
+}
+
+// The service roots of the sessions, sorted.
+fn session_roots(stats: &Value) -> Vec<String> {
+    let mut roots: Vec<String> = stats["sessions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|s| s["root"].as_str().unwrap().to_owned())
+        .collect();
+    roots.sort();
+    roots
+}
+
+#[test]
+fn content_indexing_is_a_capability_in_both_arrival_orders() {
+    for content_first in [true, false] {
+        let tmp = Sandbox::new();
+        let service = tmp.service();
+        let (project, _) = fixture(tmp.path());
+        let content: &[&str] = &["--content-indexing"];
+        let (first, second) = if content_first {
+            (content, &[][..])
+        } else {
+            (&[][..], content)
+        };
+        let mut first = Client::start_with(&project, &service, first);
+        let mut second = Client::start_with(&project, &service, second);
+        if content_first {
+            assert_eq!(
+                status(&service)["index_count"],
+                1,
+                "paths-only request built an index"
+            );
+        }
+        // A paths-only session moves to the content index once it is ready, and the
+        // paths-only index is released.
+        let stats = wait_status(
+            &service,
+            "sessions never shared the content index",
+            shared_by(2),
+        );
+        assert_eq!(
+            stats["indexes"][0]["options"]["content_indexing"], true,
+            "{stats}"
+        );
+        for client in [&mut first, &mut second] {
+            assert!(
+                client
+                    .tool("grep", json!({"query":"UniqueNeedle"}))
+                    .contains("inside.rs")
+            );
+        }
+        let pids = service_pids(&service);
+        drop(first);
+        drop(second);
+        wait_stopped(&service, &pids);
+    }
+}
+
+#[test]
+fn symlink_policy_separates_indexes() {
+    let tmp = Sandbox::new();
+    let service = tmp.service();
+    let (project, _) = fixture(tmp.path());
+    let mut plain = Client::start(&project, &service);
+    let mut following = Client::start_with(&project, &service, &["--follow-symlinks"]);
+    for client in [&mut plain, &mut following] {
+        assert!(
+            client
+                .tool("grep", json!({"query":"UniqueNeedle"}))
+                .contains("inside.rs")
+        );
+    }
+    let stats = status(&service);
+    assert_eq!(stats["index_count"], 2, "{stats}");
+    let mut policies: Vec<_> = stats["indexes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|index| index["options"]["follow_symlinks"].as_bool().unwrap())
+        .collect();
+    policies.sort();
+    assert_eq!(policies, [false, true]);
+    let pids = service_pids(&service);
+    drop(plain);
+    drop(following);
+    wait_stopped(&service, &pids);
+}
+
+#[test]
+fn snapshot_request_uses_a_watched_index_and_keeps_its_binding() {
+    let tmp = Sandbox::new();
+    let service = tmp.service();
+    let (project, sub) = fixture(tmp.path());
+    let watched = Client::start(&sub, &service);
+    let mut snapshot = Client::start_with(&sub, &service, &["--no-watch"]);
+    assert_eq!(status(&service)["index_count"], 1);
+    // Broader coverage moves the watched session but not the snapshot.
+    let parent = Client::start(&project, &service);
+    let sub = sub.canonicalize().unwrap().to_str().unwrap().to_owned();
+    let project = project.canonicalize().unwrap().to_str().unwrap().to_owned();
+    let mut expected = vec![project.clone(), project, sub];
+    expected.sort();
+    let stats = wait_status(&service, "watched session never moved", |stats| {
+        session_roots(stats) == expected
+    });
+    assert_eq!(stats["index_count"], 2, "{stats}");
+    assert!(
+        snapshot
+            .tool("grep", json!({"query":"UniqueNeedle"}))
+            .contains("src/inside.rs")
+    );
+    let pids = service_pids(&service);
+    drop((watched, snapshot, parent));
+    wait_stopped(&service, &pids);
+}
+
+// An index that snapshot sessions keep is not replaced, so a watched index does not copy it.
+#[test]
+fn watched_request_beside_a_snapshot_index_gets_only_what_it_needs() {
+    let tmp = Sandbox::new();
+    let service = tmp.service();
+    let (project, _) = fixture(tmp.path());
+    let mut snapshot =
+        Client::start_with(&project, &service, &["--no-watch", "--content-indexing"]);
+    let mut watched = Client::start(&project, &service);
+    for client in [&mut snapshot, &mut watched] {
+        assert!(
+            client
+                .tool("find_files", json!({"query":"inside"}))
+                .contains("inside.rs")
+        );
+    }
+    let stats = status(&service);
+    assert_eq!(stats["index_count"], 2, "{stats}");
+    let options = |watch: bool| {
+        stats["indexes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|index| index["options"]["watch"] == watch)
+            .map(|index| index["options"].clone())
+            .unwrap_or_else(|| panic!("no index with watch {watch}: {stats}"))
+    };
+    assert_eq!(options(true)["content_indexing"], false, "{stats}");
+    assert_eq!(options(false)["content_indexing"], true, "{stats}");
+    let pids = service_pids(&service);
+    drop((snapshot, watched));
+    wait_stopped(&service, &pids);
+}
+
+#[test]
+fn request_without_frecency_database_shares_an_index_with_one() {
+    let tmp = Sandbox::new();
+    let service = tmp.service();
+    let (project, _) = fixture(tmp.path());
+    let db = tmp.path().join("frecency");
+    let with = Client::start_with(&project, &service, &["--frecency-db", db.to_str().unwrap()]);
+    let without = Client::start(&project, &service);
+    let stats = status(&service);
+    assert_eq!(stats["index_count"], 1, "{stats}");
+    assert!(stats["indexes"][0]["options"]["frecency_db"].is_string());
+    let pids = service_pids(&service);
+    drop((with, without));
     wait_stopped(&service, &pids);
 }
 
@@ -1002,7 +1195,8 @@ fn stopped_service_spares_the_socket_of_its_replacement() {
         .open(service.join(format!("startup-{tag}.lock")))
         .unwrap();
     startup.lock().unwrap();
-    let hello = json!({"token":endpoint_token(&service),"protocol":2,"request":{"request":"stop"}});
+    let hello =
+        json!({"token":endpoint_token(&service),"protocol":PROTOCOL,"request":{"request":"stop"}});
     let (recv, mut send) = connect(&service).split();
     send.write_all(format!("{hello}\n").as_bytes()).unwrap();
     send.flush().unwrap();
@@ -1055,22 +1249,15 @@ fn sandbox_stops_services_left_by_a_panicking_test() {
     );
 }
 
+// Debug builds take a build variant from the environment, standing in for another release.
+const OTHER_BUILD: (&str, &str) = ("FFF_MCP_TEST_BUILD_ID", "other build");
+
 #[test]
 fn different_builds_run_side_by_side() {
     let tmp = Sandbox::new();
     let service = tmp.service();
     let (project, _) = fixture(tmp.path());
-    let other = tmp.path().join(Path::new(BIN).file_name().unwrap());
-    std::fs::copy(BIN, &other).unwrap();
-    // Trailing bytes change the build identity without changing behaviour.
-    std::fs::OpenOptions::new()
-        .append(true)
-        .open(&other)
-        .unwrap()
-        .write_all(b"other build")
-        .unwrap();
-    let other = other.to_str().unwrap();
-    let mut old = Client::start_configured(other, &project, &service, "0", &[], &[]);
+    let mut old = Client::start_configured(BIN, &project, &service, "0", &[], &[OTHER_BUILD]);
     let mut new = Client::start_configured(BIN, &project, &service, "0", &[], &[]);
     let services = report(&service)["services"].as_array().unwrap().clone();
     assert_eq!(services.len(), 2, "{services:?}");
@@ -1086,7 +1273,7 @@ fn different_builds_run_side_by_side() {
     let pids = service_pids(&service);
     assert!(!stop_service(&service).status.success());
     drop(old);
-    let stop = cli(other, "--service-stop", &service);
+    let stop = cli_with(BIN, "--service-stop", &service, &[OTHER_BUILD]);
     assert!(!stop.status.success(), "stopped a build with clients");
     drop(new);
     let deadline = Instant::now() + EVENTUAL;
@@ -1095,6 +1282,64 @@ fn different_builds_run_side_by_side() {
         std::thread::sleep(Duration::from_millis(100));
     }
     wait_stopped(&service, &pids);
+}
+
+// The identity is compiled in, so a copy that was moved, re-signed or otherwise
+// changed after the build joins the original's service.
+#[test]
+fn copied_executable_joins_the_same_service() {
+    let tmp = Sandbox::new();
+    let service = tmp.service();
+    let (project, _) = fixture(tmp.path());
+    let copy = tmp
+        .path()
+        .join("copy")
+        .join(Path::new(BIN).file_name().unwrap());
+    std::fs::create_dir_all(copy.parent().unwrap()).unwrap();
+    std::fs::copy(BIN, &copy).unwrap();
+    std::fs::OpenOptions::new()
+        .append(true)
+        .open(&copy)
+        .unwrap()
+        .write_all(b"appended after the build")
+        .unwrap();
+    let copy = copy.to_str().unwrap();
+    let mut original = Client::start(&project, &service);
+    let mut copied = Client::start_configured(copy, &project, &service, "1", &[], &[]);
+    let report = report(&service);
+    let services = report["services"].as_array().unwrap();
+    assert_eq!(services.len(), 1, "{report}");
+    assert_eq!(services[0]["sessions"].as_array().unwrap().len(), 2);
+    assert_eq!(services[0]["index_count"], 1);
+    for client in [&mut original, &mut copied] {
+        assert!(
+            client
+                .tool("grep", json!({"query":"UniqueNeedle"}))
+                .contains("inside.rs")
+        );
+    }
+    let pids = service_pids(&service);
+    drop(copied);
+    drop(original);
+    wait_stopped(&service, &pids);
+}
+
+#[test]
+fn service_of_another_build_refuses_to_start_for_a_client() {
+    let tmp = Sandbox::new();
+    let service = tmp.service();
+    let output = Command::new(BIN)
+        .args(["--service", "--service-build", "another-build"])
+        .arg("--service-dir")
+        .arg(&service)
+        .arg("--log-file")
+        .arg(service.with_extension("log"))
+        .output_serialized()
+        .unwrap();
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("needs build another-build"), "{stderr}");
+    assert!(endpoints(&service).is_empty());
 }
 
 #[test]
@@ -1246,13 +1491,13 @@ fn handshake_rejects_bad_tokens_protocols_and_oversized_hellos() {
             json!({"token":token,"protocol":protocol,"request":{"request":"status"}})
         )
     };
-    let reply = raw_hello(&service, hello("wrong", 2).as_bytes());
+    let reply = raw_hello(&service, hello("wrong", PROTOCOL).as_bytes());
     assert_eq!(reply["error"]["kind"], "unauthorized", "{reply}");
     let reply = raw_hello(&service, hello(&token, 999).as_bytes());
     assert_eq!(reply["error"]["kind"], "protocol", "{reply}");
     let reply = raw_hello(&service, &vec![b' '; 70 * 1024]);
     assert_eq!(reply["error"]["kind"], "invalid_request", "{reply}");
-    let reply = raw_hello(&service, hello(&token, 2).as_bytes());
+    let reply = raw_hello(&service, hello(&token, PROTOCOL).as_bytes());
     assert_eq!(reply["reply"], "status", "{reply}");
     assert!(stop_service(&service).status.success());
 }
@@ -1495,4 +1740,1140 @@ fn the_service_never_checks_upstream_for_updates() {
     assert!(client.wait().unwrap().success());
     daemon.wait().unwrap();
     assert!(!ran.exists(), "fff-mcp ran curl to check for updates");
+}
+
+fn program_options() -> IndexOptions {
+    IndexOptions {
+        warmup: false,
+        content_indexing: false,
+        watch: true,
+        follow_symlinks: false,
+        max_cached_files: None,
+        frecency_db: None,
+        enable_home_scan: false,
+        enable_root_scan: false,
+    }
+}
+
+fn program_config(scope: &Path, service: &Path) -> ProgramConfig {
+    ProgramConfig {
+        scope: scope.to_path_buf(),
+        options: program_options(),
+        executable: BIN.into(),
+        service_dir: Some(service.to_path_buf()),
+        idle_timeout_secs: 1,
+        log_file: Some(service.with_extension("log")),
+        log_level: None,
+        connect_timeout: CONNECT_TIMEOUT,
+        response_timeout: RESPONSE_TIMEOUT,
+    }
+}
+
+fn open_program(scope: &Path, service: &Path, options: IndexOptions) -> ProgramSession {
+    let session = ProgramSession::open(&ProgramConfig {
+        options,
+        ..program_config(scope, service)
+    })
+    .unwrap();
+    assert!(
+        session.wait_ready(EVENTUAL).unwrap(),
+        "index never became ready"
+    );
+    session
+}
+
+// An in-process index of `root` with the options the service uses for program sessions.
+fn local_index(root: &Path) -> FilePicker {
+    let mut picker = FilePicker::new(FilePickerOptions {
+        base_path: root.canonicalize().unwrap().to_str().unwrap().into(),
+        watch: false,
+        mode: FFFMode::Ai,
+        ..Default::default()
+    })
+    .unwrap();
+    picker.collect_files().unwrap();
+    picker
+}
+
+fn local_options(
+    offset: usize,
+    limit: usize,
+    exclude_frecency: bool,
+) -> FuzzySearchOptions<'static> {
+    FuzzySearchOptions {
+        pagination: PaginationArgs { offset, limit },
+        exclude_frecency,
+        ..Default::default()
+    }
+}
+
+fn search(query: &str, offset: usize, limit: usize) -> SearchRequest {
+    SearchRequest {
+        query: query.into(),
+        offset,
+        limit,
+        exclude_frecency: true,
+        ..Default::default()
+    }
+}
+
+fn grep_options(cursor: Option<GrepCursor>, page_size: usize) -> GrepOptions {
+    GrepOptions {
+        max_file_size: 10 * 1024 * 1024,
+        smart_case: true,
+        cursor,
+        page_size,
+        ..Default::default()
+    }
+}
+
+fn scored<'a>(
+    paths: impl Iterator<Item = String>,
+    scores: impl Iterator<Item = &'a i32>,
+) -> Vec<(String, i32)> {
+    let mut pairs: Vec<_> = paths.zip(scores.copied()).collect();
+    pairs.sort();
+    pairs
+}
+
+type Line = (String, u64, String, Vec<(u32, u32)>);
+
+fn service_lines(results: &GrepResults) -> Vec<Line> {
+    results
+        .matches
+        .iter()
+        .map(|m| {
+            let path = results.files[m.file].relative_path.clone();
+            (
+                path,
+                m.line_number,
+                m.line_content.clone(),
+                m.match_ranges.clone(),
+            )
+        })
+        .collect()
+}
+
+fn local_lines(result: &fff::grep::GrepResult, picker: &FilePicker) -> Vec<Line> {
+    result
+        .matches
+        .iter()
+        .map(|m| {
+            let path = result.files[m.file_index].relative_path(picker);
+            let ranges = m.match_byte_offsets.to_vec();
+            (path, m.line_number, m.line_content.clone(), ranges)
+        })
+        .collect()
+}
+
+fn program_fixture(root: &Path) -> PathBuf {
+    let project = root.join("project");
+    for (path, body) in [
+        ("src/main.rs", "fn main() { UniqueNeedle(); }\n"),
+        ("src/lib.rs", "pub fn UniqueNeedle() {}\nfn filler() {}\n"),
+        ("src/nested/deep.rs", "// filler UniqueNeedle\n"),
+        ("docs/guide.md", "Mentions UniqueNeedle and filler\n"),
+        ("README.md", "filler only\n"),
+    ] {
+        let path = project.join(path);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, body).unwrap();
+    }
+    project
+}
+
+#[test]
+fn program_results_match_an_in_process_index() {
+    let tmp = Sandbox::new();
+    let service = tmp.service();
+    let project = program_fixture(tmp.path());
+    let _daemon = start_daemon(&service, "0");
+    let session = open_program(&project, &service, program_options());
+    let local = local_index(&project);
+
+    let progress = session.progress().unwrap();
+    assert!(!progress.scanning);
+    assert_eq!(progress.files, local.live_file_count());
+
+    let listed = session.search_files(search("", 0, 0)).unwrap();
+    let paths: Vec<_> = listed
+        .items
+        .iter()
+        .map(|i| i.relative_path.clone())
+        .collect();
+    let mut sorted = paths.clone();
+    sorted.sort();
+    assert_eq!(paths, sorted, "an empty query lists files in path order");
+    let expected = local.fuzzy_search(
+        &QueryParser::default().parse(""),
+        None,
+        local_options(0, 0, true),
+    );
+    let expected: Vec<_> = expected
+        .items
+        .iter()
+        .map(|f| f.relative_path(&local))
+        .collect();
+    assert_eq!(paths, expected);
+    let page = session.search_files(search("", 1, 2)).unwrap();
+    let page: Vec<_> = page.items.iter().map(|i| i.relative_path.clone()).collect();
+    assert_eq!(page, &paths[1..3]);
+
+    let found = session.search_files(search("lib", 0, 10)).unwrap();
+    let query = QueryParser::default().parse("lib");
+    let expected = local.fuzzy_search(&query, None, local_options(0, 10, true));
+    assert_eq!(found.total_matched, expected.total_matched);
+    assert_eq!(found.total_files, expected.total_files);
+    assert_eq!(
+        scored(
+            found.items.iter().map(|i| i.relative_path.clone()),
+            found.scores.iter().map(|s| &s.total)
+        ),
+        scored(
+            expected.items.iter().map(|f| f.relative_path(&local)),
+            expected.scores.iter().map(|s| &s.total)
+        ),
+    );
+
+    let dirs = session.search_directories(search("nest", 0, 10)).unwrap();
+    let query = QueryParser::new(fff_query_parser::DirSearchConfig).parse("nest");
+    let expected = local.fuzzy_search_directories(&query, local_options(0, 10, true));
+    assert_eq!(
+        scored(
+            dirs.items.iter().map(|d| d.relative_path.clone()),
+            dirs.scores.iter().map(|s| &s.total)
+        ),
+        scored(
+            expected.items.iter().map(|d| d.relative_path(&local)),
+            expected.scores.iter().map(|s| &s.total)
+        ),
+    );
+    assert_eq!(dirs.total_dirs, expected.total_dirs);
+
+    let mixed = session.search_mixed(search("", 0, 0)).unwrap();
+    let query = QueryParser::new(fff_query_parser::MixedSearchConfig).parse("");
+    let expected = local.fuzzy_search_mixed(&query, None, local_options(0, 0, true));
+    let mixed: Vec<_> = mixed
+        .items
+        .iter()
+        .map(|item| match item {
+            MixedEntry::File(file) => file.relative_path.clone(),
+            MixedEntry::Dir(dir) => dir.relative_path.clone(),
+        })
+        .collect();
+    let expected: Vec<_> = expected
+        .items
+        .iter()
+        .map(|item| match item {
+            fff::types::MixedItemRef::File(file) => file.relative_path(&local),
+            fff::types::MixedItemRef::Dir(dir) => dir.relative_path(&local),
+        })
+        .collect();
+    assert_eq!(mixed, expected);
+
+    let globbed = session
+        .glob(GlobRequest {
+            pattern: "**/*.rs".into(),
+            exclude_frecency: true,
+            ..Default::default()
+        })
+        .unwrap();
+    let expected = local.glob("**/*.rs", local_options(0, 0, true));
+    let globbed: Vec<_> = globbed
+        .items
+        .iter()
+        .map(|i| i.relative_path.clone())
+        .collect();
+    let expected: Vec<_> = expected
+        .items
+        .iter()
+        .map(|f| f.relative_path(&local))
+        .collect();
+    assert_eq!(globbed, expected);
+    assert_eq!(globbed.len(), 3);
+
+    for (query, mode) in [
+        ("UniqueNeedle", GrepMode::PlainText),
+        ("Unique[N]eedle", GrepMode::Regex),
+        ("UniqNeedle", GrepMode::Fuzzy),
+    ] {
+        let found = session
+            .grep(GrepRequest {
+                query: query.into(),
+                mode,
+                ai_syntax: false,
+                options: grep_options(None, 50),
+            })
+            .unwrap();
+        let options = fff::grep::GrepSearchOptions {
+            mode: match mode {
+                GrepMode::PlainText => fff::grep::GrepMode::PlainText,
+                GrepMode::Regex => fff::grep::GrepMode::Regex,
+                GrepMode::Fuzzy => fff::grep::GrepMode::Fuzzy,
+            },
+            max_file_size: 10 * 1024 * 1024,
+            smart_case: true,
+            page_limit: 50,
+            ..Default::default()
+        };
+        let expected = local.grep(&fff::grep::parse_grep_query(query), &options);
+        assert_eq!(
+            service_lines(&found),
+            local_lines(&expected, &local),
+            "{query}"
+        );
+        assert!(!found.matches.is_empty(), "{query}");
+        assert_eq!(found.total_files_searched, expected.total_files_searched);
+    }
+
+    let found = session
+        .multi_grep(MultiGrepRequest {
+            patterns: vec!["UniqueNeedle".into(), "filler".into()],
+            constraints: Some("*.md".into()),
+            options: grep_options(None, 50),
+        })
+        .unwrap();
+    let constraints = QueryParser::new(fff_query_parser::AiGrepConfig).parse_constraints("*.md");
+    let options = fff::grep::GrepSearchOptions {
+        max_file_size: 10 * 1024 * 1024,
+        smart_case: true,
+        page_limit: 50,
+        ..Default::default()
+    };
+    let expected = local.multi_grep(&["UniqueNeedle", "filler"], &constraints, &options);
+    assert_eq!(service_lines(&found), local_lines(&expected, &local));
+    assert_eq!(found.files.len(), 2);
+
+    let invalid = session
+        .grep(GrepRequest {
+            query: "Unique(Needle".into(),
+            mode: GrepMode::Regex,
+            ai_syntax: false,
+            options: grep_options(None, 50),
+        })
+        .unwrap();
+    assert!(invalid.regex_fallback_error.is_some());
+    assert_eq!(session.repository().unwrap(), None);
+    session.close().unwrap();
+    wait_status(&service, "closed session stayed registered", |stats| {
+        stats["sessions"].as_array().unwrap().is_empty()
+    });
+}
+
+#[test]
+fn program_grep_without_frecency_orders_files_as_an_index_without_one() {
+    let tmp = Sandbox::new();
+    let service = tmp.service();
+    let project = program_fixture(tmp.path()).canonicalize().unwrap();
+    // Older files come later, so frecency alone moves `README.md` to the front.
+    let now = std::time::SystemTime::now();
+    for (age, path) in ["src/main.rs", "src/lib.rs", "docs/guide.md", "README.md"]
+        .iter()
+        .enumerate()
+    {
+        let file = std::fs::File::options()
+            .write(true)
+            .open(project.join(path))
+            .unwrap();
+        file.set_modified(now - Duration::from_secs(60 * (age as u64 + 1)))
+            .unwrap();
+    }
+    let db = tmp.path().join("frecency");
+    let tracker = fff::frecency::FrecencyTracker::open(&db).unwrap();
+    for _ in 0..5 {
+        tracker.track_access(&project.join("README.md")).unwrap();
+    }
+    drop(tracker);
+    let _daemon = start_daemon(&service, "0");
+    let options = IndexOptions {
+        frecency_db: Some(db.to_str().unwrap().into()),
+        ..program_options()
+    };
+    let session = open_program(&project, &service, options);
+    let local = local_index(&project);
+    let order = |exclude_frecency: bool, multi: bool| {
+        let options = GrepOptions {
+            exclude_frecency,
+            ..grep_options(None, 50)
+        };
+        let results = if multi {
+            session.multi_grep(MultiGrepRequest {
+                patterns: vec!["filler".into()],
+                constraints: None,
+                options,
+            })
+        } else {
+            session.grep(GrepRequest {
+                query: "filler".into(),
+                options,
+                ..Default::default()
+            })
+        };
+        let results = results.unwrap();
+        let paths = results.files.iter().map(|f| f.relative_path.clone());
+        paths.collect::<Vec<_>>()
+    };
+    let local_options = fff::grep::GrepSearchOptions {
+        max_file_size: 10 * 1024 * 1024,
+        smart_case: true,
+        ..Default::default()
+    };
+    let local_grep = local.grep(&fff::grep::parse_grep_query("filler"), &local_options);
+    let expected: Vec<_> = local_grep
+        .files
+        .iter()
+        .map(|f| f.relative_path(&local))
+        .collect();
+    assert_eq!(expected.last().unwrap(), "README.md");
+
+    for multi in [false, true] {
+        assert_eq!(order(false, multi)[0], "README.md", "frecency ranks first");
+        assert_eq!(order(true, multi), expected);
+    }
+    session.close().unwrap();
+}
+
+#[test]
+fn program_grep_cursor_continues_and_expires_when_the_session_moves() {
+    let tmp = Sandbox::new();
+    let service = tmp.service();
+    let (project, sub) = fixture(tmp.path());
+    for n in 0..6 {
+        std::fs::write(sub.join(format!("page{n}.txt")), "PageNeedle\n").unwrap();
+    }
+    let _daemon = start_daemon(&service, "0");
+    let child = open_program(&sub, &service, program_options());
+    let page = |cursor| {
+        let mut options = grep_options(cursor, 2);
+        options.max_matches_per_file = 1;
+        GrepRequest {
+            query: "PageNeedle".into(),
+            options,
+            ..Default::default()
+        }
+    };
+    let first = child.grep(page(None)).unwrap();
+    assert!(first.next_cursor.is_some());
+    let second = child.grep(page(first.next_cursor.clone())).unwrap();
+    let names = |results: &GrepResults| {
+        results
+            .files
+            .iter()
+            .map(|f| f.relative_path.clone())
+            .collect::<Vec<_>>()
+    };
+    let (first_names, second_names) = (names(&first), names(&second));
+    assert_eq!(first_names.len(), 2);
+    assert_eq!(second_names.len(), 2);
+    assert!(second_names.iter().all(|name| !first_names.contains(name)));
+    assert!(first_names.iter().all(|name| name.starts_with("page")));
+    // A broader index takes over the session; offsets into the old one expire.
+    let parent = open_program(&project, &service, program_options());
+    wait_status(
+        &service,
+        "child never moved to the broader index",
+        index_count(1),
+    );
+    // A cursor names the index it came from, also after a grep on the new index.
+    let fresh = child.grep(page(None)).unwrap();
+    assert!(names(&fresh).iter().all(|name| name.starts_with("page")));
+    assert_ne!(
+        fresh.next_cursor.as_ref().map(|c| &c.index),
+        second.next_cursor.as_ref().map(|c| &c.index)
+    );
+    let stale = child.grep(page(second.next_cursor.clone()));
+    assert!(
+        matches!(stale, Err(ClientError::Program(ProgramError::StaleCursor))),
+        "{stale:?}"
+    );
+    let continued = child.grep(page(fresh.next_cursor.clone())).unwrap();
+    assert!(
+        names(&continued)
+            .iter()
+            .all(|name| !names(&fresh).contains(name))
+    );
+    let all = child.search_files(search("", 0, 0)).unwrap();
+    assert!(
+        all.items
+            .iter()
+            .all(|i| !i.relative_path.contains("outside"))
+    );
+    assert_eq!(all.total_matched, 7);
+    assert_eq!(
+        child.progress().unwrap().files,
+        7,
+        "progress counts the scope's files"
+    );
+    let seen = parent.grep(page(None)).unwrap();
+    assert!(!seen.files.is_empty());
+    assert!(names(&seen).iter().all(|name| name.starts_with("sub/page")));
+}
+
+#[test]
+fn mcp_and_program_sessions_share_one_index() {
+    let tmp = Sandbox::new();
+    let service = tmp.service();
+    let (project, _) = fixture(tmp.path());
+    let mut agent = Client::start(&project, &service);
+    let program = open_program(&project, &service, program_options());
+    let stats = status(&service);
+    assert_eq!(stats["index_count"], 1, "{stats}");
+    let mut kinds: Vec<_> = stats["sessions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|s| s["kind"].as_str().unwrap().to_owned())
+        .collect();
+    kinds.sort();
+    assert_eq!(kinds, ["mcp", "program"]);
+    let found = program
+        .grep(GrepRequest {
+            query: "UniqueNeedle".into(),
+            options: grep_options(None, 50),
+            ..Default::default()
+        })
+        .unwrap();
+    assert_eq!(found.files.len(), 2);
+    assert!(
+        agent
+            .tool("grep", json!({"query":"UniqueNeedle"}))
+            .contains("inside.rs")
+    );
+    let pids = service_pids(&service);
+    drop(program);
+    drop(agent);
+    wait_stopped(&service, &pids);
+}
+
+// Holds a program session until it is killed; runs only when spawned by the test below.
+#[test]
+fn program_session_holder() {
+    let (Some(scope), Some(service)) = (
+        std::env::var_os("FFF_TEST_HOLDER_SCOPE"),
+        std::env::var_os("FFF_TEST_HOLDER_SERVICE"),
+    ) else {
+        return;
+    };
+    if std::env::var_os("FFF_TEST_HOLDER_WAIT").is_some() {
+        let session =
+            ProgramSession::open(&program_config(Path::new(&scope), Path::new(&service))).unwrap();
+        println!("holding");
+        let waited = session.wait_ready(Duration::from_secs(60 * 60));
+        println!("waited: {waited:?}");
+        return;
+    }
+    let _session = open_program(Path::new(&scope), Path::new(&service), program_options());
+    println!("holding");
+    let mut line = String::new();
+    let _ = std::io::stdin().read_line(&mut line);
+}
+
+// Programs send one spelling of a frecency database, so equal databases share an index.
+#[test]
+fn program_sessions_with_one_frecency_database_share_an_index() {
+    let tmp = Sandbox::new();
+    let service = tmp.service();
+    let (project, _) = fixture(tmp.path());
+    let state = tmp.path().join("state");
+    std::fs::create_dir_all(state.join("nested")).unwrap();
+    let _daemon = start_daemon(&service, "0");
+    let with_database = |path: PathBuf| IndexOptions {
+        frecency_db: Some(path.to_string_lossy().into_owned()),
+        ..program_options()
+    };
+    let _first = open_program(&project, &service, with_database(state.join("frecency")));
+    let _second = open_program(
+        &project,
+        &service,
+        with_database(state.join("nested/../frecency")),
+    );
+    let stats = status(&service);
+    assert_eq!(stats["index_count"], 1, "{stats}");
+}
+
+// A live service of another build under this build's file names fails the client at once.
+#[test]
+fn a_build_tag_collision_is_reported() {
+    let tmp = Sandbox::new();
+    let service = tmp.service();
+    let (project, _) = fixture(tmp.path());
+    let namespace = fff_service::namespace::Namespace::open(&service).unwrap();
+    let files = fff_service::Build::current().files();
+    let owner = namespace.open_file(&files.owner_lock(), true).unwrap();
+    owner.lock().unwrap();
+    let endpoint = fff_service::protocol::Endpoint {
+        name: "unreachable".into(),
+        token: "token".into(),
+        protocol: fff_service::protocol::PROTOCOL,
+        build: "f".repeat(64),
+        pid: std::process::id(),
+    };
+    let file = namespace.open_file(&files.endpoint(), true).unwrap();
+    serde_json::to_writer(file, &endpoint).unwrap();
+    let error = ProgramSession::open(&program_config(&project, &service))
+        .err()
+        .expect("opened a session beside a colliding service");
+    assert!(
+        matches!(error, ClientError::BuildCollision { .. }),
+        "{error}"
+    );
+}
+
+// A killed program ends its session also while the service works on its request.
+#[test]
+fn program_session_ends_when_its_process_exits_during_a_request() {
+    let tmp = Sandbox::new();
+    let service = tmp.service();
+    let (project, _) = fixture(tmp.path());
+    let hold = tmp.path().join("hold-readiness");
+    std::fs::write(&hold, "").unwrap();
+    let _daemon = start_daemon_with(&service, "0", &[("FFF_MCP_TEST_HOLD_READINESS", &hold)]);
+    let mut holder = Daemon(
+        Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "program_session_holder", "--nocapture"])
+            .env("FFF_TEST_HOLDER_SCOPE", &project)
+            .env("FFF_TEST_HOLDER_SERVICE", &service)
+            .env("FFF_TEST_HOLDER_WAIT", "1")
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::inherit())
+            .spawn_serialized()
+            .unwrap(),
+    );
+    let mut lines = BufReader::new(holder.stdout.take().unwrap()).lines();
+    let held = lines
+        .by_ref()
+        .map_while(Result::ok)
+        .any(|line| line.contains("holding"));
+    assert!(held, "holder never opened its session");
+    wait_status(&service, "program session not registered", shared_by(1));
+    holder.kill().unwrap();
+    holder.wait().unwrap();
+    let rest: Vec<_> = lines.map_while(Result::ok).collect();
+    assert!(rest.iter().all(|line| !line.contains("waited")), "{rest:?}");
+    wait_status(&service, "a waiting program kept its session", |stats| {
+        stats["sessions"].as_array().unwrap().is_empty()
+    });
+}
+
+#[test]
+fn program_session_ends_when_its_process_exits() {
+    let tmp = Sandbox::new();
+    let service = tmp.service();
+    let (project, _) = fixture(tmp.path());
+    let mut agent = Client::start(&project, &service);
+    let mut holder = Daemon(
+        Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "program_session_holder", "--nocapture"])
+            .env("FFF_TEST_HOLDER_SCOPE", &project)
+            .env("FFF_TEST_HOLDER_SERVICE", &service)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::inherit())
+            .spawn_serialized()
+            .unwrap(),
+    );
+    let stdout = holder.stdout.take().unwrap();
+    let held = BufReader::new(stdout)
+        .lines()
+        .map_while(Result::ok)
+        .any(|line| line.contains("holding"));
+    assert!(held, "holder never opened its session");
+    wait_status(&service, "program session not registered", shared_by(2));
+    holder.kill().unwrap();
+    holder.wait().unwrap();
+    let stats = wait_status(&service, "killed program kept its session", |stats| {
+        stats["sessions"].as_array().unwrap().len() == 1
+    });
+    assert_eq!(stats["sessions"][0]["kind"], "mcp");
+    assert_eq!(stats["index_count"], 1);
+    assert!(
+        agent
+            .tool("grep", json!({"query":"UniqueNeedle"}))
+            .contains("inside.rs")
+    );
+    let pids = service_pids(&service);
+    drop(agent);
+    wait_stopped(&service, &pids);
+}
+
+#[test]
+fn program_rescan_and_repository_state() {
+    let tmp = Sandbox::new();
+    let service = tmp.service();
+    let (project, sub) = fixture(tmp.path());
+    let snapshot = IndexOptions {
+        watch: false,
+        ..program_options()
+    };
+    let mut config = ProgramConfig {
+        scope: sub.clone(),
+        options: snapshot.clone(),
+        executable: tmp.path().join("missing-executable"),
+        service_dir: Some(service.clone()),
+        idle_timeout_secs: 1,
+        log_file: Some(service.with_extension("log")),
+        log_level: None,
+        connect_timeout: CONNECT_TIMEOUT,
+        response_timeout: RESPONSE_TIMEOUT,
+    };
+    let missing = ProgramSession::open(&config)
+        .err()
+        .expect("opened without a service");
+    assert!(matches!(missing, ClientError::Io(_)), "{missing}");
+    // The session starts the service itself; a snapshot index runs no watcher.
+    config.executable = BIN.into();
+    let session = ProgramSession::open(&config).unwrap();
+    assert!(session.wait_ready(EVENTUAL).unwrap());
+    assert!(!session.is_scanning().unwrap());
+    assert_eq!(session.repository().unwrap(), None);
+    std::fs::write(sub.join("added.rs"), "fn AddedLater() {}\n").unwrap();
+    let added = |session: &ProgramSession| {
+        session
+            .search_files(search("added", 0, 10))
+            .unwrap()
+            .items
+            .iter()
+            .any(|i| i.relative_path == "added.rs")
+    };
+    assert!(!added(&session), "a snapshot saw a file without a rescan");
+    session.rescan().unwrap();
+    assert!(session.wait_ready(EVENTUAL).unwrap());
+    assert!(added(&session));
+    git2::Repository::init(&project).unwrap();
+    assert_eq!(
+        session.repository().unwrap(),
+        Some(project.canonicalize().unwrap())
+    );
+}
+
+// Waits until `done` holds, polling the service.
+fn eventually(what: &str, mut done: impl FnMut() -> bool) {
+    let deadline = Instant::now() + EVENTUAL;
+    while !done() {
+        assert!(Instant::now() < deadline, "{what}");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+// Program searches answer from what a building index holds, within the session's scope.
+#[test]
+fn program_searches_answer_while_the_index_builds() {
+    let tmp = Sandbox::new();
+    let service = tmp.service();
+    let (project, sub) = fixture(tmp.path());
+    let hold = tmp.path().join("hold-readiness");
+    std::fs::write(&hold, "").unwrap();
+    let _daemon = start_daemon_with(&service, "0", &[("FFF_MCP_TEST_HOLD_READINESS", &hold)]);
+    let _parent = ProgramSession::open(&program_config(&project, &service)).unwrap();
+    let session = ProgramSession::open(&program_config(&sub, &service)).unwrap();
+    let stats = status(&service);
+    assert_eq!(stats["index_count"], 1, "{stats}");
+    let paths = |session: &ProgramSession| -> Vec<String> {
+        let files = session.search_files(search("", 0, 100)).unwrap();
+        files.items.into_iter().map(|i| i.relative_path).collect()
+    };
+    // Before and after the walk is committed, only the session's own files appear.
+    eventually("the building index never held the scope's files", || {
+        let found = paths(&session);
+        assert!(
+            found.iter().all(|path| path == "src/inside.rs"),
+            "{found:?}"
+        );
+        !found.is_empty()
+    });
+    let grep = session
+        .grep(GrepRequest {
+            query: "UniqueNeedle".into(),
+            options: grep_options(None, 50),
+            ..Default::default()
+        })
+        .unwrap();
+    let grepped: Vec<_> = grep.files.iter().map(|f| &f.relative_path).collect();
+    assert_eq!(grepped, ["src/inside.rs"]);
+    session
+        .glob(GlobRequest {
+            pattern: "**/*.rs".into(),
+            limit: 10,
+            ..Default::default()
+        })
+        .unwrap();
+    session.search_directories(search("src", 0, 10)).unwrap();
+    session.search_mixed(search("inside", 0, 10)).unwrap();
+    assert!(
+        session.is_scanning().unwrap(),
+        "searches waited for the index"
+    );
+    std::fs::remove_file(&hold).unwrap();
+    assert!(session.wait_ready(EVENTUAL).unwrap());
+    assert_eq!(paths(&session), ["src/inside.rs"]);
+}
+
+// Scan state answers while another session's search holds the index locked.
+#[test]
+fn program_scan_state_answers_while_a_search_holds_the_index() {
+    let tmp = Sandbox::new();
+    let service = tmp.service();
+    let (project, _) = fixture(tmp.path());
+    let hold = tmp.path().join("hold-search");
+    let _daemon = start_daemon_with(&service, "0", &[("FFF_MCP_TEST_HOLD_SEARCH", &hold)]);
+    let searcher = open_program(&project, &service, program_options());
+    let observer = open_program(&project, &service, program_options());
+    let before = observer.progress().unwrap();
+    assert_eq!(before.files, 2);
+    std::fs::write(&hold, "").unwrap();
+    let search = std::thread::spawn(move || {
+        searcher.grep(GrepRequest {
+            query: "UniqueNeedle".into(),
+            options: grep_options(None, 50),
+            ..Default::default()
+        })
+    });
+    let held = tmp.path().join("hold-search.held");
+    eventually("the search never held the index", || held.exists());
+    let during = observer.progress().unwrap();
+    assert!(!during.scanning);
+    assert_eq!(during.files, before.files);
+    assert!(!observer.is_scanning().unwrap());
+    assert_eq!(observer.repository().unwrap(), None);
+    std::fs::remove_file(&hold).unwrap();
+    assert_eq!(search.join().unwrap().unwrap().files.len(), 2);
+}
+
+// A call the service does not answer fails within its bound, and the next call opens a new
+// session on the same service instead of failing for good.
+#[test]
+fn program_call_that_times_out_leaves_a_session_that_reconnects() {
+    let tmp = Sandbox::new();
+    let service = tmp.service();
+    let (project, _) = fixture(tmp.path());
+    let hold = tmp.path().join("hold-search");
+    let _daemon = start_daemon_with(&service, "0", &[("FFF_MCP_TEST_HOLD_SEARCH", &hold)]);
+    let session = ProgramSession::open(&ProgramConfig {
+        response_timeout: Duration::from_millis(500),
+        ..program_config(&project, &service)
+    })
+    .unwrap();
+    assert!(session.wait_ready(EVENTUAL).unwrap());
+    std::fs::write(&hold, "").unwrap();
+    let grep = |session: &ProgramSession| {
+        session.grep(GrepRequest {
+            query: "UniqueNeedle".into(),
+            options: grep_options(None, 50),
+            ..Default::default()
+        })
+    };
+    let error = grep(&session).unwrap_err();
+    assert!(matches!(error, ClientError::TimedOut(_)), "{error}");
+    std::fs::remove_file(&hold).unwrap();
+    // The lost session's index may already be released, so the reconnected session can land
+    // on a fresh index that is still scanning.
+    assert!(session.wait_ready(EVENTUAL).unwrap());
+    assert_eq!(session.progress().unwrap().files, 2);
+    assert_eq!(grep(&session).unwrap().files.len(), 2);
+}
+
+// Reopening a lost session counts against the call's own bound, not the connect timeout.
+#[cfg(unix)]
+#[test]
+fn program_reconnect_to_an_unresponsive_service_stays_within_the_call_bound() {
+    use rustix::process::{Pid, Signal, kill_process};
+
+    let tmp = Sandbox::new();
+    let service = tmp.service();
+    let (project, _) = fixture(tmp.path());
+    let hold = tmp.path().join("hold-search");
+    let daemon = start_daemon_with(&service, "0", &[("FFF_MCP_TEST_HOLD_SEARCH", &hold)]);
+    let session = ProgramSession::open(&ProgramConfig {
+        response_timeout: Duration::from_millis(500),
+        ..program_config(&project, &service)
+    })
+    .unwrap();
+    assert!(session.wait_ready(EVENTUAL).unwrap());
+    std::fs::write(&hold, "").unwrap();
+    let request = SearchRequest {
+        query: "inside".into(),
+        limit: 10,
+        ..Default::default()
+    };
+    let error = session.search_files(request.clone()).unwrap_err();
+    assert!(error.lost_service(), "{error}");
+    std::fs::remove_file(&hold).unwrap();
+    // The daemon this test started stops answering while the session reconnects.
+    let pid = Pid::from_raw(daemon.id() as i32).unwrap();
+    kill_process(pid, Signal::STOP).unwrap();
+    let started = Instant::now();
+    let reconnect = session.progress();
+    let elapsed = started.elapsed();
+    kill_process(pid, Signal::CONT).unwrap();
+    let error = reconnect.unwrap_err();
+    assert!(error.lost_service(), "{error}");
+    assert!(
+        elapsed < Duration::from_secs(10),
+        "reconnecting took {elapsed:?}"
+    );
+    assert!(session.wait_ready(EVENTUAL).unwrap());
+    assert!(!session.search_files(request).unwrap().items.is_empty());
+}
+
+// A namespace whose socket path exceeds the platform limit listens in the per-user runtime
+// directory, under the name a client derives from the same namespace.
+#[cfg(unix)]
+#[test]
+fn a_long_namespace_listens_on_a_short_socket_its_clients_reach() {
+    use fff_service::namespace::Namespace;
+    use fff_service::protocol::Endpoint;
+    use fff_service::socket::SocketPlace;
+
+    let segment = "n".repeat(60);
+    let tmp = Sandbox::with_service(&format!("{segment}/{segment}/service"));
+    let service = tmp.service();
+    let (project, _) = fixture(tmp.path());
+    // A short private runtime root of the test's own, in place of the shared one.
+    let runtime = tempfile::Builder::new()
+        .prefix("fr")
+        .tempdir_in("/tmp")
+        .unwrap();
+    let root = runtime.path().canonicalize().unwrap().join("rt");
+    let _daemon = start_daemon_with(&service, "0", &[("FFF_MCP_TEST_RUNTIME_DIR", &root)]);
+    let session = open_program(&project, &service, program_options());
+    let request = SearchRequest {
+        query: "inside".into(),
+        limit: 10,
+        ..Default::default()
+    };
+    assert!(!session.search_files(request).unwrap().items.is_empty());
+
+    let [endpoint] = endpoints(&service).try_into().unwrap();
+    let files =
+        fff_service::ServiceFiles::from_endpoint(endpoint.file_name().unwrap().to_str().unwrap())
+            .unwrap();
+    let published: Endpoint = serde_json::from_slice(&std::fs::read(&endpoint).unwrap()).unwrap();
+    let namespace = Namespace::open(&service).unwrap();
+    let place =
+        SocketPlace::open_with_roots(&namespace, &files, std::slice::from_ref(&root)).unwrap();
+    assert_eq!(Path::new(&published.name), place.path(&namespace));
+    assert_eq!(place.dir(&namespace).path(), root);
+    assert!(!namespace.path().join(files.socket()).exists());
+    assert!(Path::new(&published.name).exists());
+}
+
+// What a test can observe of a running process: its working directory, executable,
+// environment and whether descriptor `fd` is open in it.
+#[cfg(unix)]
+struct ProcessView {
+    cwd: PathBuf,
+    executable: PathBuf,
+    environment: String,
+    holds_fd: bool,
+}
+
+#[cfg(target_os = "linux")]
+fn process_view(pid: u64, fd: i32) -> ProcessView {
+    let proc = PathBuf::from(format!("/proc/{pid}"));
+    ProcessView {
+        cwd: std::fs::read_link(proc.join("cwd")).unwrap(),
+        executable: std::fs::read_link(proc.join("exe")).unwrap(),
+        environment: String::from_utf8_lossy(&std::fs::read(proc.join("environ")).unwrap())
+            .replace('\0', "\n"),
+        holds_fd: std::fs::read_link(proc.join("fd").join(fd.to_string()))
+            .is_ok_and(|target| target.to_string_lossy().starts_with("pipe:")),
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn process_view(pid: u64, fd: i32) -> ProcessView {
+    let run = |program: &str, args: &[&str]| {
+        String::from_utf8_lossy(&Command::new(program).args(args).output().unwrap().stdout)
+            .into_owned()
+    };
+    let pid = pid.to_string();
+    let named = |listing: String| {
+        listing
+            .lines()
+            .find_map(|line| line.strip_prefix('n'))
+            .map(PathBuf::from)
+    };
+    ProcessView {
+        cwd: named(run("lsof", &["-a", "-p", &pid, "-d", "cwd", "-Fn"])).unwrap(),
+        executable: PathBuf::from(run("ps", &["-o", "comm=", "-p", &pid]).trim()),
+        environment: run("ps", &["-E", "-ww", "-o", "command=", "-p", &pid]),
+        holds_fd: run("lsof", &["-a", "-p", &pid, "-d", &fd.to_string(), "-Ft"])
+            .lines()
+            .any(|line| line == "tPIPE"),
+    }
+}
+
+// A service started by a client inherits neither descriptors the client's parent left open
+// nor its working directory or environment, and one whose executable lives in the running
+// AppImage runs from a private copy in the namespace.
+#[cfg(unix)]
+#[test]
+fn a_started_service_holds_nothing_of_the_program_that_started_it() {
+    use std::os::fd::AsRawFd;
+
+    let tmp = Sandbox::new();
+    let service = tmp.service();
+    let (project, _) = fixture(tmp.path());
+    // An application's mount, holding the client executable.
+    let appdir = tmp.path().join("mount");
+    std::fs::create_dir(&appdir).unwrap();
+    let binary = appdir.join("fff-mcp");
+    std::fs::copy(BIN, &binary).unwrap();
+    // A pipe without close-on-exec, as an application runtime keeps to hold its mount, at a
+    // free descriptor number high enough that the service has no reason to use it itself.
+    let (keep_read, _keep_write) = rustix::pipe::pipe().unwrap();
+    // SAFETY: F_DUPFD returns a new descriptor this test owns, without close-on-exec.
+    let inherited = unsafe { libc::fcntl(keep_read.as_raw_fd(), libc::F_DUPFD, 500) };
+    assert!(inherited >= 500, "{}", std::io::Error::last_os_error());
+    let _inherited =
+        unsafe { <std::os::fd::OwnedFd as std::os::fd::FromRawFd>::from_raw_fd(inherited) };
+    // A copy of another build that nothing runs or starts, left from an earlier version.
+    let namespace = fff_service::namespace::Namespace::open(&service).unwrap();
+    let stale = namespace.path().join("fff-mcp-0123456789abcdef");
+    std::fs::write(&stale, "").unwrap();
+    let start = || {
+        Client::start_configured(
+            binary.to_str().unwrap(),
+            &project,
+            &service,
+            "1",
+            &[],
+            &[
+                ("APPDIR", appdir.to_str().unwrap()),
+                ("NOT_FOR_THE_SERVICE", "1"),
+            ],
+        )
+    };
+    let mut client = start();
+    assert!(!stale.exists(), "the stale copy was kept");
+    for lock in ["startup", "owner"] {
+        let created = namespace
+            .path()
+            .join(format!("{lock}-0123456789abcdef.lock"));
+        assert!(!created.exists(), "a lock was created for the stale build");
+    }
+    let [pid] = service_pids(&service).try_into().unwrap();
+    let view = process_view(pid, inherited);
+    assert!(!view.holds_fd, "the service holds descriptor {inherited}");
+    assert_eq!(view.cwd, Path::new("/"));
+    let namespace = service.canonicalize().unwrap();
+    assert!(
+        view.executable.starts_with(&namespace),
+        "the service runs from {}",
+        view.executable.display()
+    );
+    assert!(
+        !view.environment.contains("NOT_FOR_THE_SERVICE"),
+        "{}",
+        view.environment
+    );
+    assert!(!view.environment.contains("APPDIR"), "{}", view.environment);
+    let result = client.request(
+        "tools/call",
+        json!({"name": "find_files", "arguments": {"query": "inside"}}),
+    );
+    assert!(result.to_string().contains("inside.rs"), "{result}");
+
+    // The next service of the build starts from the same copy, which is not written again.
+    use std::os::unix::fs::MetadataExt;
+    let copy = std::fs::metadata(&view.executable).unwrap();
+    drop(client);
+    eventually("the first service never exited", || {
+        service_pids(&service).is_empty()
+    });
+    let _client = start();
+    let [pid] = service_pids(&service).try_into().unwrap();
+    let again = process_view(pid, inherited);
+    assert_eq!(again.executable, view.executable);
+    let reused = std::fs::metadata(&again.executable).unwrap();
+    assert_eq!((reused.dev(), reused.ino()), (copy.dev(), copy.ino()));
+}
+
+// Reported changes reach an index without a watcher before the reply, and a path outside the
+// session's directory refuses the request.
+#[test]
+fn program_reported_changes_apply_before_the_reply() {
+    let tmp = Sandbox::new();
+    let service = tmp.service();
+    let (project, sub) = fixture(tmp.path());
+    let snapshot = IndexOptions {
+        watch: false,
+        ..program_options()
+    };
+    let session = open_program(&sub, &service, snapshot);
+    let names = |session: &ProgramSession| {
+        let results = session.search_files(search("", 0, 100)).unwrap();
+        results
+            .items
+            .iter()
+            .map(|item| item.relative_path.clone())
+            .collect::<Vec<_>>()
+    };
+    std::fs::write(sub.join("src/reported.rs"), "fn Reported() {}\n").unwrap();
+    session.changed(vec!["src/reported.rs".into()]).unwrap();
+    assert!(names(&session).contains(&"src/reported.rs".to_owned()));
+    std::fs::remove_file(sub.join("src/reported.rs")).unwrap();
+    session.changed(vec![sub.join("src/reported.rs")]).unwrap();
+    assert!(!names(&session).contains(&"src/reported.rs".to_owned()));
+
+    // A path through a missing component and back is inside, lexically.
+    std::fs::write(sub.join("src/back.rs"), "fn Back() {}\n").unwrap();
+    session.changed(vec!["nope/../src/back.rs".into()]).unwrap();
+    assert!(names(&session).contains(&"src/back.rs".to_owned()));
+
+    // Where the filesystem ignores case, a report spelled otherwise updates the indexed
+    // entry rather than adding a second one, also once the file is gone.
+    if sub.join("SRC").exists() {
+        session.changed(vec!["SRC/INSIDE.RS".into()]).unwrap();
+        let listed = names(&session);
+        let inside: Vec<_> = listed
+            .iter()
+            .filter(|name| name.eq_ignore_ascii_case("src/inside.rs"))
+            .collect();
+        assert_eq!(inside, ["src/inside.rs"], "{listed:?}");
+        std::fs::remove_file(sub.join("src/back.rs")).unwrap();
+        session.changed(vec!["Src/Back.RS".into()]).unwrap();
+        assert!(!names(&session).contains(&"src/back.rs".to_owned()));
+    }
+
+    // The index does not follow symlinks, as its scan does not: a reported symlink stays out,
+    // and a file that became one leaves.
+    #[cfg(unix)]
+    {
+        std::os::unix::fs::symlink("inside.rs", sub.join("src/link.rs")).unwrap();
+        session.changed(vec!["src/link.rs".into()]).unwrap();
+        assert!(!names(&session).contains(&"src/link.rs".to_owned()));
+        std::fs::write(sub.join("src/turned.rs"), "fn Turned() {}\n").unwrap();
+        session.changed(vec!["src/turned.rs".into()]).unwrap();
+        assert!(names(&session).contains(&"src/turned.rs".to_owned()));
+        std::fs::remove_file(sub.join("src/turned.rs")).unwrap();
+        std::os::unix::fs::symlink("inside.rs", sub.join("src/turned.rs")).unwrap();
+        session.changed(vec!["src/turned.rs".into()]).unwrap();
+        assert!(!names(&session).contains(&"src/turned.rs".to_owned()));
+    }
+
+    let outside = project.join("submarine/outside.rs");
+    let error = session.changed(vec![outside]).unwrap_err();
+    assert!(
+        matches!(error, ClientError::Program(ProgramError::OutsideScope(_))),
+        "{error}"
+    );
+    for escaping in ["../src/inside.rs", "src/../../x.rs"] {
+        let error = session.changed(vec![escaping.into()]).unwrap_err();
+        assert!(
+            matches!(error, ClientError::Program(ProgramError::OutsideScope(_))),
+            "{escaping}: {error}"
+        );
+    }
+    // A symlink inside the directory that leads out of it does not carry a report out.
+    #[cfg(unix)]
+    {
+        std::os::unix::fs::symlink(project.join("submarine"), sub.join("door")).unwrap();
+        let error = session.changed(vec!["door/outside.rs".into()]).unwrap_err();
+        assert!(
+            matches!(error, ClientError::Program(ProgramError::OutsideScope(_))),
+            "{error}"
+        );
+    }
 }

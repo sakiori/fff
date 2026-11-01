@@ -15,6 +15,55 @@
 #define FFF_CREATE_OPTIONS_VERSION 2
 
 /**
+ * `int_value` of a failed call on a service-backed instance without a more
+ * specific kind.
+ */
+#define FFF_ERROR_FAILED 0
+
+/**
+ * `int_value` of a failed call whose instance lost its service: it did not
+ * answer in time, could not be reached or started, or the connection broke.
+ * The instance's next call opens a new session.
+ */
+#define FFF_ERROR_LOST_SERVICE 1
+
+/**
+ * `int_value` of a failed grep whose cursor belongs to an index the session
+ * no longer uses; search again without it.
+ */
+#define FFF_ERROR_STALE_CURSOR 2
+
+/**
+ * `int_value` of a failed call that has no equivalent over the shared service.
+ */
+#define FFF_ERROR_UNAVAILABLE 3
+
+/**
+ * `int_value` of a failed call whose directory cannot be served: it is
+ * missing or inaccessible, or it is the home directory or filesystem root
+ * without the option that allows indexing it.
+ */
+#define FFF_ERROR_SCOPE_UNAVAILABLE 4
+
+/**
+ * `int_value` of a failed call whose request the library or the service
+ * refused as invalid.
+ */
+#define FFF_ERROR_INVALID_REQUEST 5
+
+/**
+ * `int_value` of a failed call that names a path outside the instance's
+ * directory.
+ */
+#define FFF_ERROR_OUTSIDE_SCOPE 6
+
+/**
+ * `int_value` of a failed call that met the index while its coverage changed;
+ * the same call succeeds when retried.
+ */
+#define FFF_ERROR_RETRY 7
+
+/**
  * Current version of [`FffWatchOptions`].
  */
 #define FFF_WATCH_OPTIONS_VERSION 1
@@ -541,6 +590,78 @@ struct FffResult *fff_create_instance_with(const struct FffCreateOptions *opts);
 struct FffResult *fff_create_instance_with_value(struct FffCreateOptions opts);
 
 /**
+ * Create an instance whose index lives in the shared fff service of this
+ * library's build, starting that service from `executable` when none runs.
+ *
+ * The instance takes the same handle as in-process instances and works with
+ * every search, grep, scan and health function. Functions without a service
+ * equivalent (watching, query tracking and history, git status refresh,
+ * restarting in another directory) return an error naming them as
+ * unavailable over the shared service.
+ *
+ * From `opts`: `base_path`, `frecency_db_path`, `enable_mmap_cache` (warmup),
+ * `enable_content_indexing`, `watch`, `ai_mode` (grep constraint syntax),
+ * `cache_budget_max_files`, `enable_fs_root_scanning`,
+ * `enable_home_dir_scanning` and `follow_symlinks` choose the index the
+ * session uses; `log_file_path` and `log_level` configure a service this call
+ * starts. `history_db_path` is refused; the other cache budgets are ignored.
+ *
+ * `executable` is the `fff-mcp` executable built with this library.
+ * `service_dir` selects the service namespace; NULL/empty takes
+ * `FFF_MCP_SERVICE_DIR` or the default namespace. A service this call starts
+ * exits after `FFF_MCP_IDLE_TIMEOUT_SECS` without clients, one hour by default.
+ *
+ * `timeout_ms` bounds the wait for a service that does not answer: opening
+ * the session, which may start the service, and each call beyond the time the
+ * call itself asks for (a readiness wait's timeout, a grep's time budget). 0
+ * takes the defaults, 90 seconds to open and 30 seconds per call. A call that
+ * times out or loses the service fails, and the instance's next call opens a
+ * new session for the same directory within that call's own bound.
+ *
+ * Calls on one service instance may come from any thread; they are
+ * serialized. `fff_destroy` must not overlap another call on the instance.
+ *
+ * On such an instance, the `file_offset` of the grep functions continues only
+ * its last grep page; the cursors of [`fff_service_call`] name the index they
+ * belong to. A string argument that is not valid UTF-8 fails the call.
+ *
+ * ## Safety
+ * * `opts` as in [`fff_create_instance_with`].
+ * * `executable` and `service_dir` must be null-terminated strings or NULL.
+ */
+struct FffResult *fff_create_service_instance(const struct FffCreateOptions *opts,
+                                              const char *executable,
+                                              const char *service_dir,
+                                              uint64_t timeout_ms);
+
+/**
+ * Send one request of the shared service's program protocol to a service
+ * instance and return the whole reply as one JSON document, a C string in
+ * `handle` to free with `fff_free_string`.
+ *
+ * `request_json` is the JSON form of `fff_service::program::ProgramRequest` of
+ * this library's build, for example
+ * `{"SearchFiles":{"query":"main","current_file":null,"offset":0,"limit":100,"exclude_frecency":false}}`.
+ * Replies to searches, globs and greps carry every item with the fields of the
+ * result structs in camelCase; a grep page's `nextCursor` is passed back
+ * unchanged as the next request's `cursor`. A scan progress reply has the
+ * fields of `FffScanProgress` in camelCase; readiness and scanning replies are
+ * booleans, a repository reply is a path or null and other replies are null.
+ * Grep constraints use the syntax of the instance's `ai_mode`. Close the
+ * instance with `fff_destroy`, not with a request.
+ *
+ * A failure carries its kind in `int_value`, one of the `FFF_ERROR_*`
+ * constants: [`FFF_ERROR_LOST_SERVICE`] when the instance lost its service,
+ * whose next call opens a new session, [`FFF_ERROR_STALE_CURSOR`] for a grep
+ * cursor of an index the session no longer uses, and so on.
+ *
+ * ## Safety
+ * * `fff_handle` must be a valid instance pointer from `fff_create_service_instance`.
+ * * `request_json` must be a null-terminated string.
+ */
+struct FffResult *fff_service_call(void *fff_handle, const char *request_json);
+
+/**
  * Destroy a file finder instance and free all its resources.
  *
  * ## Safety
@@ -569,6 +690,23 @@ struct FffResult *fff_search(void *fff_handle,
                              uint32_t min_combo_count);
 
 /**
+ * [`fff_search`] plus `exclude_frecency`: rank as an index without a frecency
+ * database would; a query without fuzzy text then lists files in path order.
+ *
+ * ## Safety
+ * Same as [`fff_search`].
+ */
+struct FffResult *fff_search_ex(void *fff_handle,
+                                const char *query,
+                                const char *current_file,
+                                uint32_t max_threads,
+                                uint32_t page_index,
+                                uint32_t page_size,
+                                int32_t combo_boost_multiplier,
+                                uint32_t min_combo_count,
+                                bool exclude_frecency);
+
+/**
  * Glob-only search: filter indexed files by a single glob pattern (passed
  * through verbatim, no query parsing), rank by frecency, and paginate.
  *
@@ -585,6 +723,20 @@ struct FffResult *fff_glob(void *fff_handle,
                            uint32_t max_threads,
                            uint32_t page_index,
                            uint32_t page_size);
+
+/**
+ * [`fff_glob`] plus `exclude_frecency`, which lists matches in path order.
+ *
+ * ## Safety
+ * Same as [`fff_glob`].
+ */
+struct FffResult *fff_glob_ex(void *fff_handle,
+                              const char *pattern,
+                              const char *current_file,
+                              uint32_t max_threads,
+                              uint32_t page_index,
+                              uint32_t page_size,
+                              bool exclude_frecency);
 
 /**
  * Perform fuzzy search on indexed directories.
@@ -604,6 +756,20 @@ struct FffResult *fff_search_directories(void *fff_handle,
                                          uint32_t page_size);
 
 /**
+ * [`fff_search_directories`] plus `exclude_frecency`, as in [`fff_search_ex`].
+ *
+ * ## Safety
+ * Same as [`fff_search_directories`].
+ */
+struct FffResult *fff_search_directories_ex(void *fff_handle,
+                                            const char *query,
+                                            const char *current_file,
+                                            uint32_t max_threads,
+                                            uint32_t page_index,
+                                            uint32_t page_size,
+                                            bool exclude_frecency);
+
+/**
  * Perform a mixed fuzzy search across both files and directories.
  *
  * Returns one flat list interleaved by descending total score; each item's
@@ -621,6 +787,22 @@ struct FffResult *fff_search_mixed(void *fff_handle,
                                    uint32_t page_size,
                                    int32_t combo_boost_multiplier,
                                    uint32_t min_combo_count);
+
+/**
+ * [`fff_search_mixed`] plus `exclude_frecency`, as in [`fff_search_ex`].
+ *
+ * ## Safety
+ * Same as [`fff_search_mixed`].
+ */
+struct FffResult *fff_search_mixed_ex(void *fff_handle,
+                                      const char *query,
+                                      const char *current_file,
+                                      uint32_t max_threads,
+                                      uint32_t page_index,
+                                      uint32_t page_size,
+                                      int32_t combo_boost_multiplier,
+                                      uint32_t min_combo_count,
+                                      bool exclude_frecency);
 
 /**
  * Perform content search (grep) across indexed files.
@@ -671,6 +853,28 @@ struct FffResult *fff_live_grep_ex(void *fff_handle,
                                    uint8_t classify_definitions);
 
 /**
+ * [`fff_live_grep_ex`] plus `exclude_frecency`: files are searched in the
+ * order an index without a frecency database gives, newest first.
+ *
+ * ## Safety
+ * Same as [`fff_live_grep`].
+ */
+struct FffResult *fff_live_grep_ex2(void *fff_handle,
+                                    const char *query,
+                                    uint8_t mode,
+                                    uint64_t max_file_size,
+                                    uint32_t max_matches_per_file,
+                                    bool smart_case,
+                                    uint32_t file_offset,
+                                    uint32_t page_limit,
+                                    uint64_t time_budget_ms,
+                                    bool enforce_time_budget,
+                                    uint32_t before_context,
+                                    uint32_t after_context,
+                                    bool classify_definitions,
+                                    bool exclude_frecency);
+
+/**
  * Multi-pattern OR search (SIMD Aho-Corasick): lines matching ANY pattern.
  *
  * `patterns_joined` is `\n`-separated (e.g. `"foo\nbar"`); `constraints` is an
@@ -713,6 +917,27 @@ struct FffResult *fff_multi_grep_ex(void *fff_handle,
                                     uint32_t before_context,
                                     uint32_t after_context,
                                     uint8_t classify_definitions);
+
+/**
+ * [`fff_multi_grep_ex`] plus `exclude_frecency`, as in [`fff_live_grep_ex2`].
+ *
+ * ## Safety
+ * Same as [`fff_multi_grep`].
+ */
+struct FffResult *fff_multi_grep_ex2(void *fff_handle,
+                                     const char *patterns_joined,
+                                     const char *constraints,
+                                     uint64_t max_file_size,
+                                     uint32_t max_matches_per_file,
+                                     bool smart_case,
+                                     uint32_t file_offset,
+                                     uint32_t page_limit,
+                                     uint64_t time_budget_ms,
+                                     bool enforce_time_budget,
+                                     uint32_t before_context,
+                                     uint32_t after_context,
+                                     bool classify_definitions,
+                                     bool exclude_frecency);
 
 /**
  * Trigger a rescan of the file index.
@@ -799,6 +1024,10 @@ struct FffResult *fff_get_historical_query(void *fff_handle, uint64_t offset);
 
 /**
  * Get health check information.
+ *
+ * On a service-backed instance the check asks the service for the index's
+ * state and repository; when the instance lost its service, the check fails
+ * with [`FFF_ERROR_LOST_SERVICE`] as [`fff_service_call`] does.
  *
  * ## Safety
  * * `fff_handle` must be a valid instance pointer from `fff_create_instance`, or null for
