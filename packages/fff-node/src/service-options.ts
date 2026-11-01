@@ -45,20 +45,21 @@ export interface FrecencyOptions {
 }
 
 /**
- * The kind of a watch event over the shared service: the shared kinds, and
+ * The kind of a watch event over the shared service: the shared kinds,
  * `repository` when the git state of a repository inside the instance's
- * directory, or containing it, changed, for subscriptions that ask for it, and
- * `failed` when the subscription ended for good after `watch` resolved: the
+ * directory, or containing it, changed, and `refs` when one of its branches,
+ * tags or remote-tracking refs changed, for subscriptions that ask for them,
+ * and `failed` when the subscription ended for good after `watch` resolved: the
  * service no longer serves its directory, as after the directory was removed,
  * or refused a reconnect. No event follows a `failed` one.
  */
-export type ServiceWatchEventKind = WatchEventKind | "repository" | "failed";
+export type ServiceWatchEventKind = WatchEventKind | "repository" | "refs" | "failed";
 
 /** A filesystem change, or a repository state change, of a subscription. */
 export interface ServiceWatchEvent {
   /**
    * Absolute path of the affected file; the instance's directory for `rescan`
-   * and `failed`, and the repository's work tree for `repository`.
+   * and `failed`, and the repository's work tree for `repository` and `refs`.
    */
   path: string;
   kind: ServiceWatchEventKind;
@@ -80,6 +81,16 @@ export interface ServiceWatchOptions extends WatchOptions {
    * delivered as file events. (default: false)
    */
   repository?: boolean;
+  /**
+   * Also deliver a `refs` event, naming the repository's work tree, when a
+   * branch, tag or remote-tracking ref of a repository inside the instance's
+   * directory, or containing it, is created, moved or deleted, as `git branch`,
+   * `git tag`, a commit, `git fetch` or `git pack-refs` do. A linked worktree
+   * shares its main repository's refs, so a change there names every work tree
+   * of the repository the subscription covers. The service watches refs only
+   * while a subscription asks for them. (default: false)
+   */
+  refs?: boolean;
 }
 
 /** Receives the batches of a subscription on the event loop. */

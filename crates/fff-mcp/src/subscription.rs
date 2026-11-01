@@ -50,7 +50,7 @@ pub(crate) async fn serve(
     // The binding is not held beyond this, so the index is released when the session moves.
     let (mut core, mut rescans) = {
         let binding = session.snapshot();
-        match Core::subscribe(&binding, &session.scope, &request, &queue) {
+        match Core::open(&binding, &session.scope, &request, &queue, 0).await {
             Ok(core) => (core, binding.index.rescans()),
             Err(error) => return send_message(&mut send, &Reply::Error { error }).await,
         }
@@ -72,13 +72,13 @@ pub(crate) async fn serve(
             }
             _ = rebindings.changed(), if !failed => {
                 let binding = session.snapshot();
-                // The new index's events start after its subscription; what happened in
-                // between is lost.
-                match Core::subscribe(&binding, &session.scope, &request, &queue) {
+                // What happened before the new index's subscription is lost, and the old
+                // index's callbacks, also one running now, queue nothing after the rescan.
+                let epoch = queue.move_on();
+                match Core::open(&binding, &session.scope, &request, &queue, epoch).await {
                     Ok(moved) => {
                         core = moved;
                         rescans = binding.index.rescans();
-                        queue.lose();
                     }
                     Err(error) => {
                         failed = true;
@@ -128,16 +128,40 @@ fn failure(session: &Session) -> Option<ServiceError> {
 struct Core {
     picker: SharedFilePicker,
     id: WatchId,
-    _repository: Option<ListenerSubscription>,
+    repository: Option<ListenerSubscription>,
+    refs: Option<ListenerSubscription>,
 }
 
 impl Core {
+    // Subscribing takes the index's locks and changes its watches, so it runs off the runtime.
+    async fn open(
+        binding: &Arc<Binding>,
+        scope: &Path,
+        request: &WatchRequest,
+        queue: &Arc<Queue>,
+        epoch: u64,
+    ) -> Result<Self, ServiceError> {
+        let (binding, scope) = (binding.clone(), scope.to_path_buf());
+        let (request, queue) = (request.clone(), queue.clone());
+        let root = binding.index.root.clone();
+        let subscribe = move || Self::subscribe(&binding, &scope, &request, &queue, epoch);
+        tokio::task::spawn_blocking(subscribe)
+            .await
+            .unwrap_or_else(|error| {
+                Err(ServiceError::Index {
+                    root,
+                    reason: error.to_string(),
+                })
+            })
+    }
+
     // The core runs every subscriber's callback on one thread, so these only queue.
     fn subscribe(
         binding: &Binding,
         scope: &Path,
         request: &WatchRequest,
         queue: &Arc<Queue>,
+        epoch: u64,
     ) -> Result<Self, ServiceError> {
         let picker = binding.index.picker.clone();
         let options = WatchOptions {
@@ -147,7 +171,8 @@ impl Core {
             let queue = queue.clone();
             let scope = scope.to_path_buf();
             move |_: WatchId, events: &[fff::WatchEvent]| {
-                queue.push(events.iter().filter_map(|event| wire_event(event, &scope)));
+                let events = events.iter().filter_map(|event| wire_event(event, &scope));
+                queue.push(epoch, events);
             }
         };
         let id = picker
@@ -162,36 +187,64 @@ impl Core {
                 },
             })?;
         let repository = request.repository.then(|| {
-            let queue = queue.clone();
-            let scope = scope.to_path_buf();
-            // The index reports every repository it watches; the subscription hears those
-            // inside its directory and the one containing it.
-            picker.subscribe_repository_state(move |root| {
-                // Git spells a work tree with a trailing separator.
-                let root: std::path::PathBuf = root.components().collect();
-                let path = match root.strip_prefix(&scope) {
-                    Ok(inside) => wire_path(inside),
-                    Err(_) if scope.starts_with(&root) => wire_path(&root),
-                    Err(_) => return,
-                };
-                queue.push([WatchEvent {
-                    path,
-                    kind: WatchEventKind::Repository,
-                    from: None,
-                }]);
-            })
+            let forward = work_tree_event(queue, epoch, scope, WatchEventKind::Repository);
+            picker.subscribe_repository_state(forward)
+        });
+        let refs = request.refs.then(|| {
+            let forward = work_tree_event(queue, epoch, scope, WatchEventKind::Refs);
+            picker.subscribe_ref_changes(scope, forward)
         });
         Ok(Self {
             picker,
             id,
-            _repository: repository,
+            repository,
+            refs,
         })
     }
 }
 
+// Unsubscribing changes the index's watches too, so it leaves the runtime's threads.
 impl Drop for Core {
     fn drop(&mut self) {
-        self.picker.unwatch(self.id);
+        let (picker, id) = (self.picker.clone(), self.id);
+        let listeners = (self.repository.take(), self.refs.take());
+        let release = move || {
+            picker.unwatch(id);
+            drop(listeners);
+        };
+        match tokio::runtime::Handle::try_current() {
+            Ok(runtime) => drop(runtime.spawn_blocking(release)),
+            Err(_) => release(),
+        }
+    }
+}
+
+// Queues the events of a work tree's git state or refs. The index reports every repository it
+// watches; the subscription hears those inside its directory and the one containing it.
+fn work_tree_event(
+    queue: &Arc<Queue>,
+    epoch: u64,
+    scope: &Path,
+    kind: WatchEventKind,
+) -> impl Fn(&Path) + Send + Sync + 'static {
+    let queue = queue.clone();
+    let scope = scope.to_path_buf();
+    move |root| {
+        // Git spells a work tree with a trailing separator.
+        let root: std::path::PathBuf = root.components().collect();
+        let path = match root.strip_prefix(&scope) {
+            Ok(inside) => wire_path(inside),
+            Err(_) if scope.starts_with(&root) => wire_path(&root),
+            Err(_) => return,
+        };
+        queue.push(
+            epoch,
+            [WatchEvent {
+                path,
+                kind,
+                from: None,
+            }],
+        );
     }
 }
 
@@ -249,16 +302,22 @@ struct QueueState {
     // A replaced change leaves a gap, skipped when the queue drains.
     events: Vec<Option<WatchEvent>>,
     live: usize,
-    // A repository event and a file event never share a slot.
-    positions: HashMap<(bool, String), usize>,
+    // Repository, refs and file events never share a slot.
+    positions: HashMap<(Slot, String), usize>,
     rescan: bool,
     failed: Option<ServiceError>,
     closed: bool,
+    // Which subscription may queue: the one made since the last move.
+    epoch: u64,
 }
 
 impl Queue {
-    fn push(&self, events: impl IntoIterator<Item = WatchEvent>) {
+    // Events of a subscription made before the queue moved on are refused.
+    fn push(&self, epoch: u64, events: impl IntoIterator<Item = WatchEvent>) {
         let mut state = self.state.lock();
+        if state.epoch != epoch {
+            return;
+        }
         let mut pushed = false;
         for event in events {
             // A pending rescan covers every change after it too.
@@ -290,6 +349,20 @@ impl Queue {
         state.lose();
         drop(state);
         self.ready.notify_one();
+    }
+
+    // The subscription moves to another index: a rescan replaces what came before, and only
+    // the subscription made with the returned epoch queues anything after it.
+    fn move_on(&self) -> u64 {
+        let mut state = self.state.lock();
+        if !state.closed {
+            state.lose();
+        }
+        state.epoch += 1;
+        let epoch = state.epoch;
+        drop(state);
+        self.ready.notify_one();
+        epoch
     }
 
     fn close(&self) {
@@ -345,11 +418,11 @@ impl QueueState {
     // source's slot, so later changes of the source follow it, and a removal of its
     // destination stays a removal of the source in its place, followed by the destination's.
     fn coalesce(&mut self, event: WatchEvent) {
-        let key = (event.kind == WatchEventKind::Repository, event.path.clone());
+        let key = (Slot::of(event.kind), event.path.clone());
         if event.kind == WatchEventKind::Renamed
             && let Some(from) = &event.from
         {
-            self.positions.remove(&(false, from.clone()));
+            self.positions.remove(&(Slot::File, from.clone()));
         }
         let Some(&position) = self.positions.get(&key) else {
             self.append(key, event);
@@ -373,7 +446,7 @@ impl QueueState {
         }
     }
 
-    fn append(&mut self, key: (bool, String), event: WatchEvent) {
+    fn append(&mut self, key: (Slot, String), event: WatchEvent) {
         self.positions.insert(key, self.events.len());
         self.events.push(Some(event));
         self.live += 1;
@@ -399,6 +472,24 @@ impl QueueState {
     }
 }
 
+// What a queued event coalesces with: a later event of the same path and slot.
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+enum Slot {
+    File,
+    Repository,
+    Refs,
+}
+
+impl Slot {
+    fn of(kind: WatchEventKind) -> Self {
+        match kind {
+            WatchEventKind::Repository => Slot::Repository,
+            WatchEventKind::Refs => Slot::Refs,
+            _ => Slot::File,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -410,6 +501,20 @@ mod tests {
             kind,
             from: None,
         }
+    }
+
+    #[test]
+    fn a_move_to_another_index_leaves_nothing_of_the_old_one_after_its_rescan() {
+        let queue = Queue::default();
+        queue.push(0, [event("before", WatchEventKind::Modified)]);
+        let epoch = queue.move_on();
+        // The old index's callback, still running, and the new one's before the rescan went out.
+        queue.push(0, [event("stale", WatchEventKind::Modified)]);
+        queue.push(epoch, [event("early", WatchEventKind::Modified)]);
+        assert_eq!(take(&queue), vec![WatchEvent::rescan()]);
+        queue.push(0, [event("stale", WatchEventKind::Modified)]);
+        queue.push(epoch, [event("after", WatchEventKind::Modified)]);
+        assert_eq!(take(&queue), vec![event("after", WatchEventKind::Modified)]);
     }
 
     fn take(queue: &Queue) -> Vec<WatchEvent> {
@@ -434,11 +539,14 @@ mod tests {
         // Saving as vim does: the file moves to a backup, a new file takes its name, and
         // the backup goes.
         let queue = Queue::default();
-        queue.push([
-            renamed("a.txt", "a.txt~"),
-            event("a.txt", WatchEventKind::Created),
-            event("a.txt~", WatchEventKind::Removed),
-        ]);
+        queue.push(
+            0,
+            [
+                renamed("a.txt", "a.txt~"),
+                event("a.txt", WatchEventKind::Created),
+                event("a.txt~", WatchEventKind::Removed),
+            ],
+        );
         assert_eq!(
             take(&queue),
             vec![
@@ -447,12 +555,15 @@ mod tests {
                 event("a.txt~", WatchEventKind::Removed),
             ]
         );
-        queue.push([
-            event("b", WatchEventKind::Modified),
-            renamed("b", "c"),
-            event("b", WatchEventKind::Created),
-            event("c", WatchEventKind::Modified),
-        ]);
+        queue.push(
+            0,
+            [
+                event("b", WatchEventKind::Modified),
+                renamed("b", "c"),
+                event("b", WatchEventKind::Created),
+                event("c", WatchEventKind::Modified),
+            ],
+        );
         assert_eq!(
             take(&queue),
             vec![
@@ -466,22 +577,28 @@ mod tests {
     #[test]
     fn a_replaced_change_moves_to_the_end() {
         let queue = Queue::default();
-        queue.push([
-            event("a", WatchEventKind::Modified),
-            event("x", WatchEventKind::Modified),
-            renamed("x", "a"),
-        ]);
+        queue.push(
+            0,
+            [
+                event("a", WatchEventKind::Modified),
+                event("x", WatchEventKind::Modified),
+                renamed("x", "a"),
+            ],
+        );
         assert_eq!(
             take(&queue),
             vec![event("x", WatchEventKind::Modified), renamed("x", "a")],
             "x is gone once it moved onto a"
         );
-        queue.push([
-            event("a", WatchEventKind::Modified),
-            event("b", WatchEventKind::Created),
-            event("a", WatchEventKind::Removed),
-            event("c", WatchEventKind::Modified),
-        ]);
+        queue.push(
+            0,
+            [
+                event("a", WatchEventKind::Modified),
+                event("b", WatchEventKind::Created),
+                event("a", WatchEventKind::Removed),
+                event("c", WatchEventKind::Modified),
+            ],
+        );
         assert_eq!(
             take(&queue),
             vec![
@@ -501,7 +618,10 @@ mod tests {
             } else {
                 WatchEventKind::Created
             };
-            queue.push([event("hot", kind), event(&format!("cold{}", n % 3), kind)]);
+            queue.push(
+                0,
+                [event("hot", kind), event(&format!("cold{}", n % 3), kind)],
+            );
         }
         let slots = queue.state.lock().events.len();
         assert!(slots <= 2 * 4 + FRAME_EVENTS, "{slots} slots for 4 changes");
@@ -511,9 +631,9 @@ mod tests {
     #[test]
     fn a_failure_follows_what_is_queued_and_ends_the_queue() {
         let queue = Queue::default();
-        queue.push([event("a", WatchEventKind::Modified)]);
+        queue.push(0, [event("a", WatchEventKind::Modified)]);
         queue.fail(ServiceError::ShuttingDown);
-        queue.push([event("b", WatchEventKind::Modified)]);
+        queue.push(0, [event("b", WatchEventKind::Modified)]);
         let runtime = tokio::runtime::Builder::new_current_thread()
             .build()
             .unwrap();
@@ -531,21 +651,33 @@ mod tests {
     #[test]
     fn changes_coalesce_by_path() {
         let queue = Queue::default();
-        queue.push([
-            event("a", WatchEventKind::Created),
-            event("b", WatchEventKind::Modified),
-            event("a", WatchEventKind::Modified),
-            event("b", WatchEventKind::Removed),
-            event("", WatchEventKind::Repository),
-        ]);
-        queue.push([event("", WatchEventKind::Modified)]);
+        queue.push(
+            0,
+            [
+                event("a", WatchEventKind::Created),
+                event("b", WatchEventKind::Modified),
+                event("a", WatchEventKind::Modified),
+                event("b", WatchEventKind::Removed),
+                event("", WatchEventKind::Repository),
+                event("", WatchEventKind::Refs),
+            ],
+        );
+        queue.push(
+            0,
+            [
+                event("", WatchEventKind::Modified),
+                event("", WatchEventKind::Refs),
+                event("", WatchEventKind::Repository),
+            ],
+        );
         assert_eq!(
             take(&queue),
             vec![
                 event("a", WatchEventKind::Created),
                 event("b", WatchEventKind::Removed),
-                event("", WatchEventKind::Repository),
                 event("", WatchEventKind::Modified),
+                event("", WatchEventKind::Refs),
+                event("", WatchEventKind::Repository),
             ]
         );
     }
@@ -553,10 +685,13 @@ mod tests {
     #[test]
     fn overflow_becomes_one_rescan_that_covers_later_changes() {
         let queue = Queue::default();
-        queue.push((0..=QUEUE_LIMIT).map(|n| event(&n.to_string(), WatchEventKind::Created)));
-        queue.push([event("later", WatchEventKind::Modified)]);
+        queue.push(
+            0,
+            (0..=QUEUE_LIMIT).map(|n| event(&n.to_string(), WatchEventKind::Created)),
+        );
+        queue.push(0, [event("later", WatchEventKind::Modified)]);
         assert_eq!(take(&queue), vec![WatchEvent::rescan()]);
-        queue.push([event("after", WatchEventKind::Modified)]);
+        queue.push(0, [event("after", WatchEventKind::Modified)]);
         assert_eq!(take(&queue), vec![event("after", WatchEventKind::Modified)]);
     }
 

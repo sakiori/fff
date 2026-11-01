@@ -24,6 +24,8 @@ pub struct WatchRequest {
     pub ignore: Vec<String>,
     /// Whether to deliver [`WatchEventKind::Repository`] events.
     pub repository: bool,
+    /// Whether to deliver [`WatchEventKind::Refs`] events.
+    pub refs: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -38,11 +40,14 @@ pub enum WatchEventKind {
     /// The git state of the work tree at `path` changed: its index, HEAD or an operation
     /// in progress such as a merge.
     Repository,
+    /// A branch, tag or remote-tracking ref of the work tree at `path` was created, moved or
+    /// deleted, loose or in `packed-refs`. A linked worktree shares its main repository's.
+    Refs,
 }
 
 /// One change. Paths are relative to the subscription's directory, and a rescan names the
-/// directory itself with an empty path; a repository event names its work tree, absolute
-/// when the work tree lies above the directory. The service sends batches of these as
+/// directory itself with an empty path; a repository or refs event names its work tree,
+/// absolute when the work tree lies above the directory. The service sends batches of these as
 /// [`WatchFrame::Events`].
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WatchEvent {

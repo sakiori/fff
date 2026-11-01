@@ -3,6 +3,9 @@ pub use background_watcher::*;
 
 mod dir_walk;
 
+mod ref_watches;
+pub(crate) use ref_watches::common_dir_of;
+
 mod held_events;
 pub(crate) use held_events::{EventHold, Released};
 

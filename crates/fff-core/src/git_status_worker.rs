@@ -26,6 +26,8 @@ pub(crate) struct GitStatusWorker {
     state: Mutex<Pending>,
     cv: Condvar,
     consumer_spawned: AtomicBool,
+    #[cfg(all(test, target_os = "macos"))]
+    full_rescans: std::sync::atomic::AtomicUsize,
     // owned by `SharedPickerInner` so the pause survives picker re-creation
     paused: Arc<AtomicBool>,
 }
@@ -40,6 +42,8 @@ impl GitStatusWorker {
             state: Mutex::new(Pending::default()),
             cv: Condvar::new(),
             consumer_spawned: AtomicBool::new(false),
+            #[cfg(all(test, target_os = "macos"))]
+            full_rescans: Default::default(),
             paused,
         })
     }
@@ -72,6 +76,8 @@ impl GitStatusWorker {
     }
 
     pub(crate) fn request_full_rescan(&self) {
+        #[cfg(all(test, target_os = "macos"))]
+        self.full_rescans.fetch_add(1, Ordering::Relaxed);
         let mut guard = self.state.lock();
         if self.paused.load(Ordering::Acquire) {
             return;
@@ -79,6 +85,11 @@ impl GitStatusWorker {
         guard.full_rescan = true;
         drop(guard);
         self.cv.notify_one();
+    }
+
+    #[cfg(all(test, target_os = "macos"))]
+    pub(crate) fn full_rescans_requested(&self) -> usize {
+        self.full_rescans.load(Ordering::Relaxed)
     }
 
     // the caller flips `paused` first, so nothing can be queued after this

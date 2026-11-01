@@ -66,7 +66,7 @@
 /**
  * Current version of [`FffWatchOptions`].
  */
-#define FFF_WATCH_OPTIONS_VERSION 2
+#define FFF_WATCH_OPTIONS_VERSION 3
 
 /**
  * Kind of a watch event: the git state of a repository changed. Delivered only to
@@ -86,6 +86,13 @@
  * the instance's directory; every later change is delivered.
  */
 #define FFF_WATCH_EVENT_READY 7
+
+/**
+ * Kind of a watch event: a branch, tag or remote-tracking ref of a repository was created,
+ * moved or deleted, or its HEAD moved. Delivered only to subscriptions that ask for refs, on
+ * instances of the shared service.
+ */
+#define FFF_WATCH_EVENT_REFS 8
 
 /**
  * Result envelope returned by all `fff_*` functions.
@@ -486,7 +493,7 @@ typedef struct FffMixedSearchResult {
  * 4 = renamed (`path` is the destination; read the source with
  * `fff_watch_events_get_from_path`), 5 = repository (only when requested,
  * see [`FffWatchOptions::repository`]), 6 = failed and 7 = ready (service-backed
- * instances only).
+ * instances only), 8 = refs (only when requested, see [`FffWatchOptions::refs`]).
  *
  * Layout is frozen: this is an array element, so growing it would change the
  * stride every existing binding compiled against.
@@ -554,6 +561,15 @@ typedef struct FffWatchOptions {
    * Service-backed instances only; an in-process instance refuses it.
    */
   bool repository;
+  /**
+   * Version 3: also deliver an event of kind [`FFF_WATCH_EVENT_REFS`] naming the work
+   * tree when a branch, tag or remote-tracking ref of a repository inside the instance's
+   * directory, or containing it, is created, moved or deleted, loose, in `packed-refs` or
+   * in a reftable repository's tables, or when its HEAD moves. A linked worktree shares
+   * its main repository's branches and has a HEAD of its own.
+   * Service-backed instances only; an in-process instance refuses it.
+   */
+  bool refs;
 } FffWatchOptions;
 
 /**
@@ -697,7 +713,8 @@ struct FffResult *fff_create_service_instance(const struct FffCreateOptions *opt
  * * `fff_handle` must be a valid instance pointer from `fff_create_service_instance`.
  * * `request_json` must be a null-terminated string.
  */
-struct FffResult *fff_service_call(void *fff_handle, const char *request_json);
+struct FffResult *fff_service_call(void *fff_handle,
+                                   const char *request_json);
 
 /**
  * Destroy a file finder instance and free all its resources.
@@ -1748,6 +1765,19 @@ struct FffResult *fff_watch_args_ex(void *fff_handle,
                                     bool repository);
 
 /**
+ * [`fff_watch_args_ex`] that also takes [`FffWatchOptions::refs`].
+ *
+ * ## Safety
+ * As [`fff_watch_args`].
+ */
+struct FffResult *fff_watch_args_ex2(void *fff_handle,
+                                     const char *pattern,
+                                     const char *const *ignore,
+                                     uint32_t ignore_count,
+                                     bool repository,
+                                     bool refs);
+
+/**
  * Remove a watch subscription. `int_value` = 1 if the id existed, 0 otherwise.
  * On a service-backed instance, once it returns the callback is not called for
  * the subscription again, unless it is called from that callback.
@@ -1784,13 +1814,14 @@ const char *fff_watch_events_get_from_path(const struct FffWatchEventBatch *batc
 
 /**
  * Kind of event `index` (0 = created, 1 = modified, 2 = removed, 3 = rescan,
- * 4 = renamed, 5 = repository, 6 = failed, 7 = ready).
+ * 4 = renamed, 5 = repository, 6 = failed, 7 = ready, 8 = refs).
  * 3 (rescan aka "re-stat something" kind) returned when OS based buffer
  * has been overflown and some events might be loss. Paths will contain a list of
  * directories that needs to be rescanned to ensure consistency.
  * 4 reports a move: `path` is the destination and
  * `fff_watch_events_get_from_path` yields the source.
- * 5 names the work tree whose git state changed, for subscriptions that asked.
+ * 5 names the work tree whose git state changed, and 8 one whose refs changed, for
+ * subscriptions that asked.
  * 6 and 7 come only from service-backed instances, in a batch of their own that
  * names the instance's directory: a subscription there always delivers 7 first,
  * once it is ready, or 6 instead when it cannot be opened; a 6 after 7 ends it

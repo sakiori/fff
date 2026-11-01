@@ -681,6 +681,565 @@ fn invalid_patterns_are_rejected() {
     );
 }
 
+#[test]
+fn ref_listeners_hear_branches_tags_heads_packing_and_fetches() {
+    let tmp = TempDir::new().unwrap();
+    let root = fff_search::path_utils::canonicalize(tmp.path()).unwrap();
+    let upstream = root.join("upstream");
+    let base = root.join("clone");
+    committed_repository(&upstream);
+    git(&root, &["clone", "-q", "upstream", "clone"]);
+    hears_every_ref_step(&upstream, &base, true);
+}
+
+#[test]
+fn ref_listeners_of_a_reftable_repository_hear_its_tables() {
+    let tmp = TempDir::new().unwrap();
+    let root = fff_search::path_utils::canonicalize(tmp.path()).unwrap();
+    let upstream = root.join("upstream");
+    committed_repository(&upstream);
+    if let Err(reason) = try_git(
+        &root,
+        &["clone", "-q", "--ref-format=reftable", "upstream", "clone"],
+    ) {
+        eprintln!("skipped: the installed git cannot create a reftable repository: {reason}");
+        return;
+    }
+    // Reftable compacts its tables as it writes, so packing may change nothing.
+    hears_every_ref_step(&upstream, &root.join("clone"), false);
+}
+
+// Every step changes the refs of `base`, a clone of `upstream`, as a terminal would.
+fn hears_every_ref_step(upstream: &Path, base: &Path, packs: bool) {
+    let (picker, _frecency) = make_ref_picker(base);
+    let refs = RefChanges::subscribe(&picker, base, base);
+
+    for step in [
+        &["branch", "feature"][..],
+        &["commit", "-q", "--allow-empty", "-m", "second"],
+        &["branch", "-f", "feature", "HEAD"],
+        &["branch", "-m", "feature", "renamed"],
+        &["branch", "-D", "renamed"],
+        // A namespace is a directory of its own below refs/heads.
+        &["branch", "team/topic"],
+        &["branch", "-D", "team/topic"],
+        &["tag", "v1"],
+        &["tag", "-d", "v1"],
+        // HEAD moves without any branch changing.
+        &["branch", "existing"],
+        &["switch", "-q", "existing"],
+        &["switch", "-q", "--detach"],
+        &["commit", "-q", "--allow-empty", "-m", "detached"],
+        &["switch", "-q", "main"],
+        &["branch", "packed"],
+        &["pack-refs", "--all"],
+        // Only `packed-refs` holds this branch now.
+        &["branch", "-D", "packed"],
+    ] {
+        if step[0] == "pack-refs" && !packs {
+            continue;
+        }
+        refs.after(base, || git(base, step), &format!("git {}", step.join(" ")));
+    }
+    git(
+        upstream,
+        &["commit", "-q", "--allow-empty", "-m", "upstream"],
+    );
+    refs.after(base, || git(base, &["fetch", "-q", "origin"]), "a fetch");
+}
+
+#[test]
+fn ref_listeners_hear_upstream_and_remote_config_once() {
+    let tmp = TempDir::new().unwrap();
+    let root = fff_search::path_utils::canonicalize(tmp.path()).unwrap();
+    let upstream = root.join("upstream");
+    let base = root.join("clone");
+    committed_repository(&upstream);
+    git(&root, &["clone", "-q", "upstream", "clone"]);
+    let (picker, _frecency) = make_ref_picker(&base);
+    let refs = RefChanges::subscribe(&picker, &base, &base);
+    let moved = root.join("moved");
+    let moved = moved.to_string_lossy();
+
+    // How many times each command writes the config.
+    for (writes, step) in [
+        (2, &["branch", "--unset-upstream"][..]),
+        (2, &["branch", "-u", "origin/main"]),
+        (1, &["remote", "set-url", "origin", &moved]),
+        // Any key of the shared config is announced: consumers read what they need.
+        (1, &["config", "fff.unrelated", "true"]),
+    ] {
+        let what = format!("git {}", step.join(" "));
+        refs.at_most(writes, &base, || git(&base, step), &what);
+    }
+}
+
+// A common layout: linked worktrees below the main checkout, which ignores them, and one
+// beside it. Each change of the set of worktrees is heard by the main work tree, at least once
+// and at most once per write of the worktree's admin dir.
+#[test]
+fn ref_listeners_hear_linked_worktrees_added_moved_and_removed() {
+    hears_the_set_of_worktrees(make_ref_picker);
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn ref_listeners_hear_linked_worktrees_with_the_native_watcher() {
+    hears_the_set_of_worktrees(make_watched_picker);
+}
+
+fn hears_the_set_of_worktrees(make_picker: fn(&Path) -> (SharedFilePicker, SharedFrecency)) {
+    let tmp = TempDir::new().unwrap();
+    let root = fff_search::path_utils::canonicalize(tmp.path()).unwrap();
+    let main = root.join("main");
+    seed(&main);
+    fs::write(main.join(".gitignore"), ".worktrees/\n").unwrap();
+    git(&main, &["init", "-q", "-b", "main"]);
+    git(&main, &["add", "."]);
+    git(&main, &["commit", "-q", "-m", "init"]);
+    let (picker, _frecency) = make_picker(&main);
+    let (state_sender, state) = std::sync::mpsc::channel();
+    let _state = picker.subscribe_repository_state(move |root| {
+        let _ = state_sender.send(root.to_path_buf());
+    });
+    let refs = RefChanges::subscribe(&picker, &main, &main);
+
+    // The first worktree also creates `worktrees`, and each its admin dir and `gitdir`.
+    for (writes, step) in [
+        (
+            3,
+            &["worktree", "add", "-q", "--detach", ".worktrees/inner"][..],
+        ),
+        (2, &["worktree", "add", "-q", "--detach", "../beside"]),
+        (1, &["worktree", "lock", ".worktrees/inner"]),
+        (1, &["worktree", "unlock", ".worktrees/inner"]),
+        (
+            2,
+            &["worktree", "move", ".worktrees/inner", ".worktrees/moved"],
+        ),
+        (2, &["worktree", "remove", ".worktrees/moved"]),
+    ] {
+        let what = format!("git {}", step.join(" "));
+        refs.at_most(writes, &main, || git(&main, step), &what);
+    }
+    // Work in another worktree is its own: its admin dir changes, its set does not, and its
+    // operations in progress are not the main checkout's.
+    let beside = root.join("beside");
+    refs.quiet(
+        || {
+            git(&beside, &["status", "--short"]);
+            git(&beside, &["commit", "-q", "--allow-empty", "-m", "beside"]);
+        },
+        "work in another worktree",
+    );
+    refs.after(
+        &main,
+        || {
+            git(&beside, &["switch", "-q", "-c", "side"]);
+            fs::write(beside.join("README.md"), "side\n").unwrap();
+            git(&beside, &["commit", "-q", "-am", "side"]);
+        },
+        "a branch of another worktree",
+    );
+    git(&beside, &["switch", "-q", "--detach", "main"]);
+    fs::write(beside.join("README.md"), "other\n").unwrap();
+    git(&beside, &["commit", "-q", "-am", "other"]);
+    refs.fence();
+    state.try_iter().for_each(drop);
+    for (operation, abort) in [
+        ("merge", "--abort"),
+        ("cherry-pick", "--abort"),
+        ("revert", "--abort"),
+    ] {
+        refs.quiet(
+            || {
+                // Each stops at its conflict, with its `*_HEAD` in the worktree's admin dir.
+                let _ = try_git(&beside, &[operation, "side"]);
+                git(&beside, &[operation, abort]);
+            },
+            &format!("a {operation} in another worktree"),
+        );
+        let repository: Vec<_> = state.try_iter().collect();
+        assert!(
+            !repository.contains(&main),
+            "a {operation} in another worktree: {repository:?}"
+        );
+    }
+    fs::remove_dir_all(root.join("beside")).unwrap();
+    refs.at_most(
+        2,
+        &main,
+        || git(&main, &["worktree", "prune"]),
+        "git worktree prune",
+    );
+}
+
+#[test]
+fn ref_listeners_of_a_linked_worktree_hear_shared_and_own_config() {
+    let tmp = TempDir::new().unwrap();
+    let root = fff_search::path_utils::canonicalize(tmp.path()).unwrap();
+    let main = root.join("main");
+    let linked = root.join("linked");
+    committed_repository(&main);
+    git(
+        &main,
+        &["worktree", "add", "-q", "-b", "linked", "../linked"],
+    );
+    let (picker, _frecency) = make_ref_picker(&linked);
+    let refs = RefChanges::subscribe(&picker, &linked, &linked);
+
+    refs.at_most(
+        1,
+        &linked,
+        || git(&main, &["config", "branch.linked.merge", "refs/heads/main"]),
+        "the main repository's branch tracking",
+    );
+    refs.at_most(
+        1,
+        &linked,
+        || git(&main, &["config", "extensions.worktreeConfig", "true"]),
+        "the shared config",
+    );
+    refs.at_most(
+        1,
+        &linked,
+        || git(&linked, &["config", "--worktree", "fff.own", "true"]),
+        "the worktree's own config",
+    );
+}
+
+#[test]
+fn ref_listeners_of_a_linked_worktree_hear_its_main_repository_refs() {
+    let tmp = TempDir::new().unwrap();
+    let root = fff_search::path_utils::canonicalize(tmp.path()).unwrap();
+    let main = root.join("main");
+    let linked = root.join("linked");
+    committed_repository(&main);
+    git(
+        &main,
+        &["worktree", "add", "-q", "-b", "linked", "../linked"],
+    );
+    let (picker, _frecency) = make_ref_picker(&linked);
+    let refs = RefChanges::subscribe(&picker, &linked, &linked);
+
+    refs.after(&linked, || git(&main, &["branch", "other"]), "a branch");
+    refs.after(&linked, || git(&main, &["tag", "v1"]), "a tag");
+    refs.after(
+        &linked,
+        || git(&linked, &["commit", "-q", "--allow-empty", "-m", "moved"]),
+        "a commit in the worktree",
+    );
+    refs.after(
+        &linked,
+        || git(&linked, &["switch", "-q", "--detach"]),
+        "the worktree's own HEAD",
+    );
+    refs.quiet(
+        || git(&main, &["switch", "-q", "--detach"]),
+        "the main checkout's HEAD",
+    );
+    refs.after(&linked, || git(&main, &["pack-refs", "--all"]), "packing");
+    refs.after(
+        &linked,
+        || git(&main, &["branch", "-D", "other"]),
+        "a packed branch deleted",
+    );
+
+    // The watches go with the last listener and come back with the next.
+    drop(refs);
+    let refs = RefChanges::subscribe(&picker, &linked, &linked);
+    refs.after(
+        &linked,
+        || git(&main, &["branch", "again"]),
+        "a branch after resubscribing",
+    );
+}
+
+#[test]
+fn ref_listeners_of_a_reftable_linked_worktree_hear_both_table_lists() {
+    let tmp = TempDir::new().unwrap();
+    let root = fff_search::path_utils::canonicalize(tmp.path()).unwrap();
+    let main = root.join("main");
+    let linked = root.join("linked");
+    seed(&main);
+    if let Err(reason) = try_git(
+        &main,
+        &["init", "-q", "--ref-format=reftable", "-b", "main"],
+    ) {
+        eprintln!("skipped: the installed git cannot create a reftable repository: {reason}");
+        return;
+    }
+    git(&main, &["add", "."]);
+    git(&main, &["commit", "-q", "-m", "init"]);
+    git(
+        &main,
+        &["worktree", "add", "-q", "-b", "linked", "../linked"],
+    );
+    let (picker, _frecency) = make_ref_picker(&linked);
+    let refs = RefChanges::subscribe(&picker, &linked, &linked);
+
+    refs.after(&linked, || git(&main, &["branch", "other"]), "a branch");
+    refs.after(
+        &linked,
+        || git(&linked, &["switch", "-q", "--detach"]),
+        "the worktree's own HEAD",
+    );
+    refs.after(
+        &linked,
+        || git(&main, &["branch", "-D", "other"]),
+        "a branch deleted",
+    );
+}
+
+#[test]
+fn ref_listeners_hear_only_the_repositories_of_their_scope() {
+    let tmp = TempDir::new().unwrap();
+    let root = fff_search::path_utils::canonicalize(tmp.path()).unwrap();
+    committed_repository(&root.join("a"));
+    committed_repository(&root.join("b"));
+    let (picker, _frecency) = make_ref_picker(&root);
+    let refs = RefChanges::subscribe(&picker, &root.join("a"), &root);
+
+    refs.quiet(
+        || git(&root.join("b"), &["branch", "other"]),
+        "another repository",
+    );
+    refs.after(
+        &root.join("a"),
+        || git(&root.join("a"), &["branch", "other"]),
+        "the scope's repository",
+    );
+}
+
+#[test]
+fn ref_listeners_hear_a_repository_whose_refs_appear_after_it() {
+    let tmp = TempDir::new().unwrap();
+    let root = fff_search::path_utils::canonicalize(tmp.path()).unwrap();
+    let upstream = root.join("upstream");
+    committed_repository(&upstream);
+    let base = root.join("index");
+    let repo = base.join("repo");
+    // A clone caught after it made its git dir and before its refs.
+    fs::create_dir_all(repo.join(".git/objects")).unwrap();
+    fs::write(repo.join(".git/HEAD"), "ref: refs/heads/main\n").unwrap();
+    seed(&base);
+    let (picker, _frecency) = make_ref_picker(&base);
+    let refs = RefChanges::subscribe(&picker, &base, &base);
+
+    let commit = git_output(&upstream, &["rev-parse", "HEAD"]);
+    refs.after(
+        &repo,
+        || {
+            fs::create_dir_all(repo.join(".git/refs/heads")).unwrap();
+            fs::write(repo.join(".git/refs/heads/main"), commit).unwrap();
+        },
+        "the refs created",
+    );
+    refs.after(
+        &repo,
+        || {
+            fs::write(
+                repo.join(".git/refs/heads/second"),
+                git_output(&upstream, &["rev-parse", "HEAD"]),
+            )
+            .unwrap()
+        },
+        "a branch in them",
+    );
+}
+
+#[test]
+fn subscribers_without_ref_listeners_hear_no_ref_changes() {
+    let tmp = TempDir::new().unwrap();
+    let base = fff_search::path_utils::canonicalize(tmp.path()).unwrap();
+    committed_repository(&base);
+    let (picker, _frecency) = make_ref_picker(&base);
+    let files = watch_collect(&picker, "", WatchOptions::default());
+
+    for step in [
+        &["branch", "quiet"][..],
+        &["tag", "quiet-tag"],
+        &["pack-refs", "--all"],
+        &["branch", "-D", "quiet"],
+    ] {
+        git(&base, step);
+    }
+    // A listener elsewhere turns ref watching on without reaching the others.
+    let refs = RefChanges::subscribe(&picker, &base, &base);
+    refs.after(
+        &base,
+        || git(&base, &["branch", "heard"]),
+        "the opted-in listener",
+    );
+    // Its sentinels follow every change before them.
+    let files = files.lock();
+    assert!(
+        (files.iter()).any(|e| e.path.to_string_lossy().contains("ref-sentinel-")),
+        "the sentinels reached every subscriber: {files:?}"
+    );
+    assert!(
+        files.iter().all(|e| !e.path.starts_with(base.join(".git"))),
+        "file subscribers never hear git dir changes: {files:?}"
+    );
+}
+
+// With FSEvents, an index of a linked worktree whose main repository lies
+// outside it. A second repository's worktree nested in the index serves as a fence: its git
+// dir lies outside too, so its refs come through the same stream, in order.
+#[cfg(target_os = "macos")]
+#[test]
+fn a_linked_worktree_hears_its_refs_with_the_native_watcher() {
+    let tmp = TempDir::new().unwrap();
+    let root = fff_search::path_utils::canonicalize(tmp.path()).unwrap();
+    let (main, other) = (root.join("main"), root.join("other"));
+    let (linked, nested) = (root.join("linked"), root.join("linked/nested"));
+    committed_repository(&main);
+    committed_repository(&other);
+    git(
+        &main,
+        &["worktree", "add", "-q", "-b", "linked", "../linked"],
+    );
+    git(
+        &other,
+        &["worktree", "add", "-q", "-b", "nested", "../linked/nested"],
+    );
+    let (picker, _frecency) = make_watched_picker(&linked);
+    assert_eq!(
+        picker.rescan_stats().total,
+        0,
+        "watching a git dir outside the index during the walk rescans nothing"
+    );
+    let (state_sender, state) = std::sync::mpsc::channel();
+    let _state = picker.subscribe_repository_state(move |root| {
+        let _ = state_sender.send(root.to_path_buf());
+    });
+    let (sender, heard) = std::sync::mpsc::channel();
+    let _refs = picker.subscribe_ref_changes(&linked, move |root| {
+        let _ = sender.send(root.to_path_buf());
+    });
+    let fences = std::cell::Cell::new(0);
+    // Returns what was heard before the fence.
+    let fence = || {
+        fences.set(fences.get() + 1);
+        git(&other, &["branch", &format!("fence-{}", fences.get())]);
+        until_heard(&heard, &nested, "the fence")
+    };
+    fence();
+    let step = |change: &dyn Fn(), what: &str| {
+        change();
+        until_heard(&heard, &linked, what);
+        fence();
+    };
+
+    step(
+        &|| git(&main, &["branch", "other"]),
+        "a branch of the main repository",
+    );
+    step(
+        &|| git(&linked, &["switch", "-q", "--detach"]),
+        "the worktree's own HEAD",
+    );
+    git(&main, &["switch", "-q", "--detach"]);
+    let before = fence();
+    assert!(
+        !before.contains(&linked),
+        "the main checkout's HEAD is its own: {before:?}"
+    );
+    // Upstreams and remotes in the main repository's config, heard at least once and at
+    // most once per write of the config.
+    // Worktrees added from the main checkout restart no stream: the linked worktree hears refs
+    // events, spelled one way, and no repository event, which a restart's recovery sends.
+    state.try_iter().for_each(drop);
+    for n in 0..3 {
+        let what = format!("git worktree add {n}");
+        let path = format!("../added-{n}");
+        git(&main, &["worktree", "add", "-q", "--detach", &path]);
+        until_heard(&heard, &linked, &what);
+        let later = fence();
+        let times = 1 + later.iter().filter(|root| **root == linked).count();
+        assert!(times <= 2, "{what}: heard {times} times, {later:?}");
+        let spelled = |root: &std::path::PathBuf| root.as_os_str().to_string_lossy().ends_with('/');
+        assert!(!later.iter().any(spelled), "{what}: {later:?}");
+        let repository: Vec<_> = state.try_iter().collect();
+        assert!(
+            !repository.contains(&linked),
+            "{what} restarted a stream: {repository:?}"
+        );
+    }
+    for (writes, args) in [
+        (1, &["config", "branch.linked.merge", "refs/heads/main"][..]),
+        (2, &["remote", "add", "origin", "../other"]),
+        (1, &["remote", "set-url", "origin", "../main"]),
+    ] {
+        let what = format!("git {}", args.join(" "));
+        git(&main, args);
+        until_heard(&heard, &linked, &what);
+        let later = fence();
+        let times = 1 + later.iter().filter(|root| **root == linked).count();
+        assert!(times <= writes, "{what}: heard {times} times, {later:?}");
+    }
+    assert_eq!(picker.rescan_stats().total, 0);
+}
+
+// With FSEvents the own repository's refs are watched from the start and stay, so neither the
+// first listener nor the last one leaving restarts a stream.
+#[cfg(target_os = "macos")]
+#[test]
+fn refs_listeners_of_a_linked_worktree_restart_no_stream() {
+    let tmp = TempDir::new().unwrap();
+    let root = fff_search::path_utils::canonicalize(tmp.path()).unwrap();
+    let (main, linked) = (root.join("main"), root.join("linked"));
+    committed_repository(&main);
+    git(
+        &main,
+        &["worktree", "add", "-q", "-b", "linked", "../linked"],
+    );
+    let (picker, _frecency) = make_watched_picker(&linked);
+    let (state_sender, state) = std::sync::mpsc::channel();
+    let _state = picker.subscribe_repository_state(move |root| {
+        let _ = state_sender.send(root.to_path_buf());
+    });
+
+    // A restarted stream announces its repositories at once, from the change that restarts it.
+    for round in 0..2 {
+        let (sender, heard) = std::sync::mpsc::channel();
+        let refs = picker.subscribe_ref_changes(&linked, move |root| {
+            let _ = sender.send(root.to_path_buf());
+        });
+        assert!(state.try_recv().is_err(), "subscribing announced a restart");
+        git(&main, &["branch", &format!("heard-{round}")]);
+        until_heard(&heard, &linked, "a branch of the main repository");
+        drop(refs);
+        assert!(
+            state.try_recv().is_err(),
+            "unsubscribing announced a restart"
+        );
+    }
+    assert_eq!(picker.rescan_stats().total, 0);
+}
+
+// Waits until `heard` names `work_tree` and returns what it named before.
+#[cfg(target_os = "macos")]
+fn until_heard(
+    heard: &std::sync::mpsc::Receiver<std::path::PathBuf>,
+    work_tree: &Path,
+    what: &str,
+) -> Vec<std::path::PathBuf> {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let mut before = Vec::new();
+    while let Some(left) = deadline.checked_duration_since(Instant::now()) {
+        match heard.recv_timeout(left) {
+            Ok(root) if root == work_tree => return before,
+            Ok(root) => before.push(root),
+            Err(_) => break,
+        }
+    }
+    panic!(
+        "{what}: no ref change of {}, heard {before:?}",
+        work_tree.display()
+    );
+}
+
 // Folds events into index presence, rejecting any the index could not have applied.
 fn presence_after(initial: bool, events: &[WatchEvent]) -> bool {
     events.iter().fold(initial, |present, event| {
@@ -696,4 +1255,184 @@ fn presence_after(initial: bool, events: &[WatchEvent]) -> bool {
         );
         event.kind != WatchEventKind::Removed
     })
+}
+
+// FSEvents restarts its stream whenever the watched paths change and may coalesce what a
+// step writes, so macOS polls; inotify delivers every step as it happens.
+fn make_ref_picker(base: &Path) -> (SharedFilePicker, SharedFrecency) {
+    if cfg!(target_os = "macos") {
+        fff_search::watch::poll_watcher_for(base);
+    }
+    make_watched_picker(base)
+}
+
+// A repository on `main` with one commit.
+fn committed_repository(dir: &Path) {
+    seed(dir);
+    git(dir, &["init", "-q", "-b", "main"]);
+    git(dir, &["add", "."]);
+    git(dir, &["commit", "-q", "-m", "init"]);
+}
+
+fn git(dir: &Path, args: &[&str]) {
+    if let Err(error) = try_git(dir, args) {
+        panic!("git {args:?}: {error}");
+    }
+}
+
+fn git_output(dir: &Path, args: &[&str]) -> String {
+    let output = git_command(dir, args).output().unwrap();
+    assert!(output.status.success(), "git {args:?}");
+    String::from_utf8(output.stdout).unwrap()
+}
+
+fn try_git(dir: &Path, args: &[&str]) -> Result<(), String> {
+    fs::create_dir_all(dir).unwrap();
+    let output = git_command(dir, args).output().map_err(|e| e.to_string())?;
+    match output.status.success() {
+        true => Ok(()),
+        false => Err(String::from_utf8_lossy(&output.stderr).trim().to_string()),
+    }
+}
+
+fn git_command(dir: &Path, args: &[&str]) -> std::process::Command {
+    let mut command = std::process::Command::new("git");
+    command
+        .args(args)
+        .current_dir(dir)
+        .env("GIT_AUTHOR_NAME", "test")
+        .env("GIT_AUTHOR_EMAIL", "test@test.com")
+        .env("GIT_COMMITTER_NAME", "test")
+        .env("GIT_COMMITTER_EMAIL", "test@test.com");
+    command
+}
+
+// The work trees a ref listener heard, beside a file subscription whose sentinel tells when
+// the watcher has handled every change made before it; dropping it unsubscribes both.
+struct RefChanges {
+    picker: SharedFilePicker,
+    heard: std::sync::mpsc::Receiver<std::path::PathBuf>,
+    files: std::sync::mpsc::Receiver<WatchEvent>,
+    files_id: fff_search::WatchId,
+    index: std::path::PathBuf,
+    writes: std::cell::Cell<usize>,
+    _subscription: fff_search::ListenerSubscription,
+}
+
+impl RefChanges {
+    // Listens to the refs of `scope`'s repositories; the sentinel is written in `index`.
+    fn subscribe(picker: &SharedFilePicker, scope: &Path, index: &Path) -> Self {
+        let (sender, heard) = std::sync::mpsc::channel();
+        let subscription = picker.subscribe_ref_changes(scope, move |root| {
+            let _ = sender.send(root.to_path_buf());
+        });
+        let (sender, files) = std::sync::mpsc::channel();
+        let files_id = picker
+            .watch("", WatchOptions::default(), move |_, events| {
+                for event in events {
+                    let _ = sender.send(event.clone());
+                }
+            })
+            .unwrap();
+        let refs = Self {
+            picker: picker.clone(),
+            heard,
+            files,
+            files_id,
+            index: index.to_path_buf(),
+            writes: std::cell::Cell::new(0),
+            _subscription: subscription,
+        };
+        refs.fence();
+        refs
+    }
+
+    // Runs `change` and waits until the listener names `work_tree`, then lets the watcher
+    // handle the rest of the change, so the next step starts from nothing heard.
+    fn after(&self, work_tree: &Path, change: impl FnOnce(), what: &str) {
+        change();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let mut heard = Vec::new();
+        while let Some(left) = deadline.checked_duration_since(Instant::now()) {
+            match self.heard.recv_timeout(left) {
+                Ok(root) if root == work_tree => {
+                    self.fence();
+                    return;
+                }
+                Ok(root) => heard.push(root),
+                Err(_) => break,
+            }
+        }
+        panic!(
+            "{what}: no ref change of {}, heard {heard:?}",
+            work_tree.display()
+        );
+    }
+
+    // As `after`, and the listener names `work_tree` at most `most` times for the change:
+    // events of one path coalesce within the debounce window, so a command writing a file
+    // twice may still be heard twice.
+    fn at_most(&self, most: usize, work_tree: &Path, change: impl FnOnce(), what: &str) {
+        change();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let mut heard = Vec::new();
+        while let Some(left) = deadline.checked_duration_since(Instant::now()) {
+            match self.heard.recv_timeout(left) {
+                Ok(root) if root == work_tree => {
+                    let later = self.fence();
+                    let times = 1 + later.iter().filter(|root| *root == work_tree).count();
+                    assert!(times <= most, "{what}: heard {times} times, {later:?}");
+                    return;
+                }
+                Ok(root) => heard.push(root),
+                Err(_) => break,
+            }
+        }
+        panic!(
+            "{what}: no ref change of {}, heard {heard:?}",
+            work_tree.display()
+        );
+    }
+
+    // Runs `change` and asserts the listener hears nothing of it.
+    fn quiet(&self, change: impl FnOnce(), what: &str) {
+        change();
+        let heard = self.fence();
+        assert!(heard.is_empty(), "{what}: heard {heard:?}");
+    }
+
+    // Events come in order, and a batch's file events go out before its ref changes, so two
+    // sentinels follow each other: once the second is heard, the watcher has handled every
+    // change before the first. Each is a new file, as one write may be heard twice. Returns
+    // what the listener heard until then.
+    fn fence(&self) -> Vec<std::path::PathBuf> {
+        for _ in 0..2 {
+            let sentinel = self.sentinel();
+            fs::write(&sentinel, "sentinel\n").unwrap();
+            let deadline = Instant::now() + Duration::from_secs(10);
+            loop {
+                let left = deadline
+                    .checked_duration_since(Instant::now())
+                    .unwrap_or_else(|| panic!("no event of {}", sentinel.display()));
+                match self.files.recv_timeout(left) {
+                    Ok(event) if event.path == sentinel => break,
+                    Ok(_) => {}
+                    Err(error) => panic!("no event of {}: {error}", sentinel.display()),
+                }
+            }
+        }
+        self.heard.try_iter().collect()
+    }
+
+    fn sentinel(&self) -> std::path::PathBuf {
+        let writes = self.writes.get() + 1;
+        self.writes.set(writes);
+        self.index.join(format!("ref-sentinel-{writes}.txt"))
+    }
+}
+
+impl Drop for RefChanges {
+    fn drop(&mut self) {
+        self.picker.unwatch(self.files_id);
+    }
 }

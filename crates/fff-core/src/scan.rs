@@ -310,6 +310,13 @@ impl ScanJob {
                 .and_then(BackgroundWatcher::dir_hook)
         });
 
+        if config.install_watcher
+            && let Ok(guard) = shared_picker.read()
+            && let Some(watcher) = guard.as_ref().and_then(|p| p.background_watcher.as_ref())
+        {
+            watcher.walk_begins();
+        }
+
         // 2. Walk the file system and collect the list of files
         #[cfg(test)]
         tests::reached(tests::Stage::Walking, &base_path);
@@ -438,12 +445,16 @@ impl ScanJob {
             tracing::Span::current(),
         ) {
             Ok(watcher) => {
+                let watches = watcher.watches();
                 if let Ok(mut guard) = shared_picker.write()
                     && let Some(picker) = guard.as_mut()
                     && picker.base_path() == base_path
                     && !signals.cancelled.load(Ordering::Acquire)
                 {
                     picker.background_watcher = Some(watcher);
+                    drop(guard);
+                    // A ref listener subscribed before the watcher was in place.
+                    watches.sync_refs(shared_picker);
                 }
             }
             Err(e) => error!(?e, "failed to initialize background watcher"),

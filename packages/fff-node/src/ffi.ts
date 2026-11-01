@@ -380,12 +380,20 @@ export function ffiWatchStart(
   pattern: string,
   ignore: string[],
   repository: boolean,
+  refs: boolean,
 ): Result<number> {
   const { DataType } = ffi();
   return callIntSync(
-    "fff_watch_args_ex",
-    [DataType.BigInt, DataType.String, DataType.StringArray, DataType.U32, DataType.Boolean],
-    [handle, pattern, ignore, ignore.length, repository],
+    "fff_watch_args_ex2",
+    [
+      DataType.BigInt,
+      DataType.String,
+      DataType.StringArray,
+      DataType.U32,
+      DataType.Boolean,
+      DataType.Boolean,
+    ],
+    [handle, pattern, ignore, ignore.length, repository, refs],
   );
 }
 

@@ -45,18 +45,18 @@ async function open(basePath, options = {}) {
   return created.value;
 }
 
-// Collects the events of a subscription; `until` resolves with every event up to the first
-// that `wanted` accepts, and fails the test when none arrives in time.
+// Collects the events of a subscription; `until` resolves with every event from index `from`
+// up to the first there that `wanted` accepts, and fails the test when none arrives in time.
 function collector() {
   const events = [];
   let waiter = null;
   const check = () => {
     if (!waiter) return;
-    const index = events.findIndex(waiter.wanted);
+    const index = events.findIndex((event, at) => at >= waiter.from && waiter.wanted(event));
     if (index >= 0) {
-      const { resolve } = waiter;
+      const { resolve, from } = waiter;
       waiter = null;
-      resolve(events.slice(0, index + 1));
+      resolve(events.slice(from, index + 1));
     }
   };
   return {
@@ -65,7 +65,7 @@ function collector() {
       events.push(...batch);
       check();
     },
-    until(wanted) {
+    until(wanted, from = 0) {
       return new Promise((resolve, reject) => {
         const timer = setTimeout(
           () => reject(new Error(`no matching event; received ${JSON.stringify(events)}`)),
@@ -73,6 +73,7 @@ function collector() {
         );
         waiter = {
           wanted,
+          from,
           resolve: (seen) => {
             clearTimeout(timer);
             resolve(seen);
@@ -82,6 +83,17 @@ function collector() {
       });
     },
   };
+}
+
+// Events come in order, and a batch's file events go out before its refs events, so once the
+// second of two new sentinel files is heard, every change before the first was.
+async function fence(collected, dir, name) {
+  for (const round of [1, 2]) {
+    const sentinel = join(dir, `${name}-${round}.txt`);
+    const from = collected.events.length;
+    writeFileSync(sentinel, "sentinel\n");
+    await collected.until((event) => event.path === sentinel, from);
+  }
 }
 
 const paths = (result) => {
@@ -681,6 +693,40 @@ describe("FileFinder over the shared service", { concurrency: 1 }, () => {
     assert.equal(heard.at(-1).path, dir);
     watched.value();
     belowWatched.value();
+  });
+
+  it("reports ref changes to subscriptions that ask for them", async () => {
+    const dir = realpathSync(tree("ref-changes", { "a.txt": "a\n" }));
+    const git = (...args) =>
+      execFileSync("git", ["-C", dir, "-c", "user.name=fff", "-c", "user.email=fff@example.invalid", ...args]);
+    git("init", "-q");
+    git("add", "a.txt");
+    git("commit", "-q", "-m", "init");
+    const finder = await open(dir);
+    const refs = collector();
+    const watched = await finder.watch(refs.callback, { refs: true });
+    assert.ok(watched.ok, JSON.stringify(watched));
+    const plain = collector();
+    const plainWatched = await finder.watch(plain.callback, { repository: true });
+    assert.ok(plainWatched.ok, JSON.stringify(plainWatched));
+
+    git("branch", "feature");
+    const seen = await refs.until((event) => event.kind === "refs");
+    assert.equal(seen.at(-1).path, dir);
+    await fence(refs, dir, "after-branch");
+    const beforeTag = refs.events.length;
+    git("tag", "v1");
+    await refs.until((event) => event.kind === "refs", beforeTag);
+    await fence(refs, dir, "after-tag");
+    const beforeSwitch = refs.events.length;
+    git("switch", "-q", "feature");
+    await refs.until((event) => event.kind === "refs" && event.path === dir, beforeSwitch);
+    // Changes come in order, so the sentinel's event follows any of the refs'.
+    writeFileSync(join(dir, "sentinel.txt"), "after the refs\n");
+    const heard = await plain.until((event) => event.path === join(dir, "sentinel.txt"));
+    assert.ok(heard.every((event) => event.kind !== "refs"), JSON.stringify(heard));
+    watched.value();
+    plainWatched.value();
   });
 
   it("replaces what a callback falling behind could not take with one rescan", async () => {

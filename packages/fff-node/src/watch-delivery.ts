@@ -235,7 +235,17 @@ const LIBRARY = "fff_c";
 const PENDING_LIMIT = workerData.pendingLimit;
 ffi.open({ library: LIBRARY, path: workerData.library });
 
-const KINDS = ["created", "modified", "removed", "rescan", "renamed", "repository", "failed", "ready"];
+const KINDS = [
+  "created",
+  "modified",
+  "removed",
+  "rescan",
+  "renamed",
+  "repository",
+  "failed",
+  "ready",
+  "refs",
+];
 const RESULT = {
   success: DataType.U8,
   error: DataType.External,

@@ -255,7 +255,7 @@ without leaving a zombie process.
 
 A watch subscription is a session of its own: the program opens a connection
 with a watch hello naming its directory, index options, a pattern, ignore rules
-and whether it wants repository state, and the service answers `ready` once the
+and whether it wants repository state and refs, and the service answers `ready` once the
 session's index is ready and the subscription is registered with its watcher,
 so every change after the reply is delivered. The hello waits for the index
 without the handshake's limit, bounded by the caller's connect timeout. The
@@ -285,6 +285,108 @@ subscription at the root of a nested repository has an index of its own, as
 every session's index belongs to the repository containing its directory, so
 it hears only that repository and the ones nested in it.
 
+A subscription that asks for refs also receives a refs event, with the same
+path, when a branch, tag or remote-tracking ref of such a repository is
+created, moved or deleted, and when a work tree's HEAD moves, as by a switch or
+a commit on a detached HEAD; a HEAD change stays a repository event as well.
+The core's `SharedFilePicker::subscribe_ref_changes` reports them from a loose
+ref under `refs/heads`, `refs/tags` or `refs/remotes`, `packed-refs` and HEAD,
+or, in a repository whose `extensions.refStorage` is `reftable`, from the
+`reftable/tables.list` that git replaces for every ref update. A change of the
+common dir's `config`, where upstreams and remotes live, as `git branch -u`,
+`git branch --unset-upstream` or `git remote set-url` make it, is a refs event
+for every followed work tree sharing it, and a change of a work tree's own
+`config.worktree` one for that work tree: consumers read branch tracking as ref
+state. Every config key counts, since telling which keys changed would mean
+keeping and comparing each config, and a consumer reads what it needs anyway.
+`.lock` paths are never events; a command that writes config twice, as
+`git branch -u`, `git branch --unset-upstream` and `git remote add` do, is
+heard once when the watcher's debounce window merges the two writes, as it does
+in practice, and twice otherwise, never not at all. A linked worktree added,
+moved, removed or pruned is a refs event for every followed work tree sharing
+the common dir, as the creation or removal of the common dir's `worktrees` or of
+an admin dir in it, or a change of an admin dir's `gitdir`, shows it: which
+worktrees exist and where is ref state to consumers, as is what they check out.
+A lock taken or released by `git worktree lock` or `unlock`, its admin dir's
+`locked`, counts too, and so does `git worktree repair` rewriting a `gitdir`
+unchanged. A directory there touched by the files of its worktree, as its
+`index` or `HEAD`, is no event, and a merge, cherry-pick or revert in progress
+there is that worktree's own: `MERGE_HEAD`, `CHERRY_PICK_HEAD` and
+`REVERT_HEAD` count as a repository's state only at its git dir's root. A
+worktree directory deleted without git is not announced from the main
+repository until `git worktree prune`; a subscription in it ends as its
+directory went. Files of another worktree's admin dir that only the ref
+watches deliver, as its `index`, `HEAD`, logs and locks while an agent works
+there, are dropped by their path before a batch is applied. Repository and
+refs events name a work tree in one spelling, without git's trailing separator.
+Other refs, such
+as `refs/stash`, `refs/notes`, `FETCH_HEAD` and `ORIG_HEAD`, reflogs, git's
+`.lock` files and a namespace directory's own modification are not refs events,
+and a branch or tag change is no repository event. A linked worktree keeps its
+branches in its main repository's common dir, the one its git dir's
+`commondir` file names, so a change there names every followed work tree that
+shares it: the index's own and those of the repositories nested in it that its
+ignore rules keep. HEAD names only its own work tree; a reftable repository's
+linked worktree keeps its HEAD in tables of its own, while the main checkout's
+lives with the shared refs. libgit2 opens no reftable repository, so where it
+finds none for an index, its own discovery, with git's environment, ceilings
+and filesystem boundary, decides whether one is there: only a repository it
+refuses for its format, at the first `.git` it meets, whose common dir stores
+refs as reftable and that git's ownership rule accepts is the index's own
+repository for refs. That rule is git's own (`ensure_valid_ownership` of git
+2.47): the `.git` file, the work tree and the git dir belong to the current
+user, which for root also means the user `SUDO_UID` names, or the work tree's
+real path is a safe directory of git's protected config, read as git reads it:
+the system file unless `GIT_CONFIG_NOSYSTEM`, at `GIT_CONFIG_SYSTEM` or else
+where libgit2 finds it, the file `GIT_CONFIG_GLOBAL` names or else the XDG and
+home files, then `GIT_CONFIG_COUNT` entries and `GIT_CONFIG_PARAMETERS`; config
+git could not read refuses the repository. An empty entry resets, `*` allows all, `~`,
+`~user` and an absolute `%(prefix)/` are expanded, only absolute paths and `.`
+count, and a trailing `/*` allows everything below it.
+A linked worktree whose admin dir was pruned and a repository git refuses have
+none. A subscription that does not ask for refs never receives one.
+
+The core's ref listener names the subscription's directory as its scope, and
+an index follows the refs of its own repository and of the registered
+repositories whose work tree lies inside a scope or contains it, only while a
+listener is subscribed: watching refs costs one watch per directory under
+`refs` on backends that watch directory by directory, as on Linux. The watches
+are in place from before the subscription is ready and, except with FSEvents,
+go with the last listener: each followed common dir's `worktrees`, recursively with FSEvents,
+where a watch added would restart a stream, and elsewhere with every admin dir
+in it, each without recursion, and its `refs`, recursively, or
+its `reftable`
+and that of a reftable repository's linked worktrees, and the common dir
+itself, where the git state watches or the tree's recursive watch do not cover
+them, as for a linked worktree whose main repository lies outside the index.
+Events of such a common dir are only ref signals and register no git state. A
+watch that another one shares, as a nested repository's git dir watched for its
+state, is left in place, and a path whose watch failed is still removed with
+the rest. A repository registered before its `refs` or `reftable` exists, as
+during a clone, is followed once it appears, and its work tree announced then;
+a changed config also makes the index read the ref storage again. Upstream never
+watches refs.
+
+Every change of the watched paths the watcher makes goes to notify as one
+update. FSEvents on macOS restarts a stream for each update, from that moment
+on, so the watcher sends no path a stream already watches and keeps two
+streams: one for the index's tree, set up once with its root, and one for the
+paths outside it, which every later change goes to. A restart of the outside
+stream can lose only the git state of repositories outside the tree, so one
+after the index's first walk began is recovered before the change that caused
+it returns, and nothing rescans: ref watches brought in line again and the
+`logs` of every git dir outside the tree watched, for a ref store or log that
+appeared meanwhile, in at most one round more than there are such paths, then a
+full git status refresh where the own git dir lies outside the tree, as for a
+linked worktree or a submodule, and each repository whose git
+dir or common dir lies outside the tree announced with a repository and a refs
+event. The outside stream starts with the own git dir and, where they lie
+outside the tree, the own repository's ref watches, and ref watches stay there
+once added, so refs listeners coming and going restart nothing in a linked
+worktree whose main repository lies outside the index, and an index meeting
+such git dirs during its walk scans once. Subscribing and unsubscribing run on
+the service's blocking threads, never on its async runtime.
+
 The core reads a repository's git state from its git dir: its `.git`
 directory, or the one its `.git` file names, as a linked worktree's and a
 submodule's do, which may lie outside the indexed tree. The index's own
@@ -305,7 +407,10 @@ clone or a worktree added anew, also within one batch, is watched again and
 gets a repository event once its watches are in place, since its state may
 have changed before them, as after a `git init` followed at once by
 `git add`. A known one is not watched again, which the polling backend would
-answer with a new snapshot that loses what changed since its last poll. A
+answer with a new snapshot that loses what changed since its last poll; the
+index's own git dir is recorded when the watcher starts watching it, so a walk
+reaching its work tree later, as after an event for the index's root, finds it
+known. A
 removal event of a recorded git dir, its work tree or a directory above them
 forgets the record, also when the path is back by the time the batch is read,
 so a file system that gives the new directory the old one's inode and records
@@ -330,7 +435,8 @@ When a program reads slower than its files change, the queue is replaced by one
 rescan event, which also covers changes until it is sent, and the service keeps
 serving every other client. A rescan event also follows a rescan a program
 requests, the watcher's own rescans and a move of the session to another index,
-whose watcher the subscription then follows.
+whose watcher the subscription then follows; nothing of the old index follows
+that rescan, also from a callback of it still running.
 
 `fff_service::watch::Subscription` is the client. Starting it returns at once;
 on a thread of the subscription it delivers `Ready` once the service answered
@@ -383,9 +489,11 @@ both name the instance's directory. The batch struct appends `error` and
 created without `watch`, `fff_watch` fails with `FFF_ERROR_UNAVAILABLE`. Version 2 of `FffWatchOptions` appends `repository`
 in the struct's former tail padding, and `fff_watch_args_ex` takes it for
 bindings that pass flat arguments; repository events have the kind
-`FFF_WATCH_EVENT_REPOSITORY` (5), and an in-process instance refuses
-`repository` with `FFF_ERROR_UNAVAILABLE`. Version 1 options, the other kinds and every
-layout stay as they are. Once `fff_unwatch` returns on a service-backed
+`FFF_WATCH_EVENT_REPOSITORY` (5). Version 3 appends `refs` after it, still in
+the padding, which the library reads only from a version 3 struct, and `fff_watch_args_ex2` takes both; refs events have the kind
+`FFF_WATCH_EVENT_REFS` (8). An in-process instance refuses `repository` and
+`refs` with `FFF_ERROR_UNAVAILABLE`. Version 1 and 2 options, the other kinds
+and every layout stay as they are. Once `fff_unwatch` returns on a service-backed
 instance, the callback is not called for that subscription again, unless
 `fff_unwatch` runs inside the callback; `fff_destroy` ends the instance's
 subscriptions before it returns. Searches and greps have `_ex` variants (`_ex2` for the greps) that
@@ -457,7 +565,7 @@ synchronous: once it returns, the callback is not called again. A subscription
 that ends for good afterwards delivers a `failed` event carrying `error` and
 `code`. `destroy` ends every subscription of the instance, resolves pending
 ones as destroyed and calls no callback once it is called. `options.repository` asks for
-`repository` events, whose kind and options are the Node package's own
+`repository` events and `options.refs` for `refs` events, whose kinds and options are the Node package's own
 `ServiceWatchEvent` and `ServiceWatchOptions`, so the API shared with fff-bun
 keeps its kinds. On an instance created with `disableWatch`, `watch` fails with
 `unavailable`. The library's callback is upstream's process-wide ffi-rs
@@ -502,7 +610,8 @@ disposable namespace with a temporary state directory, including overlapping
 calls on one and on several instances, watch subscriptions (delivery on the
 event loop, patterns and ignore rules, unsubscribing, repository state, the
 end of subscriptions with `destroy`, `unavailable` with `disableWatch`, a
-process that exits while subscribed, repository state below the work tree, a
+process that exits while subscribed, repository state below the work tree, refs
+only when asked, a
 callback that falls behind, which gets at most 1024 events and then a rescan, a
 delivery worker that exits, a removed directory's `failed` event, delivery in
 a program run under `node --watch` or with `--input-type=module`, and searches
@@ -633,7 +742,8 @@ snapshot index, a build tag collision, a session that starts the service
 itself, a call that times out and the reconnect after it, a reconnect to a
 stopped service within the call's bound, watch subscriptions (changes of the
 subscription's directory only, ignored and outside files, a rescan after a
-program's rescan, repository state only when asked, also below the work tree,
+program's rescan, repository state and refs only when asked, also below the
+work tree, refs of a linked worktree's main repository, a moved HEAD,
 a consumer that reads nothing while thousands of files change, which alone
 gets a rescan while one that reads keeps every change, the move to a broader
 index, a resubscription to a new service after the old one was killed, the end
@@ -643,7 +753,50 @@ repository or a plain folder, each heard by its own subscription and the
 enclosing one, one initialised after the scan, one removed and created again,
 and linked worktrees, one removed and added again, and a submodule, whose
 `.git` is a file), and a namespace whose socket path
-exceeds the platform limit. In debug builds, `FFF_MCP_TEST_RUNTIME_DIR` replaces
+exceeds the platform limit. The core's watch subscription tests drive refs with
+the git command, in repositories with loose and packed refs and in reftable
+ones: branches, namespaced ones included, and tags created, moved, renamed and
+deleted, a commit, a switch, a detached HEAD and a commit on it,
+`git pack-refs`, a branch only `packed-refs` holds deleted, a fetch, an index of
+a linked worktree whose main repository lies outside it, with the linked
+worktree's own HEAD and the main checkout's, which it does not hear, a listener
+subscribing again after the last one left, a listener scoped to one repository
+of a broad index, a repository whose refs appear after it, an upstream unset
+and set, a remote's URL and another config key changed, each heard at least
+once and at most once per write of the config, the main repository's config and a worktree's own `config.worktree` heard
+in a linked worktree, worktrees added below and beside the main checkout,
+moved, removed and pruned, each heard by the main checkout at least once and at
+most once per write of its admin dir, also with the native watcher on macOS,
+a lock taken and released, while work in another worktree, including a merge,
+a cherry-pick and a revert stopped at a conflict, gives the main checkout
+neither refs nor repository events; worktrees added from the main checkout of
+an index of a linked worktree on macOS bring that index refs events, spelled
+one way, and no repository event, as no stream restarts; and file subscribers
+hear none of it. After each step the tests write two new
+sentinel files and wait for the second's event, so a step's late events never
+satisfy the next. On macOS tests with the native watcher follow an index of a
+linked worktree whose main repository lies outside it: a branch of the main
+repository and the worktree's own HEAD are heard and the main checkout's HEAD
+is not, and the main repository's branch tracking and remotes are heard at
+least once and at most once per write of the config, ordered by the refs of another repository whose worktree is nested in the
+index and arrive through the same stream; refs listeners coming and going
+announce no restart, and the index rescans nothing at startup. A native unit
+test restarts the outside stream after the walk with a repository met then and
+checks the announcements, the git status refresh and the watches of a ref store
+and a log that appeared. The watcher's
+unit tests show which paths are refs, that a branch change is no repository
+state change, that an outside common dir registers no git state and that on
+FSEvents the tree's stream keeps only its setup paths; the ref watches' unit
+tests show which paths a scope follows and removes, a ref store that appears
+later, a reftable repository's watches, and that a pruned linked worktree, a
+repository libgit2 refuses for another extension and, when run as root, a
+reftable repository of another user have no own repository for refs, and how
+git's rule decides ownership and matches safe directories: root's repository
+is no other user's, `SUDO_UID` under root, `*`, an empty entry, real paths, `~`,
+`%(prefix)/`, relative entries, `.` and the `/*` prefix, and which config files
+and environment entries it reads, in which order. The
+service's queue tests show that nothing of an index a subscription moved away
+from follows its rescan. In debug builds, `FFF_MCP_TEST_RUNTIME_DIR` replaces
 the runtime directories, so tests never write to the shared ones. In debug builds, indexes stay building
 while the file named by `FFF_MCP_TEST_HOLD_READINESS` exists, and program searches
 hold their index locked for writing while the file named by
@@ -658,10 +811,12 @@ its steps without timing.
 In test and debug builds, watchers use notify's polling backend instead of the
 OS event service when `FFF_TEST_POLL_WATCHER_MS` sets an interval in
 milliseconds, or for roots a test registered with `watch::poll_watcher_for`;
-release builds always use the native backend. The polled events take the same
+release builds always use the native backend; the watcher's FSEvents unit
+tests start the native backend for their roots whatever the variable says. The polled events take the same
 debouncer and handler, so tests check how fff handles watcher events without
 depending on how promptly the OS delivers them. The shared-service tests and the
-downstream core tests of scans and overflow recovery always poll, and
+downstream core tests of scans and overflow recovery always poll, the core's
+ref tests on macOS, where FSEvents restarts its stream for their watches, and
 `git intake verify` sets the variable for `make test-rust` and `make test-mcp`,
 so upstream's watcher tests poll there too. Verify skips five tests by exact
 name. The three `fs_delete_handler_test` tests

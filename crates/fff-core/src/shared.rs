@@ -10,7 +10,7 @@ use crate::frecency::FrecencyTracker;
 use crate::git::GitStatusCache;
 use crate::git_recency;
 use crate::git_status_worker::GitStatusWorker;
-use crate::listeners::{CoverageListeners, ListenerSubscription, RepositoryListeners};
+use crate::listeners::{CoverageListeners, ListenerSubscription, RefListeners, WorkTreeListeners};
 use crate::query_tracker::QueryTracker;
 use crate::rescan_stats::{RescanCounters, RescanReason, RescanStats};
 use crate::rescan_throttle::{Admission, RescanThrottle};
@@ -92,10 +92,11 @@ pub struct SharedPickerInner {
     /// Watch subscriptions live outside the picker lock so delivery and
     /// (un)subscribing never contend with searches.
     watchers: Arc<WatchRegistry>,
-    /// Coverage and repository listeners live outside the picker lock and survive
+    /// Coverage, repository and ref listeners live outside the picker lock and survive
     /// picker replacement.
     coverage: Arc<CoverageListeners>,
-    repository: Arc<RepositoryListeners>,
+    repository: Arc<WorkTreeListeners>,
+    refs: Arc<RefListeners>,
     // Git dirs of repositories inside the index, with their work trees.
     git_dirs: parking_lot::Mutex<ahash::AHashMap<PathBuf, GitDir>>,
     rescans: RescanCounters,
@@ -111,6 +112,7 @@ impl Default for SharedPickerInner {
             watchers: Arc::new(WatchRegistry::default()),
             coverage: Arc::default(),
             repository: Arc::default(),
+            refs: Arc::default(),
             git_dirs: Default::default(),
             rescans: Default::default(),
             rescan_throttle: RescanThrottle::default(),
@@ -493,10 +495,12 @@ impl SharedFilePicker {
     // new one and for one removed and created again since, also within one batch.
     pub(crate) fn register_git_dir(&self, git_dir: &Path, work_tree: &Path) -> bool {
         let identity = dir_identity(git_dir);
+        let common_dir = crate::watch::common_dir_of(git_dir);
         let known = self.0.git_dirs.lock().insert(
             git_dir.to_path_buf(),
             GitDir {
                 work_tree: work_tree.to_path_buf(),
+                common_dir,
                 identity,
             },
         );
@@ -521,6 +525,22 @@ impl SharedFilePicker {
                 .get(dir)
                 .map(|known| (dir.to_path_buf(), known.work_tree.clone()))
         })
+    }
+
+    // Every registered git dir with its work tree and common dir.
+    pub(crate) fn registered_git_dirs(&self) -> Vec<RegisteredGitDir> {
+        (self.0.git_dirs.lock().iter())
+            .map(|(git_dir, known)| RegisteredGitDir {
+                git_dir: git_dir.clone(),
+                work_tree: known.work_tree.clone(),
+                common_dir: known.common_dir.clone(),
+            })
+            .collect()
+    }
+
+    // The work tree of the registered git dir `git_dir` itself.
+    pub(crate) fn registered_work_tree(&self, git_dir: &Path) -> Option<PathBuf> {
+        (self.0.git_dirs.lock().get(git_dir)).map(|known| known.work_tree.clone())
     }
 
     pub(crate) fn watch_registry(&self) -> &Arc<WatchRegistry> {
@@ -552,8 +572,64 @@ impl SharedFilePicker {
         self.0.repository.subscribe(listener)
     }
 
-    pub(crate) fn repository_listeners(&self) -> &Arc<RepositoryListeners> {
-        &self.0.repository
+    // Git spells a work tree with a trailing separator; listeners hear one spelling.
+    pub(crate) fn notify_repository_change(&self, work_tree: &Path) {
+        let work_tree: PathBuf = work_tree.components().collect();
+        self.0.repository.notify(&work_tree);
+    }
+
+    /// Calls `listener` with the root of a git work tree inside `scope` or containing it when
+    /// the watcher sees one of its refs change: a branch, tag or remote-tracking ref created,
+    /// moved or deleted, loose under `refs/heads`, `refs/tags` or `refs/remotes`, in
+    /// `packed-refs` or in a reftable repository's tables, or its HEAD moved, as by a switch
+    /// or a commit on a detached HEAD. A linked worktree's branches live in its main
+    /// repository's common dir, so a change there names every work tree of the index sharing
+    /// it; its HEAD names only itself. The work trees are those
+    /// [`Self::subscribe_repository_state`] names. The watcher watches the refs of the
+    /// repositories related to a listener's scope only while one is subscribed, from before
+    /// this returns. This and dropping the subscription change the watcher's watches, so call
+    /// them off async executors. The listener runs on the watcher's thread: it must return
+    /// promptly and must not access this picker.
+    pub fn subscribe_ref_changes(
+        &self,
+        scope: &Path,
+        listener: impl Fn(&Path) + Send + Sync + 'static,
+    ) -> ListenerSubscription {
+        let scope: PathBuf = scope.components().collect();
+        let subscription = self.0.refs.subscribe_with(scope, listener);
+        self.sync_ref_watches();
+        let picker = self.weaken();
+        subscription.after_drop(move || {
+            if let Some(picker) = picker.upgrade() {
+                picker.sync_ref_watches();
+            }
+        })
+    }
+
+    // The scopes the ref listeners asked for.
+    pub(crate) fn ref_scopes(&self) -> Vec<PathBuf> {
+        self.0.refs.asked()
+    }
+
+    // Tells the ref listeners whose scope is related to `work_tree` that its refs changed.
+    // Git spells a work tree with a trailing separator; listeners hear one spelling.
+    pub(crate) fn notify_ref_change(&self, work_tree: &Path) {
+        let work_tree: PathBuf = work_tree.components().collect();
+        self.0
+            .refs
+            .notify_where(&work_tree, |scope| related(scope, &work_tree));
+    }
+
+    // Brings the watcher's ref watches in line with the ref listeners, outside the picker lock.
+    fn sync_ref_watches(&self) {
+        let watches = self.read().ok().and_then(|guard| {
+            (guard.as_ref())
+                .and_then(|picker| picker.background_watcher.as_ref())
+                .map(crate::watch::BackgroundWatcher::watches)
+        });
+        if let Some(watches) = watches {
+            watches.sync_refs(self);
+        }
     }
 
     pub(crate) fn coverage_listeners(&self) -> &Arc<CoverageListeners> {
@@ -803,9 +879,23 @@ pub type SharedFrecency = SharedDb<FrecencyTracker>;
 /// Thread-safe shared handle to the [`QueryTracker`] instance.
 pub type SharedQueryTracker = SharedDb<QueryTracker>;
 
-// A recorded git dir: its work tree, and which directory it was when recorded.
+// A git dir the index registered, with its work tree and the common dir holding its refs.
+pub(crate) struct RegisteredGitDir {
+    pub(crate) git_dir: PathBuf,
+    pub(crate) work_tree: PathBuf,
+    pub(crate) common_dir: PathBuf,
+}
+
+// Whether a ref listener of `scope` hears `work_tree`: one inside it or containing it.
+pub(crate) fn related(scope: &Path, work_tree: &Path) -> bool {
+    work_tree.starts_with(scope) || scope.starts_with(work_tree)
+}
+
+// A recorded git dir: its work tree, the common dir holding its refs, and which directory
+// it was when recorded.
 pub(crate) struct GitDir {
     work_tree: PathBuf,
+    common_dir: PathBuf,
     identity: Option<DirIdentity>,
 }
 

@@ -2929,6 +2929,19 @@ impl Events {
         }
     }
 
+    // Events come in order, and a batch's file events go out before its refs events, so once
+    // the second of two sentinels is heard, every change before the first was. Each is a new
+    // file named by `what`, as one write may be heard twice.
+    fn fence(&self, dir: &Path, what: &str) {
+        for round in 1..=2 {
+            let name = format!("{}-{round}.txt", what.replace(' ', "-"));
+            std::fs::write(dir.join(&name), "sentinel\n").unwrap();
+            self.until(what, |event| {
+                event.path == name && event.kind != WatchEventKind::Refs
+            });
+        }
+    }
+
     // Changes and stages `file` until a repository event for `root` shows the repository's
     // git dir is watched. A rescan, which the queue delivers in place of the changes after
     // it, proves nothing, so the queue is drained and the change made again, a few times.
@@ -3025,6 +3038,10 @@ fn repository_event(path: &str) -> impl Fn(&WatchEvent) -> bool {
     move |event| event.kind == WatchEventKind::Repository && event.path == path
 }
 
+fn refs_event(path: &str) -> impl Fn(&WatchEvent) -> bool {
+    move |event| event.kind == WatchEventKind::Refs && event.path == path
+}
+
 fn canonical(path: &Path) -> String {
     path.canonicalize().unwrap().to_string_lossy().into_owned()
 }
@@ -3118,6 +3135,54 @@ fn watch_subscription_hears_repository_state_only_when_asked() {
         seen.iter().all(
             |event| event.kind != WatchEventKind::Repository && !event.path.starts_with(".git")
         ),
+        "{seen:?}"
+    );
+}
+
+#[test]
+fn watch_subscription_hears_refs_only_when_asked() {
+    let tmp = Sandbox::new();
+    let service = tmp.service();
+    let (project, sub) = repository_fixture(tmp.path());
+    commit_all(&project);
+    let repository = git2::Repository::open(&project).unwrap();
+    let linked = tmp.path().join("linked");
+    repository.worktree("linked", &linked, None).unwrap();
+    let _daemon = start_daemon(&service, "0");
+    let with_refs = || WatchRequest {
+        refs: true,
+        ..WatchRequest::default()
+    };
+    let (_refs, refs) = subscribe(&project, &service, with_refs());
+    let (_state, state) = subscribe(&project, &service, with_repository());
+    let (_below, below) = subscribe(&sub, &service, with_refs());
+    let (_linked, linked_refs) = subscribe(&linked, &service, with_refs());
+
+    let head = repository.head().unwrap().peel_to_commit().unwrap();
+    repository.branch("feature", &head, false).unwrap();
+    refs.until("a new branch", refs_event(""));
+    below.until(
+        "the containing repository's branch",
+        refs_event(&canonical(&project)),
+    );
+    // A linked worktree's branches live in its main repository.
+    linked_refs.until("a branch of the main repository", refs_event(""));
+    refs.fence(&project, "after the branch");
+    repository
+        .tag_lightweight("v1", head.as_object(), false)
+        .unwrap();
+    refs.until("a new tag", refs_event(""));
+    refs.fence(&project, "after the tag");
+    repository.set_head("refs/heads/feature").unwrap();
+    refs.until("a switched HEAD", refs_event(""));
+
+    std::fs::write(project.join("sentinel.rs"), "fn Sentinel() {}\n").unwrap();
+    let seen = state.until(
+        "the sentinel",
+        change("sentinel.rs", WatchEventKind::Created),
+    );
+    assert!(
+        seen.iter().all(|event| event.kind != WatchEventKind::Refs),
         "{seen:?}"
     );
 }

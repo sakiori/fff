@@ -10,7 +10,7 @@ use crate::ffi_types::{FFF_ERROR_UNAVAILABLE, FffResult};
 use crate::{FffInstance, instance_ref};
 
 /// Current version of [`FffWatchOptions`].
-pub const FFF_WATCH_OPTIONS_VERSION: u32 = 2;
+pub const FFF_WATCH_OPTIONS_VERSION: u32 = 3;
 
 /// Kind of a watch event: the git state of a repository changed. Delivered only to
 /// subscriptions that ask for repository state, on instances of the shared service.
@@ -24,6 +24,11 @@ pub const FFF_WATCH_EVENT_FAILED: u8 = 6;
 /// Kind of a watch event of a service-backed instance: the subscription is ready, naming
 /// the instance's directory; every later change is delivered.
 pub const FFF_WATCH_EVENT_READY: u8 = 7;
+
+/// Kind of a watch event: a branch, tag or remote-tracking ref of a repository was created,
+/// moved or deleted, or its HEAD moved. Delivered only to subscriptions that ask for refs, on
+/// instances of the shared service.
+pub const FFF_WATCH_EVENT_REFS: u8 = 8;
 
 /// Options for `fff_watch`. Versioned: new fields are only appended.
 #[repr(C)]
@@ -42,6 +47,20 @@ pub struct FffWatchOptions {
     /// merge).
     /// Service-backed instances only; an in-process instance refuses it.
     pub repository: bool,
+    /// Version 3: also deliver an event of kind [`FFF_WATCH_EVENT_REFS`] naming the work
+    /// tree when a branch, tag or remote-tracking ref of a repository inside the instance's
+    /// directory, or containing it, is created, moved or deleted, loose, in `packed-refs` or
+    /// in a reftable repository's tables, or when its HEAD moves. A linked worktree shares
+    /// its main repository's branches and has a HEAD of its own.
+    /// Service-backed instances only; an in-process instance refuses it.
+    pub refs: bool,
+}
+
+// The git events a subscription asks for beside file changes.
+#[derive(Clone, Copy, Default)]
+pub(crate) struct GitEvents {
+    pub(crate) repository: bool,
+    pub(crate) refs: bool,
 }
 
 /// A single watch event. `kind`: 0 = created, 1 = modified, 2 = removed,
@@ -49,7 +68,7 @@ pub struct FffWatchOptions {
 /// 4 = renamed (`path` is the destination; read the source with
 /// `fff_watch_events_get_from_path`), 5 = repository (only when requested,
 /// see [`FffWatchOptions::repository`]), 6 = failed and 7 = ready (service-backed
-/// instances only).
+/// instances only), 8 = refs (only when requested, see [`FffWatchOptions::refs`]).
 ///
 /// Layout is frozen: this is an array element, so growing it would change the
 /// stride every existing binding compiled against.
@@ -134,28 +153,32 @@ fn path_into_raw(path: &std::path::Path) -> *mut c_char {
         .into_raw()
 }
 
-// The options and whether repository state is asked for.
+// The options and the git events asked for.
 unsafe fn watch_options_from_ffi(
     opts: *const FffWatchOptions,
-) -> Result<(WatchOptions, bool), *mut FffResult> {
+) -> Result<(WatchOptions, GitEvents), *mut FffResult> {
     if opts.is_null() {
-        return Ok((WatchOptions::default(), false));
+        return Ok((WatchOptions::default(), GitEvents::default()));
     }
-    let opts = unsafe { &*opts };
-    if opts.version == 0 || opts.version > FFF_WATCH_OPTIONS_VERSION {
+    // Read field by field as the version allows: an older caller's struct leaves the later
+    // fields as uninitialised padding, which no `bool` may be read from.
+    let version = unsafe { (&raw const (*opts).version).read() };
+    if version == 0 || version > FFF_WATCH_OPTIONS_VERSION {
         return Err(FffResult::err(&format!(
             "Unsupported FffWatchOptions version {} (library understands up to {})",
-            opts.version, FFF_WATCH_OPTIONS_VERSION
+            version, FFF_WATCH_OPTIONS_VERSION
         )));
     }
+    let entries = unsafe { (&raw const (*opts).ignore).read() };
+    let count = unsafe { (&raw const (*opts).ignore_count).read() };
 
-    let mut ignore = Vec::with_capacity(opts.ignore_count as usize);
-    if opts.ignore_count > 0 {
-        if opts.ignore.is_null() {
+    let mut ignore = Vec::with_capacity(count as usize);
+    if count > 0 {
+        if entries.is_null() {
             return Err(FffResult::err("ignore_count > 0 but ignore is NULL"));
         }
-        for i in 0..opts.ignore_count as usize {
-            let entry = unsafe { *opts.ignore.add(i) };
+        for i in 0..count as usize {
+            let entry = unsafe { *entries.add(i) };
             match unsafe { crate::cstr_to_str(entry) } {
                 Some(s) if !s.is_empty() => ignore.push(s.to_string()),
                 Some(_) => {}
@@ -164,10 +187,11 @@ unsafe fn watch_options_from_ffi(
         }
     }
 
-    Ok((
-        WatchOptions { ignore },
-        opts.version >= 2 && opts.repository,
-    ))
+    let git = GitEvents {
+        repository: version >= 2 && unsafe { (&raw const (*opts).repository).read() },
+        refs: version >= 3 && unsafe { (&raw const (*opts).refs).read() },
+    };
+    Ok((WatchOptions { ignore }, git))
 }
 
 // The caller guarantees user_data is safe on the callback thread.
@@ -292,17 +316,17 @@ pub unsafe extern "C" fn fff_watch(
             None => return FffResult::err("Pattern is not valid UTF-8"),
         }
     };
-    let (options, repository) = match unsafe { watch_options_from_ffi(opts) } {
+    let (options, git) = match unsafe { watch_options_from_ffi(opts) } {
         Ok(o) => o,
         Err(e) => return e,
     };
     let inst = match inst {
         FffInstance::Local(local) => local,
-        FffInstance::Service(service) => return service.watch(pattern_str, options, repository),
+        FffInstance::Service(service) => return service.watch(pattern_str, options, git),
     };
-    if repository {
+    if git.repository || git.refs {
         return FffResult::err_with(
-            "Repository state is delivered to instances of the shared service only",
+            "Repository state and refs are delivered to instances of the shared service only",
             FFF_ERROR_UNAVAILABLE,
         );
     }
@@ -339,7 +363,7 @@ pub unsafe extern "C" fn fff_watch_args(
     ignore: *const *const c_char,
     ignore_count: u32,
 ) -> *mut FffResult {
-    unsafe { fff_watch_args_ex(fff_handle, pattern, ignore, ignore_count, false) }
+    unsafe { fff_watch_args_ex2(fff_handle, pattern, ignore, ignore_count, false, false) }
 }
 
 /// [`fff_watch_args`] that also takes [`FffWatchOptions::repository`].
@@ -354,11 +378,28 @@ pub unsafe extern "C" fn fff_watch_args_ex(
     ignore_count: u32,
     repository: bool,
 ) -> *mut FffResult {
+    unsafe { fff_watch_args_ex2(fff_handle, pattern, ignore, ignore_count, repository, false) }
+}
+
+/// [`fff_watch_args_ex`] that also takes [`FffWatchOptions::refs`].
+///
+/// ## Safety
+/// As [`fff_watch_args`].
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn fff_watch_args_ex2(
+    fff_handle: *mut c_void,
+    pattern: *const c_char,
+    ignore: *const *const c_char,
+    ignore_count: u32,
+    repository: bool,
+    refs: bool,
+) -> *mut FffResult {
     let opts = FffWatchOptions {
         version: FFF_WATCH_OPTIONS_VERSION,
         ignore,
         ignore_count,
         repository,
+        refs,
     };
     unsafe { fff_watch(fff_handle, pattern, &opts) }
 }
@@ -428,13 +469,14 @@ pub unsafe extern "C" fn fff_watch_events_get_from_path(
 }
 
 /// Kind of event `index` (0 = created, 1 = modified, 2 = removed, 3 = rescan,
-/// 4 = renamed, 5 = repository, 6 = failed, 7 = ready).
+/// 4 = renamed, 5 = repository, 6 = failed, 7 = ready, 8 = refs).
 /// 3 (rescan aka "re-stat something" kind) returned when OS based buffer
 /// has been overflown and some events might be loss. Paths will contain a list of
 /// directories that needs to be rescanned to ensure consistency.
 /// 4 reports a move: `path` is the destination and
 /// `fff_watch_events_get_from_path` yields the source.
-/// 5 names the work tree whose git state changed, for subscriptions that asked.
+/// 5 names the work tree whose git state changed, and 8 one whose refs changed, for
+/// subscriptions that asked.
 /// 6 and 7 come only from service-backed instances, in a batch of their own that
 /// names the instance's directory: a subscription there always delivers 7 first,
 /// once it is ready, or 6 instead when it cannot be opened; a 6 after 7 ends it
@@ -544,6 +586,8 @@ mod layout_tests {
         assert_eq!(offset_of!(FffWatchOptions, ignore_count), 16);
         // Appended in version 2, into the tail padding.
         assert_eq!(offset_of!(FffWatchOptions, repository), 20);
+        // Appended in version 3, into the tail padding.
+        assert_eq!(offset_of!(FffWatchOptions, refs), 21);
 
         assert_eq!(size_of::<FffWatchEvent>(), 16);
         assert_eq!(offset_of!(FffWatchEvent, path), 0);

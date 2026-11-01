@@ -13,7 +13,9 @@ use fff_service::protocol::{IndexOptions, ServiceError};
 use fff_service::session::{CONNECT_TIMEOUT, ProgramConfig, ProgramSession, RESPONSE_TIMEOUT};
 use fff_service::watch::{Delivery, Subscription, WatchEventKind, WatchRequest};
 
-use crate::watch::{FFF_WATCH_EVENT_READY, FFF_WATCH_EVENT_REPOSITORY};
+use crate::watch::{
+    FFF_WATCH_EVENT_READY, FFF_WATCH_EVENT_REFS, FFF_WATCH_EVENT_REPOSITORY, GitEvents,
+};
 
 use crate::ffi_types::{
     FFF_ERROR_FAILED, FFF_ERROR_INVALID_REQUEST, FFF_ERROR_LOST_SERVICE, FFF_ERROR_OUTSIDE_SCOPE,
@@ -104,7 +106,7 @@ impl ServiceInstance {
         &self,
         pattern: &str,
         options: fff::WatchOptions,
-        repository: bool,
+        git: GitEvents,
     ) -> *mut FffResult {
         if !self.config.options.watch {
             return FffResult::err_with(
@@ -125,7 +127,8 @@ impl ServiceInstance {
             (Ok(pattern), Ok(ignore)) => WatchRequest {
                 pattern,
                 ignore,
-                repository,
+                repository: git.repository,
+                refs: git.refs,
             },
             (Err(error), _) | (_, Err(error)) => return error,
         };
@@ -408,6 +411,7 @@ fn kind(kind: WatchEventKind) -> u8 {
         WatchEventKind::Rescan => 3,
         WatchEventKind::Renamed => 4,
         WatchEventKind::Repository => FFF_WATCH_EVENT_REPOSITORY,
+        WatchEventKind::Refs => FFF_WATCH_EVENT_REFS,
     }
 }
 

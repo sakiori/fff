@@ -1,4 +1,5 @@
 use super::dir_walk::{DirWalk, ReplacedDirs};
+use super::ref_watches::{RefChanges, RefWatches};
 use crate::constants::MAX_OVERFLOW_FILES;
 use crate::error::Error;
 use crate::file_picker::{FFFMode, FilePicker, IndexUpdateError};
@@ -11,12 +12,12 @@ use crate::walk::DirHook;
 use crate::watch::{RawWatchEvent, WatchEventKind};
 use git2::Repository;
 use notify::event::{AccessKind, AccessMode, ModifyKind, RemoveKind, RenameMode};
-use notify::{Config, EventKind, EventKindMask, RecursiveMode};
+use notify::{Config, EventKind, EventKindMask, PathOp, RecursiveMode, Watcher, WatcherKind};
 use notify_debouncer_full::{DebounceEventResult, DebouncedEvent, NoCache, new_debouncer_opt};
 use parking_lot::Mutex;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 use tracing::{Level, debug, error, info, warn};
@@ -35,6 +36,56 @@ impl Debouncer {
         }
     }
 
+    // Applies every op in one update, going on past a failed one, and returns whether the
+    // event stream restarted for it. FSEvents restarts its stream on every update, also for a
+    // path it watches already, and the new stream starts from now.
+    fn update(&mut self, mut ops: Vec<PathOp>) -> bool {
+        let restarts = self.restarts_stream();
+        if restarts && let Ok(watched) = self.watched_paths() {
+            ops.retain(|op| match op {
+                PathOp::Watch(path, config) => !watched
+                    .iter()
+                    .any(|(known, mode)| known == path && *mode == config.recursive_mode()),
+                PathOp::Unwatch(_) => true,
+            });
+        }
+        let restarted = restarts && !ops.is_empty();
+        while !ops.is_empty() {
+            let result = match self {
+                Debouncer::Native(debouncer) => debouncer.update_paths(ops),
+                Debouncer::Poll(debouncer) => debouncer.update_paths(ops),
+            };
+            let Err(error) = result else {
+                break;
+            };
+            match &error.origin {
+                Some(PathOp::Watch(path, _)) => {
+                    warn!("Failed to watch {}: {}", path.display(), error.source)
+                }
+                // Its directory went, and the backend dropped the watch with it.
+                Some(PathOp::Unwatch(path)) => {
+                    debug!("Failed to unwatch {}: {}", path.display(), error.source)
+                }
+                None => warn!("Failed to update the watched paths: {}", error.source),
+            }
+            ops = error.remaining;
+        }
+        restarted
+    }
+
+    // FSEvents restarts its one stream for every change of the watched paths.
+    fn restarts_stream(&self) -> bool {
+        matches!(self, Debouncer::Native(_))
+            && <notify::RecommendedWatcher as Watcher>::kind() == WatcherKind::Fsevent
+    }
+
+    fn watched_paths(&self) -> notify::Result<Vec<(PathBuf, RecursiveMode)>> {
+        match self {
+            Debouncer::Native(debouncer) => debouncer.watched_paths(),
+            Debouncer::Poll(debouncer) => debouncer.watched_paths(),
+        }
+    }
+
     fn stop_nonblocking(self) {
         match self {
             Debouncer::Native(debouncer) => debouncer.stop_nonblocking(),
@@ -46,12 +97,139 @@ impl Debouncer {
 /// Owns the file-system watcher and guarantees that all background threads
 /// are fully joined before `stop()` / `Drop` returns.
 pub struct BackgroundWatcher {
-    debouncer: Arc<Mutex<Option<Debouncer>>>,
-    watch_tx: Option<mpsc::Sender<WatchTask>>,
+    watches: Arc<Watches>,
     owner_thread: Option<std::thread::JoinHandle<()>>,
     recursive: bool,
     picker: crate::shared::WeakFilePicker,
     base_path: PathBuf,
+}
+
+// What the watcher's threads share to change the watched paths.
+pub(crate) struct Watches {
+    streams: Mutex<Option<Streams>>,
+    // Closed when the watcher stops, so the owner thread ends.
+    tasks: Mutex<Option<mpsc::Sender<WatchTask>>>,
+    refs: RefWatches,
+    git_status: Arc<GitStatusWorker>,
+    base_path: PathBuf,
+    // Set when the index's first walk begins; what a stream misses before, the walk reads.
+    walking: AtomicBool,
+}
+
+// The tree's stream, and on FSEvents one for the paths outside the tree. FSEvents restarts a
+// stream from "now" whenever its paths change, so every change after the setup goes to the
+// outside one, whose restart can lose only git state, never a file of the tree.
+struct Streams {
+    tree: Debouncer,
+    outside: Option<Debouncer>,
+}
+
+impl Streams {
+    fn stop_nonblocking(self) {
+        self.tree.stop_nonblocking();
+        if let Some(outside) = self.outside {
+            outside.stop_nonblocking();
+        }
+    }
+}
+
+impl Watches {
+    fn send(&self, task: WatchTask) -> bool {
+        (self.tasks.lock().as_ref()).is_some_and(|tasks| tasks.send(task).is_ok())
+    }
+
+    // Applies `ops` in one update and returns whether the git state of the repositories
+    // outside the tree must be announced again, as a stream restarted after the walk began.
+    fn update(&self, streams: &mut Streams, ops: Vec<PathOp>) -> bool {
+        match streams.outside.as_mut() {
+            Some(outside) => outside.update(ops) && self.walking.load(Ordering::Acquire),
+            None => streams.tree.update(ops) && self.walking.load(Ordering::Acquire),
+        }
+    }
+
+    // What changed outside the tree while its stream restarted is lost: the own git status is
+    // read again, ref stores and logs that appeared get their watches, and the repositories
+    // whose git dir or common dir lies outside the tree are announced as changed.
+    fn recover_outside(&self, picker: &SharedFilePicker) {
+        let outside = |path: &Path| !path.starts_with(&self.base_path);
+        let registered = picker.registered_git_dirs();
+        let mut appeared = Vec::new();
+        // Each update adds only paths not watched yet, so the candidates bound the rounds.
+        let mut rounds = 0;
+        let mut bound = None;
+        loop {
+            let mut guard = self.streams.lock();
+            let Some(streams) = guard.as_mut() else {
+                return;
+            };
+            let plan = self.refs.plan(picker, None);
+            let git_dirs = (registered.iter())
+                .filter(|known| known.work_tree.starts_with(&self.base_path))
+                .map(|known| known.git_dir.clone())
+                .chain(self.refs.own_git_dir());
+            let logs: Vec<_> = (git_dirs.filter(|git_dir| outside(git_dir)))
+                .map(|git_dir| git_dir.join("logs"))
+                .collect();
+            let bound = *bound.get_or_insert(plan.candidates + logs.len() + 1);
+            let logs = (logs.into_iter())
+                .filter(|logs| logs.is_dir())
+                .map(PathOp::watch_non_recursive);
+            let ops = plan.ops.into_iter().chain(logs).collect();
+            appeared.extend(plan.appeared);
+            rounds += 1;
+            if !self.update(streams, ops) {
+                break;
+            }
+            if rounds >= bound {
+                warn!(
+                    rounds,
+                    "Watches outside the tree kept changing while their stream restarted"
+                );
+                break;
+            }
+        }
+        // Read after the last restart, so the status cannot predate what it missed.
+        if self.refs.own_git_dir_outside() {
+            self.git_status.request_full_rescan();
+        }
+        let mut work_trees: Vec<PathBuf> = (registered.into_iter())
+            .filter(|known| {
+                known.work_tree.starts_with(&self.base_path)
+                    && (outside(&known.git_dir) || outside(&known.common_dir))
+            })
+            .map(|known| known.work_tree.components().collect())
+            .collect();
+        work_trees.extend(self.refs.own_work_tree_outside());
+        work_trees.sort_unstable();
+        work_trees.dedup();
+        for work_tree in &work_trees {
+            picker.notify_repository_change(work_tree);
+        }
+        appeared.extend(work_trees);
+        appeared.sort_unstable();
+        appeared.dedup();
+        for work_tree in appeared {
+            picker.notify_ref_change(&work_tree);
+        }
+    }
+
+    // Brings the ref watches in line with the ref listeners.
+    pub(crate) fn sync_refs(&self, picker: &SharedFilePicker) {
+        let (appeared, restarted) = {
+            let mut guard = self.streams.lock();
+            let Some(streams) = guard.as_mut() else {
+                return;
+            };
+            let plan = self.refs.plan(picker, None);
+            (plan.appeared, self.update(streams, plan.ops))
+        };
+        if restarted {
+            self.recover_outside(picker);
+        }
+        for work_tree in appeared {
+            picker.notify_ref_change(&work_tree);
+        }
+    }
 }
 
 enum WatchTask {
@@ -64,6 +242,8 @@ enum WatchTask {
     NewGitLog(PathBuf),
     /// A throttled rescan was deferred; wake up to run it when due.
     RescanDeferred,
+    /// A ref store or its format may have changed: the ref watches follow.
+    SyncRefs,
 }
 
 const DEBOUNCE_TIMEOUT: Duration = Duration::from_millis(50);
@@ -88,6 +268,7 @@ impl BackgroundWatcher {
         git_status_worker: Arc<GitStatusWorker>,
         trace_span: tracing::Span,
     ) -> Result<Self, Error> {
+        let git_workdir = git.map(|git| git.workdir);
         info!(
             "Initializing background watcher for path: {}, mode: {:?}",
             base_path.display(),
@@ -119,47 +300,115 @@ impl BackgroundWatcher {
 
         let (watch_tx, watch_rx) = mpsc::channel::<WatchTask>();
         let watch_tx_for_debouncer = watch_tx.clone();
+        let poll_interval = test_poll_interval(&base_path);
+        let fsevents = poll_interval.is_none()
+            && <notify::RecommendedWatcher as Watcher>::kind() == WatcherKind::Fsevent;
+        // Removing a watch restarts the FSEvents stream, so ref watches stay once added there.
+        let refs = RefWatches::new(&base_path, use_recursive, git_workdir.as_deref(), fsevents);
+        // The own git dir is watched from the start, so a walk reaching the work tree finds it
+        // known, and watches it anew only once it was created again.
+        if let Some(workdir) = &git_workdir
+            && let Some(git_dir) = git_dir_of(workdir)
+        {
+            shared_picker.register_git_dir(&git_dir, workdir);
+        }
 
         let owner_weak_picker = shared_picker.weaken();
         let hook_picker = shared_picker.weaken();
         let hook_base_path = base_path.clone();
-        let owner_git_workdir = git.as_ref().map(|git| git.workdir.clone());
+        let owner_git_workdir = git_workdir.clone();
         let owner_git_worker = Arc::clone(&git_status_worker);
         let owner_frecency = shared_frecency.clone();
         let owner_base_path = base_path.clone();
 
-        let debouncer = match test_poll_interval(&base_path) {
-            None => Debouncer::Native(Self::create_debouncer(
-                base_path,
-                git,
-                shared_picker,
-                shared_frecency,
-                mode,
-                use_recursive,
-                watch_tx_for_debouncer,
-                git_status_worker,
-                None,
-            )?),
+        let handler = || {
+            (
+                base_path.clone(),
+                git_workdir.clone(),
+                shared_picker.clone(),
+                shared_frecency.clone(),
+                watch_tx_for_debouncer.clone(),
+                Arc::clone(&git_status_worker),
+            )
+        };
+        let mut tree = match poll_interval {
+            None => {
+                let (base, workdir, picker, frecency, tx, worker) = handler();
+                Debouncer::Native(Self::create_debouncer(
+                    base, workdir, picker, frecency, mode, tx, worker, None,
+                )?)
+            }
             Some(interval) => {
                 info!(?interval, "File watcher uses the polling backend");
+                let (base, workdir, picker, frecency, tx, worker) = handler();
                 Debouncer::Poll(Self::create_debouncer(
-                    base_path,
-                    git,
-                    shared_picker,
-                    shared_frecency,
+                    base,
+                    workdir,
+                    picker,
+                    frecency,
                     mode,
-                    use_recursive,
-                    watch_tx_for_debouncer,
-                    git_status_worker,
+                    tx,
+                    worker,
                     Some(interval),
                 )?)
             }
         };
+        let mut outside = match fsevents {
+            true => {
+                let (base, workdir, picker, frecency, tx, worker) = handler();
+                Some(Debouncer::Native(Self::create_debouncer(
+                    base, workdir, picker, frecency, mode, tx, worker, None,
+                )?))
+            }
+            false => None,
+        };
+
+        if use_recursive {
+            tree.watch(&base_path, RecursiveMode::Recursive)?;
+            info!(
+                "File watcher initialized with single recursive watch on {}",
+                base_path.display(),
+            );
+        } else {
+            // Scans subscribe every directory they walk through `dir_hook`.
+            tree.watch(&base_path, RecursiveMode::NonRecursive)?;
+            info!(
+                "File watcher initialized with per-directory watches on {}",
+                base_path.display(),
+            );
+        }
+        // The .git directory is excluded from the file list but we still need to observe
+        // changes that affect git status (staging, committing, branch switches, merges, etc).
+        // The own git dir may lie outside the tree, as a linked worktree's does.
+        let own_git = git_workdir
+            .as_deref()
+            .and_then(|workdir| Repository::open(workdir).ok())
+            .map(|repo| git_dir_watches(repo.path()).collect::<Vec<_>>())
+            .unwrap_or_default();
+        match outside.as_mut() {
+            Some(outside) => {
+                let (inside, mut beyond): (Vec<_>, Vec<_>) =
+                    (own_git.into_iter()).partition(|op| op.as_path().starts_with(&base_path));
+                tree.update(inside);
+                beyond.extend(refs.own_targets(&shared_picker));
+                outside.update(beyond);
+            }
+            None => {
+                tree.update(own_git);
+            }
+        }
 
         info!("Background file watcher initialized successfully");
 
-        let debouncer = Arc::new(Mutex::new(Some(debouncer)));
-        let owner_debouncer = Arc::clone(&debouncer);
+        let watches = Arc::new(Watches {
+            streams: Mutex::new(Some(Streams { tree, outside })),
+            tasks: Mutex::new(Some(watch_tx)),
+            refs,
+            git_status: Arc::clone(&owner_git_worker),
+            base_path: base_path.clone(),
+            walking: AtomicBool::new(false),
+        });
+        let owner_watches = Arc::clone(&watches);
 
         let owner_span = trace_span.clone();
         let owner_thread = std::thread::Builder::new()
@@ -196,7 +445,7 @@ impl BackgroundWatcher {
                         Some(WatchTask::IndexNewDir(dir)) => dir,
                         Some(WatchTask::NewGitLog(git_dir)) => {
                             watch_new_log(
-                                &owner_debouncer,
+                                &owner_watches,
                                 &strong_picker,
                                 &git_dir,
                                 &owner_git_workdir,
@@ -206,23 +455,28 @@ impl BackgroundWatcher {
                         }
                         Some(WatchTask::NewRepository(work_tree)) => {
                             DirSubscriptions::hook(
-                                &owner_debouncer,
+                                &owner_watches,
                                 use_recursive,
                                 &owner_weak_picker,
                                 &owner_base_path,
                             )(&work_tree);
                             continue;
                         }
+                        Some(WatchTask::SyncRefs) => {
+                            owner_watches.refs.reread_storages();
+                            owner_watches.sync_refs(&strong_picker);
+                            continue;
+                        }
                         Some(WatchTask::RescanDeferred) | None => continue,
                     };
                     #[cfg(debug_assertions)]
                     hold_dir_indexing();
-                    if owner_debouncer.lock().is_none() {
+                    if owner_watches.streams.lock().is_none() {
                         break;
                     }
 
                     let dir_hook = DirSubscriptions::hook(
-                        &owner_debouncer,
+                        &owner_watches,
                         use_recursive,
                         &owner_weak_picker,
                         &owner_base_path,
@@ -246,8 +500,7 @@ impl BackgroundWatcher {
             .expect("failed to spawn fff-watcher-owner thread");
 
         Ok(Self {
-            debouncer,
-            watch_tx: Some(watch_tx),
+            watches,
             owner_thread: Some(owner_thread),
             recursive: use_recursive,
             picker: hook_picker,
@@ -258,11 +511,10 @@ impl BackgroundWatcher {
     #[allow(clippy::too_many_arguments)]
     fn create_debouncer<W: notify::Watcher>(
         base_path: PathBuf,
-        git: Option<GitDiscovery>,
+        git_workdir: Option<PathBuf>,
         shared_picker: SharedFilePicker,
         shared_frecency: SharedFrecency,
         mode: FFFMode,
-        use_recursive: bool,
         watch_tx: mpsc::Sender<WatchTask>,
         git_status_worker: Arc<GitStatusWorker>,
         poll_interval: Option<Duration>,
@@ -276,10 +528,10 @@ impl BackgroundWatcher {
             // our own grep calls and preview window rendering
             .with_event_kinds(EventKindMask::CORE);
 
-        let git_workdir_for_handler = git.as_ref().map(|git| git.workdir.clone());
+        let git_workdir_for_handler = git_workdir.clone();
         let base_path_for_handler = base_path.clone();
         let file_picker = shared_picker.weaken();
-        let mut debouncer = new_debouncer_opt(
+        let debouncer = new_debouncer_opt(
             DEBOUNCE_TIMEOUT,
             Some(DEBOUNCE_TIMEOUT / 2), // tick rate for the event span
             {
@@ -334,29 +586,6 @@ impl BackgroundWatcher {
             config,
         )?;
 
-        if use_recursive {
-            debouncer.watch(base_path.as_path(), RecursiveMode::Recursive)?;
-            info!(
-                "File watcher initialized with single recursive watch on {}",
-                base_path.display(),
-            );
-        } else {
-            // Scans subscribe every directory they walk through `dir_hook`.
-            debouncer.watch(base_path.as_path(), RecursiveMode::NonRecursive)?;
-            info!(
-                "File watcher initialized with per-directory watches on {}",
-                base_path.display(),
-            );
-        }
-
-        // The .git directory is excluded from the file list but we still need
-        // to observe changes that affect git status (staging, unstaging,
-        // committing, branch switches, merges, etc)
-        watch_git_status_paths(
-            &mut debouncer,
-            git.as_ref().map(|git| git.git_dir.as_path()),
-        );
-
         Ok(debouncer)
     }
 
@@ -364,9 +593,9 @@ impl BackgroundWatcher {
     /// threads. Safe to call from any context, including while holding
     /// the [`SharedFilePicker`] write lock.
     pub fn stop(&mut self) {
-        self.watch_tx.take();
-        if let Some(debouncer) = self.debouncer.lock().take() {
-            debouncer.stop_nonblocking();
+        self.watches.tasks.lock().take();
+        if let Some(streams) = self.watches.streams.lock().take() {
+            streams.stop_nonblocking();
         }
 
         self.owner_thread.take();
@@ -378,11 +607,21 @@ impl BackgroundWatcher {
     /// covers the tree, and watches the git state of a repository it holds.
     pub(crate) fn dir_hook(&self) -> Option<DirHook> {
         Some(DirSubscriptions::hook(
-            &self.debouncer,
+            &self.watches,
             self.recursive,
             &self.picker,
             &self.base_path,
         ))
+    }
+
+    // From now on a stream that restarts misses what the walk cannot read for it.
+    pub(crate) fn walk_begins(&self) {
+        self.watches.walking.store(true, Ordering::Release);
+    }
+
+    // Changes the watched paths off the picker lock, as the ref listeners need.
+    pub(crate) fn watches(&self) -> Arc<Watches> {
+        Arc::clone(&self.watches)
     }
 
     pub(crate) fn request_index_dir(&self, dir: PathBuf) -> bool {
@@ -402,9 +641,7 @@ impl BackgroundWatcher {
     }
 
     fn send(&self, task: WatchTask) -> bool {
-        self.watch_tx
-            .as_ref()
-            .is_some_and(|tx| tx.send(task).is_ok())
+        self.watches.send(task)
     }
 }
 
@@ -487,6 +724,10 @@ pub(crate) fn handle_debounced_events(
     shared_frecency: &SharedFrecency,
     git_status_worker: &Arc<GitStatusWorker>,
 ) -> Vec<PathBuf> {
+    let events = drop_foreign_admin_files(shared_picker, base_path, events);
+    if events.is_empty() {
+        return Vec::new();
+    }
     let mut git = GitChanges::default();
     let new_dirs = apply_debounced_events(
         mode,
@@ -500,25 +741,59 @@ pub(crate) fn handle_debounced_events(
     );
     // Subscribers hear of git state changes whatever became of the batch's index update.
     for root in &git.roots {
-        shared_picker.repository_listeners().notify(root);
+        shared_picker.notify_repository_change(root);
     }
-    if !git.watches.is_empty()
+    for root in &git.ref_roots {
+        shared_picker.notify_ref_change(root);
+    }
+    if (!git.watches.is_empty() || git.resync_refs)
         && let Ok(guard) = shared_picker.read()
         && let Some(watcher) = guard.as_ref().and_then(|p| p.background_watcher.as_ref())
     {
         for change in git.watches {
             watcher.request_git_state(change);
         }
+        if git.resync_refs {
+            watcher.send(WatchTask::SyncRefs);
+        }
     }
     new_dirs
 }
 
-// What a batch tells of git state: the work trees whose state changed, and the git dirs
-// and logs that need watches of their own.
+// Other worktrees' admin dirs reach the index only through its ref watches, and their busy
+// files mean nothing to it: a batch of them costs one lock and a prefix check per path.
+fn drop_foreign_admin_files(
+    picker: &SharedFilePicker,
+    base_path: &Path,
+    events: Vec<DebouncedEvent>,
+) -> Vec<DebouncedEvent> {
+    let signals = picker.read().ok().and_then(|guard| {
+        let watcher = guard.as_ref()?.background_watcher.as_ref()?;
+        watcher.watches.refs.signals()
+    });
+    let Some(signals) = signals else {
+        return events;
+    };
+    (events.into_iter())
+        .filter(|event| {
+            let paths = &event.event.paths;
+            paths.is_empty()
+                || !paths
+                    .iter()
+                    .all(|path| signals.foreign_admin_file(path, base_path))
+        })
+        .collect()
+}
+
+// What a batch tells of git state: the work trees whose state changed, those whose refs
+// changed, the git dirs and logs that need watches of their own, and whether the ref
+// watches need to follow a ref store.
 #[derive(Default)]
 struct GitChanges {
     roots: ahash::AHashSet<PathBuf>,
+    ref_roots: ahash::AHashSet<PathBuf>,
     watches: Vec<GitStateChange>,
+    resync_refs: bool,
 }
 
 enum GitStateChange {
@@ -545,11 +820,20 @@ fn apply_debounced_events(
     let repo = git_workdir.as_ref().and_then(|p| Repository::open(p).ok());
     // Prefer the walker's own ignore rules (zlob); grab a cheap Arc clone once
     // per batch so we don't hold the picker lock during filtering.
-    let (walker_rules, follow_symlinks) = shared_picker
+    let (walker_rules, follow_symlinks, ref_signals) = shared_picker
         .read()
         .ok()
-        .and_then(|g| g.as_ref().map(|p| (p.ignore_rules(), p.follows_symlinks())))
-        .unwrap_or((None, false));
+        .and_then(|g| {
+            g.as_ref().map(|p| {
+                let watcher = p.background_watcher.as_ref();
+                let ref_signals = watcher.and_then(|watcher| watcher.watches.refs.signals());
+                (p.ignore_rules(), p.follows_symlinks(), ref_signals)
+            })
+        })
+        .unwrap_or((None, false, None));
+    let ref_only = |path: &Path| {
+        (ref_signals.as_ref()).is_some_and(|signals| signals.ref_only(path, base_path))
+    };
     let filter = IgnoreFilter::new(base_path, walker_rules, repo.as_ref());
     let mut need_full_git_rescan = false;
     let mut batch_overflow_attempted = false;
@@ -605,9 +889,21 @@ fn apply_debounced_events(
                     | notify::event::RemoveKind::Other
             )
         );
-        event.event.paths.iter().map(move |path| (path, removed))
+        let kind = event.event.kind;
+        event
+            .event
+            .paths
+            .iter()
+            .map(move |path| (path, kind, removed))
     });
-    for (path, removed) in paths {
+    // Refs are looked at only while a listener follows a repository.
+    let mut ref_changes = RefChanges::default();
+    for (path, kind, removed) in paths {
+        if let Some(signals) = &ref_signals
+            && signals.may_hold(path, base_path)
+        {
+            signals.classify(path, kind, &mut ref_changes);
+        }
         // A repository whose work tree or git dir went, or a directory above them, is
         // recorded anew when it returns. Linux reports a watched git dir's own removal too.
         if removed {
@@ -618,6 +914,7 @@ fn apply_debounced_events(
                 git.roots.insert(workdir.clone());
             }
         } else if (is_git_file(path) || !path.starts_with(base_path))
+            && !ref_only(path)
             && let Some(root) = git_state_root(shared_picker, path)
             && git_workdir.as_deref() != Some(root.as_path())
             && root.starts_with(base_path)
@@ -626,6 +923,13 @@ fn apply_debounced_events(
             // A repository nested in the index, which the walk and its watches reach.
             git.roots.insert(root);
         }
+    }
+    if let Some(signals) = &ref_signals {
+        git.ref_roots.extend(
+            (ref_changes.work_trees.into_iter())
+                .filter(|work_tree| signals.is_own(work_tree) || !filter.is_ignored(work_tree)),
+        );
+        git.resync_refs = ref_changes.resync;
     }
 
     for debounced_event in &events {
@@ -700,6 +1004,9 @@ fn apply_debounced_events(
             }
 
             let outside = !path.starts_with(base_path);
+            if outside && ref_only(path) {
+                continue;
+            }
             // Bare repositories keep worktree git dirs outside of any `.git` component.
             let in_own_git_dir = repo
                 .as_ref()
@@ -1213,6 +1520,10 @@ fn hold_dir_indexing() {
 // use the native backend.
 #[cfg(any(test, debug_assertions))]
 fn test_poll_interval(base_path: &Path) -> Option<Duration> {
+    #[cfg(test)]
+    if NATIVE_ROOTS.lock().iter().any(|root| root == base_path) {
+        return None;
+    }
     if POLLED_ROOTS.lock().iter().any(|root| root == base_path) {
         return Some(Duration::from_millis(25));
     }
@@ -1233,6 +1544,10 @@ fn test_poll_interval(_base_path: &Path) -> Option<Duration> {
 
 #[cfg(any(test, debug_assertions))]
 static POLLED_ROOTS: Mutex<Vec<PathBuf>> = Mutex::new(Vec::new());
+
+// Roots whose watchers tests of native backends start natively, whatever the variable says.
+#[cfg(test)]
+static NATIVE_ROOTS: Mutex<Vec<PathBuf>> = Mutex::new(Vec::new());
 
 /// Test seam: watchers started later for `root` in this process poll instead of
 /// using OS events. Debug and test builds only.
@@ -1328,7 +1643,7 @@ pub(super) fn index_new_directory(
 // Subscribes directories one at a time as a walk reaches them, and the git state of the
 // repositories among them, which walks skip.
 struct DirSubscriptions {
-    debouncer: Arc<Mutex<Option<Debouncer>>>,
+    watches: Arc<Watches>,
     recursive: bool,
     picker: crate::shared::WeakFilePicker,
     base_path: PathBuf,
@@ -1338,13 +1653,13 @@ struct DirSubscriptions {
 
 impl DirSubscriptions {
     fn hook(
-        debouncer: &Arc<Mutex<Option<Debouncer>>>,
+        watches: &Arc<Watches>,
         recursive: bool,
         picker: &crate::shared::WeakFilePicker,
         base_path: &Path,
     ) -> DirHook {
         let subscriptions = Self {
-            debouncer: Arc::clone(debouncer),
+            watches: Arc::clone(watches),
             recursive,
             picker: picker.clone(),
             base_path: base_path.to_path_buf(),
@@ -1363,11 +1678,11 @@ impl DirSubscriptions {
         if self.consecutive_failures.load(Ordering::Relaxed) >= MAX_CONSECUTIVE_WATCH_FAILURES {
             return;
         }
-        let mut guard = self.debouncer.lock();
-        let Some(debouncer) = guard.as_mut() else {
+        let mut guard = self.watches.streams.lock();
+        let Some(streams) = guard.as_mut() else {
             return;
         };
-        match debouncer.watch(dir, RecursiveMode::NonRecursive) {
+        match streams.tree.watch(dir, RecursiveMode::NonRecursive) {
             Ok(()) => {
                 self.watched.fetch_add(1, Ordering::Relaxed);
                 self.consecutive_failures.store(0, Ordering::Relaxed);
@@ -1396,7 +1711,8 @@ impl DirSubscriptions {
     // everywhere, as the polling backend takes a new snapshot and loses what changed since
     // its last poll. Such a repository is announced once its watches are in place, since
     // `git init`, a clone or a worktree add and a first `git add` are quicker than a walk.
-    // The first scan of an index has no subscribers to hear it.
+    // The first scan of an index has no subscribers to hear it. Its ref watches, while a ref
+    // listener follows it, go in the same update.
     fn watch_git_state(&self, dir: &Path) {
         let Some(git_dir) = git_dir_of(dir) else {
             return;
@@ -1407,13 +1723,29 @@ impl DirSubscriptions {
         if !picker.register_git_dir(&git_dir, dir) {
             return;
         }
-        if !self.recursive || !git_dir.starts_with(&self.base_path) {
-            let mut guard = self.debouncer.lock();
-            if let Some(debouncer) = guard.as_mut() {
-                watch_git_dir(debouncer, &git_dir);
+        let (appeared, restarted) = {
+            let mut guard = self.watches.streams.lock();
+            let Some(streams) = guard.as_mut() else {
+                return;
+            };
+            let mut ops = Vec::new();
+            if !self.recursive || !git_dir.starts_with(&self.base_path) {
+                ops.extend(git_dir_watches(&git_dir));
             }
+            // A repository created again lost the watches of its refs; a linked worktree
+            // shares its main repository's.
+            let renew = (super::common_dir_of(&git_dir) == git_dir).then_some(git_dir.as_path());
+            let refs = self.watches.refs.plan(&picker, renew);
+            ops.extend(refs.ops);
+            (refs.appeared, self.watches.update(streams, ops))
+        };
+        if restarted {
+            self.watches.recover_outside(&picker);
         }
-        picker.repository_listeners().notify(dir);
+        for work_tree in appeared {
+            picker.notify_ref_change(&work_tree);
+        }
+        picker.notify_repository_change(dir);
     }
 }
 
@@ -1553,45 +1885,16 @@ fn affects_worktree_state(path_in_git_dir: &Path) -> bool {
         return true;
     }
 
-    path_in_git_dir
-        .file_name()
-        .and_then(|f| f.to_str())
-        .is_some_and(|fname| matches!(fname, "MERGE_HEAD" | "CHERRY_PICK_HEAD" | "REVERT_HEAD"))
-}
-
-// `git_dir` is `.git/worktrees/<name>` for linked worktrees, whose `.git` is a file.
-fn watch_git_status_paths<W: notify::Watcher>(
-    debouncer: &mut notify_debouncer_full::Debouncer<W, NoCache>,
-    git_dir: Option<&Path>,
-) {
-    let Some(git_dir) = git_dir.filter(|git_dir| git_dir.is_dir()) else {
-        return;
-    };
-
-    // We have tried to be smart about the internal git state but
-    // it appeared more harmful that it's worth it, so we just watch
-    // for the most obvious paths like HEAD, MERGE_HEAD, index.lock
-    if let Err(e) = debouncer.watch(git_dir, RecursiveMode::NonRecursive) {
-        warn!("Failed to watch .git directory: {}", e);
-    }
-
-    // `.git` above is non-recursive, so on Linux (per-dir inotify watches)
-    // events for `logs/HEAD` — the commit-finished signal used by
-    // `is_dotgit_change_affecting_status` — would never be delivered without
-    // watching `.git/logs` itself. On macOS/Windows the recursive base watch
-    // already covers it; an extra watch is harmless there.
-    let logs_dir = git_dir.join("logs");
-    if logs_dir.is_dir()
-        && let Err(e) = debouncer.watch(&logs_dir, RecursiveMode::NonRecursive)
-    {
-        warn!("Failed to watch .git/logs directory: {}", e);
-    }
+    // At the git dir's root only: a linked worktree's admin dir below it has its own.
+    ["MERGE_HEAD", "CHERRY_PICK_HEAD", "REVERT_HEAD"]
+        .iter()
+        .any(|name| path_in_git_dir == Path::new(name))
 }
 
 // Watches the log a git dir gained, unless the tree's watch covers it, and announces its
 // repository, whose HEAD moved before the log was watched.
 fn watch_new_log(
-    debouncer: &Arc<Mutex<Option<Debouncer>>>,
+    watches: &Watches,
     picker: &SharedFilePicker,
     git_dir: &Path,
     own_work_tree: &Option<PathBuf>,
@@ -1615,34 +1918,32 @@ fn watch_new_log(
     let Some(work_tree) = work_tree else {
         return;
     };
-    if !covered
-        && let Some(debouncer) = debouncer.lock().as_mut()
-        && let Err(e) = debouncer.watch(&git_dir.join("logs"), RecursiveMode::NonRecursive)
-    {
-        debug!("Failed to watch {}/logs: {}", git_dir.display(), e);
+    let logs = PathOp::watch_non_recursive(git_dir.join("logs"));
+    let restarted = !covered
+        && (watches.streams.lock().as_mut())
+            .is_some_and(|streams| watches.update(streams, vec![logs]));
+    if restarted {
+        watches.recover_outside(picker);
     }
-    picker.repository_listeners().notify(&work_tree);
+    picker.notify_repository_change(&work_tree);
 }
 
 // Whether `dir` is a git dir by its shape.
-fn is_git_dir(dir: &Path) -> bool {
+pub(crate) fn is_git_dir(dir: &Path) -> bool {
     dir.join("HEAD").is_file() && (dir.join("objects").is_dir() || dir.join("commondir").is_file())
 }
 
 // The git state of a repository lives in its git dir and its log.
-fn watch_git_dir(debouncer: &mut Debouncer, git_dir: &Path) {
-    for dir in [git_dir.to_path_buf(), git_dir.join("logs")] {
-        if dir.is_dir()
-            && let Err(e) = debouncer.watch(&dir, RecursiveMode::NonRecursive)
-        {
-            debug!("Failed to watch {}: {}", dir.display(), e);
-        }
-    }
+fn git_dir_watches(git_dir: &Path) -> impl Iterator<Item = PathOp> {
+    [git_dir.to_path_buf(), git_dir.join("logs")]
+        .into_iter()
+        .filter(|dir| dir.is_dir())
+        .map(PathOp::watch_non_recursive)
 }
 
 // The git dir of a repository whose work tree is `dir`: its `.git` directory, or the one
 // its `.git` file names.
-fn git_dir_of(dir: &Path) -> Option<PathBuf> {
+pub(crate) fn git_dir_of(dir: &Path) -> Option<PathBuf> {
     let dot_git = dir.join(".git");
     let metadata = dot_git.symlink_metadata().ok()?;
     if metadata.is_dir() {
@@ -2147,6 +2448,14 @@ mod tests {
         let git_dir = repo.path().to_path_buf();
         let repo = Some(repo);
 
+        // A linked worktree's operation in progress is its own, not the main checkout's.
+        for nested in [
+            "worktrees/wt/MERGE_HEAD",
+            "worktrees/wt/CHERRY_PICK_HEAD",
+            "x/REVERT_HEAD",
+        ] {
+            assert!(!affects_worktree_state(Path::new(nested)), "{nested}");
+        }
         let affecting = ["index", "index.lock", "HEAD", "logs/HEAD", "MERGE_HEAD"];
         for p in affecting {
             assert!(
@@ -2340,6 +2649,346 @@ mod tests {
         assert!(heard.try_recv().is_err());
     }
 
+    #[test]
+    fn ref_listeners_hear_the_refs_and_heads_of_the_work_trees_of_their_scope() {
+        let tmp = tempfile::tempdir().unwrap();
+        let base = crate::path_utils::canonicalize(tmp.path()).unwrap();
+        let repo = git2::Repository::init(&base).unwrap();
+        std::fs::create_dir(base.join("src")).unwrap();
+        std::fs::write(base.join("src/file.txt"), "a").unwrap();
+        commit(&repo);
+        repo.worktree("wt", &base.join("wt"), None).unwrap();
+        let git_dir = crate::path_utils::canonicalize(repo.path()).unwrap();
+        let (shared_picker, workdir) = polled_picker(&base);
+        let (state_sender, state) = mpsc::channel::<PathBuf>();
+        let _state = shared_picker
+            .subscribe_repository_state(move |root| state_sender.send(root.to_path_buf()).unwrap());
+        let handle = |path: PathBuf| modified(&shared_picker, &base, &workdir, path);
+        let (sender, heard) = mpsc::channel::<PathBuf>();
+        let subscription = shared_picker
+            .subscribe_ref_changes(&base, move |root| sender.send(root.to_path_buf()).unwrap());
+        let (src_sender, src_heard) = mpsc::channel::<PathBuf>();
+        let _src = shared_picker.subscribe_ref_changes(&base.join("src"), move |root| {
+            src_sender.send(root.to_path_buf()).unwrap()
+        });
+
+        // Branches live in the common dir, which both work trees share.
+        for changed in [
+            "refs/heads/main",
+            "refs/heads/feature/nested",
+            "refs/tags/v1",
+            "refs/remotes/origin/main",
+            "packed-refs",
+        ] {
+            handle(git_dir.join(changed));
+            assert_eq!(drain(&heard), [base.clone(), base.join("wt")], "{changed}");
+            assert_eq!(
+                drain(&src_heard),
+                [base.as_path()],
+                "{changed} below the work tree"
+            );
+        }
+        assert!(
+            drain(&state).is_empty(),
+            "a ref change is no git state change"
+        );
+
+        // HEAD belongs to one work tree, and stays a git state change.
+        handle(git_dir.join("HEAD"));
+        assert_eq!(drain(&heard), [base.as_path()]);
+        handle(git_dir.join("worktrees/wt/HEAD"));
+        assert_eq!(drain(&heard), [base.join("wt")]);
+        assert!(
+            drain(&src_heard) == [base.as_path()],
+            "src is not in the linked worktree"
+        );
+        assert_eq!(drain(&state), [base.clone(), base.join("wt")]);
+
+        // Upstreams and remotes are shared; a worktree's own config is its own.
+        handle(git_dir.join("config"));
+        assert_eq!(drain(&heard), [base.clone(), base.join("wt")]);
+        handle(git_dir.join("worktrees/wt/config.worktree"));
+        assert_eq!(drain(&heard), [base.join("wt")]);
+        handle(git_dir.join("config.worktree"));
+        assert_eq!(drain(&heard), [base.as_path()]);
+        drain(&src_heard);
+
+        for unrelated in [
+            "config.lock",
+            "refs/heads/main.lock",
+            "packed-refs.lock",
+            "HEAD.lock",
+            "refs/stash",
+            "refs/notes/commits",
+            "FETCH_HEAD",
+            "ORIG_HEAD",
+            "logs/HEAD",
+            "logs/refs/heads/main",
+        ] {
+            handle(git_dir.join(unrelated));
+            assert!(drain(&heard).is_empty(), "{unrelated} is no ref change");
+        }
+        handle(base.join("refs/heads/main"));
+        assert!(drain(&heard).is_empty(), "a project's own refs folder");
+
+        drop(subscription);
+        handle(git_dir.join("refs/heads/main"));
+        assert!(drain(&heard).is_empty(), "a dropped listener hears nothing");
+        assert_eq!(
+            drain(&src_heard),
+            [base.as_path()],
+            "the other one still does"
+        );
+    }
+
+    #[test]
+    fn an_outside_common_dir_watched_for_refs_is_no_git_state() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = crate::path_utils::canonicalize(tmp.path()).unwrap();
+        let main = root.join("main");
+        let repo = git2::Repository::init(&main).unwrap();
+        std::fs::write(main.join("file.txt"), "a").unwrap();
+        commit(&repo);
+        repo.worktree("linked", &root.join("linked"), None).unwrap();
+        let main_git_dir = crate::path_utils::canonicalize(repo.path()).unwrap();
+        let base = root.join("linked");
+        let (shared_picker, workdir) = polled_picker(&base);
+        let (state_sender, state) = mpsc::channel::<PathBuf>();
+        let _state = shared_picker
+            .subscribe_repository_state(move |root| state_sender.send(root.to_path_buf()).unwrap());
+        let (sender, heard) = mpsc::channel::<PathBuf>();
+        let _refs = shared_picker
+            .subscribe_ref_changes(&base, move |root| sender.send(root.to_path_buf()).unwrap());
+        let handle = |path: PathBuf| modified(&shared_picker, &base, &workdir, path);
+
+        // The main checkout's own state, seen only because its common dir holds the refs.
+        handle(main_git_dir.join("index"));
+        handle(main_git_dir.join("HEAD"));
+        assert!(drain(&state).is_empty());
+        assert!(
+            drain(&heard).is_empty(),
+            "the main checkout's HEAD is its own"
+        );
+        assert!(
+            (shared_picker.registered_git_dirs().iter()).all(|known| known.git_dir != main_git_dir),
+            "the main repository is no repository of the index"
+        );
+
+        handle(main_git_dir.join("refs/heads/other"));
+        assert_eq!(drain(&heard), [base.as_path()]);
+        // HEAD is both kinds of event, and both spell the work tree as one path does.
+        handle(main_git_dir.join("worktrees/linked/HEAD"));
+        let spelled = |heard: Vec<PathBuf>| {
+            (heard.iter())
+                .map(|root| root.as_os_str().to_owned())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(spelled(drain(&heard)), [base.as_os_str()]);
+        assert_eq!(spelled(drain(&state)), [base.as_os_str()]);
+    }
+
+    #[test]
+    fn the_own_git_dir_is_known_once_the_watcher_runs() {
+        let tmp = tempfile::tempdir().unwrap();
+        let base = crate::path_utils::canonicalize(tmp.path()).unwrap();
+        let repo = git2::Repository::init(&base).unwrap();
+        std::fs::write(base.join("file.txt"), "a").unwrap();
+        commit(&repo);
+        let (shared_picker, _workdir) = polled_picker(&base);
+        // A walk reaching the work tree, as after an event for the root, watches nothing anew:
+        // watching a path again takes a new snapshot when polling and loses what changed since.
+        assert!(!shared_picker.register_git_dir(&base.join(".git"), &base));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn fsevents_changes_the_tree_s_stream_only_at_its_setup() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = crate::path_utils::canonicalize(tmp.path()).unwrap();
+        let (main, other) = (root.join("main"), root.join("other"));
+        let repos = [&main, &other].map(|dir| {
+            let repo = git2::Repository::init(dir).unwrap();
+            std::fs::write(dir.join("file.txt"), "a").unwrap();
+            commit(&repo);
+            repo
+        });
+        let linked = root.join("linked");
+        repos[0].worktree("linked", &linked, None).unwrap();
+        repos[1]
+            .worktree("nested", &linked.join("nested"), None)
+            .unwrap();
+        NATIVE_ROOTS.lock().push(linked.clone());
+        let shared_picker = SharedFilePicker::default();
+        FilePicker::new_with_shared_state(
+            shared_picker.clone(),
+            SharedFrecency::noop(),
+            FilePickerOptions {
+                base_path: linked.to_string_lossy().into_owned(),
+                enable_content_indexing: false,
+                watch: true,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert!(shared_picker.wait_for_scan(Duration::from_secs(30)));
+        assert!(shared_picker.wait_for_watcher(Duration::from_secs(30)));
+        let watches = (shared_picker.read().unwrap().as_ref())
+            .and_then(|picker| {
+                picker
+                    .background_watcher
+                    .as_ref()
+                    .map(BackgroundWatcher::watches)
+            })
+            .unwrap();
+        let paths = |outside: bool| {
+            let guard = watches.streams.lock();
+            let streams = guard.as_ref().unwrap();
+            let stream = match outside {
+                true => streams.outside.as_ref().unwrap(),
+                false => &streams.tree,
+            };
+            let mut paths: Vec<_> = stream.watched_paths().unwrap();
+            paths.sort();
+            paths
+        };
+
+        // The walk met the nested worktree's git dir, outside the tree, after the setup.
+        assert_eq!(paths(false), [(linked.clone(), RecursiveMode::Recursive)]);
+        let _refs = shared_picker.subscribe_ref_changes(&linked, |_| {});
+        assert_eq!(paths(false), [(linked.clone(), RecursiveMode::Recursive)]);
+        let outside: Vec<_> = paths(true).into_iter().map(|(path, _)| path).collect();
+        for git_dir in [main.join(".git/refs"), other.join(".git/refs")] {
+            let git_dir = crate::path_utils::canonicalize(git_dir).unwrap();
+            assert!(outside.contains(&git_dir), "{git_dir:?} in {outside:?}");
+        }
+    }
+
+    // The outside stream restarts after the walk for a repository met then; what it may have
+    // missed meanwhile is recovered before that returns.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_restarted_outside_stream_recovers_what_it_may_have_missed() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = crate::path_utils::canonicalize(tmp.path()).unwrap();
+        let (main, other) = (root.join("main"), root.join("other"));
+        let repos = [&main, &other].map(|dir| {
+            let repo = git2::Repository::init(dir).unwrap();
+            std::fs::write(dir.join("file.txt"), "a").unwrap();
+            commit(&repo);
+            repo
+        });
+        let linked = root.join("linked");
+        repos[0].worktree("linked", &linked, None).unwrap();
+        repos[1]
+            .worktree("nested", &linked.join("nested"), None)
+            .unwrap();
+        // A repository whose git dir, outside the index, has neither refs nor logs yet.
+        let lone = root.join("lone.git");
+        std::fs::create_dir_all(lone.join("objects")).unwrap();
+        std::fs::write(lone.join("HEAD"), "ref: refs/heads/main\n").unwrap();
+        std::fs::create_dir(linked.join("lone")).unwrap();
+        let gitlink = format!("gitdir: {}\n", lone.display());
+        std::fs::write(linked.join("lone/.git"), gitlink).unwrap();
+        let (shared_picker, watcher) = native_picker(&linked);
+        let (state_sender, state) = mpsc::channel::<PathBuf>();
+        let _state = shared_picker
+            .subscribe_repository_state(move |root| state_sender.send(root.to_path_buf()).unwrap());
+        let (sender, heard) = mpsc::channel::<PathBuf>();
+        let _refs = shared_picker.subscribe_ref_changes(&linked, move |root| {
+            sender.send(root.to_path_buf()).unwrap()
+        });
+        let git_status = (shared_picker.read().unwrap().as_ref())
+            .map(|picker| Arc::clone(&picker.git_status_worker))
+            .unwrap();
+        drain(&state);
+        drain(&heard);
+        let status_rescans = git_status.full_rescans_requested();
+
+        std::fs::create_dir_all(lone.join("refs/heads")).unwrap();
+        std::fs::create_dir(lone.join("logs")).unwrap();
+        repos[1]
+            .worktree("fresh", &linked.join("fresh"), None)
+            .unwrap();
+        (watcher.dir_hook().unwrap())(&linked.join("fresh"));
+
+        let announced = drain(&state);
+        for work_tree in [&linked, &linked.join("nested")] {
+            assert!(
+                announced.contains(work_tree),
+                "{work_tree:?} in {announced:?}"
+            );
+        }
+        let heard = drain(&heard);
+        assert!(heard.contains(&linked), "{heard:?}");
+        assert!(
+            heard.contains(&linked.join("lone")),
+            "its refs appeared: {heard:?}"
+        );
+        assert!(git_status.full_rescans_requested() > status_rescans);
+        assert!(watcher.watches.refs.watched().contains(&lone.join("refs")));
+        let guard = watcher.watches.streams.lock();
+        let outside = guard.as_ref().unwrap().outside.as_ref().unwrap();
+        let watched = outside.watched_paths().unwrap();
+        assert!(
+            watched.iter().any(|(path, _)| *path == lone.join("logs")),
+            "{watched:?}"
+        );
+    }
+
+    #[test]
+    fn a_watch_update_goes_on_past_a_failed_path() {
+        let tmp = tempfile::tempdir().unwrap();
+        let config = Config::default().with_poll_interval(Duration::from_secs(60));
+        let debouncer = new_debouncer_opt::<_, notify::PollWatcher, _>(
+            Duration::from_secs(60),
+            None,
+            |_: DebounceEventResult| {},
+            NoCache::new(),
+            config,
+        )
+        .unwrap();
+        let mut debouncer = Debouncer::Poll(debouncer);
+        let missing = tmp.path().join("missing");
+        let restarted = debouncer.update(vec![
+            PathOp::watch_recursive(&missing),
+            PathOp::watch_non_recursive(tmp.path()),
+            PathOp::unwatch(&missing),
+        ]);
+        assert!(!restarted, "polling restarts nothing");
+        let watched = debouncer.watched_paths().unwrap();
+        assert_eq!(
+            watched,
+            [(tmp.path().to_path_buf(), RecursiveMode::NonRecursive)]
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn fsevents_restarts_its_stream_for_each_update_but_not_for_a_path_it_watches() {
+        let tmp = tempfile::tempdir().unwrap();
+        let debouncer = new_debouncer_opt::<_, notify::RecommendedWatcher, _>(
+            Duration::from_secs(60),
+            None,
+            |_: DebounceEventResult| {},
+            NoCache::new(),
+            Config::default(),
+        )
+        .unwrap();
+        let mut debouncer = Debouncer::Native(debouncer);
+        let dir = tmp.path().to_path_buf();
+        let sub = dir.join("sub");
+        std::fs::create_dir(&sub).unwrap();
+        let both = || {
+            vec![
+                PathOp::watch_non_recursive(&dir),
+                PathOp::watch_recursive(&sub),
+            ]
+        };
+        assert!(debouncer.update(both()), "one restart for both paths");
+        assert!(!debouncer.update(both()), "nothing new to watch");
+        assert!(debouncer.update(vec![PathOp::unwatch(&sub)]));
+    }
+
     fn subscribed_picker(base: &Path) -> (SharedFilePicker, mpsc::Receiver<Vec<WatchEvent>>) {
         let shared_picker = SharedFilePicker::default();
         let mut picker = FilePicker::new(FilePickerOptions {
@@ -2363,6 +3012,100 @@ mod tests {
             )
             .unwrap();
         (shared_picker, receiver)
+    }
+
+    // An index of `base` whose polling watcher sees no change made before it started.
+    fn polled_picker(base: &Path) -> (SharedFilePicker, Option<PathBuf>) {
+        poll_watcher_for(base);
+        let shared_picker = SharedFilePicker::default();
+        FilePicker::new_with_shared_state(
+            shared_picker.clone(),
+            SharedFrecency::noop(),
+            FilePickerOptions {
+                base_path: base.to_string_lossy().into_owned(),
+                enable_content_indexing: false,
+                watch: true,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert!(shared_picker.wait_for_scan(Duration::from_secs(30)));
+        assert!(shared_picker.wait_for_watcher(Duration::from_secs(30)));
+        let workdir = (shared_picker.read().unwrap().as_ref())
+            .and_then(|picker| picker.git_root().map(Path::to_path_buf));
+        (shared_picker, workdir)
+    }
+
+    // An index of `base` with the native watcher, and its watcher's shared state.
+    #[cfg(target_os = "macos")]
+    fn native_picker(base: &Path) -> (SharedFilePicker, WatcherHandle) {
+        NATIVE_ROOTS.lock().push(base.to_path_buf());
+        let shared_picker = SharedFilePicker::default();
+        FilePicker::new_with_shared_state(
+            shared_picker.clone(),
+            SharedFrecency::noop(),
+            FilePickerOptions {
+                base_path: base.to_string_lossy().into_owned(),
+                enable_content_indexing: false,
+                watch: true,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert!(shared_picker.wait_for_scan(Duration::from_secs(30)));
+        assert!(shared_picker.wait_for_watcher(Duration::from_secs(30)));
+        let handle = (shared_picker.read().unwrap().as_ref())
+            .and_then(|picker| picker.background_watcher.as_ref())
+            .map(|watcher| WatcherHandle {
+                watches: watcher.watches(),
+                hook: watcher.dir_hook(),
+            })
+            .unwrap();
+        (shared_picker, handle)
+    }
+
+    #[cfg(target_os = "macos")]
+    struct WatcherHandle {
+        watches: Arc<Watches>,
+        hook: Option<DirHook>,
+    }
+
+    #[cfg(target_os = "macos")]
+    impl WatcherHandle {
+        fn dir_hook(&self) -> Option<DirHook> {
+            self.hook.clone()
+        }
+    }
+
+    fn modified(picker: &SharedFilePicker, base: &Path, workdir: &Option<PathBuf>, path: PathBuf) {
+        let event = Event::new(EventKind::Modify(ModifyKind::Any)).add_path(path);
+        handle_debounced_events(
+            FFFMode::Neovim,
+            vec![DebouncedEvent::new(event, Instant::now())],
+            base,
+            workdir,
+            picker,
+            &SharedFrecency::noop(),
+            &GitStatusWorker::new(),
+        );
+    }
+
+    // What a listener heard so far, in path order.
+    fn drain(heard: &mpsc::Receiver<PathBuf>) -> Vec<PathBuf> {
+        let mut heard: Vec<_> = heard.try_iter().collect();
+        heard.sort();
+        heard
+    }
+
+    fn commit(repo: &git2::Repository) {
+        let signature = git2::Signature::now("fff", "fff@example.invalid").unwrap();
+        let mut index = repo.index().unwrap();
+        index
+            .add_all(["*"], git2::IndexAddOption::DEFAULT, None)
+            .unwrap();
+        let tree = repo.find_tree(index.write_tree().unwrap()).unwrap();
+        repo.commit(Some("HEAD"), &signature, &signature, "init", &tree, &[])
+            .unwrap();
     }
 
     fn apply(shared_picker: &SharedFilePicker, base: &Path, kinds: Vec<EventKind>, path: &Path) {

@@ -776,7 +776,13 @@ export class FileFinder {
     }
     // The library returns at once and reports readiness through the callback, so no
     // native worker waits for the index.
-    const started = ffiWatchStart(handle, pattern, options.ignore ?? [], options.repository ?? false);
+    const started = ffiWatchStart(
+      handle,
+      pattern,
+      options.ignore ?? [],
+      options.repository ?? false,
+      options.refs ?? false,
+    );
     if (!started.ok) return started;
     const watchId = started.value;
     const base = ffiGetBasePath(handle);

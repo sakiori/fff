@@ -6,7 +6,7 @@ use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 // Bump whenever a message below or a program frame changes shape.
-pub const PROTOCOL: u32 = 5;
+pub const PROTOCOL: u32 = 6;
 /// Largest hello the service reads.
 pub const MAX_MESSAGE_BYTES: usize = 64 * 1024;
 /// Largest reply a client reads; a status lists every index and session.
