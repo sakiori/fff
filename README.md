@@ -2,10 +2,16 @@
 > This is `sakiori-oss/fff`, a downstream fork of [fff](https://github.com/dmtrKovalenko/fff)
 > that follows upstream's `main`. It adds a shared index service, so the MCP clients of one
 > user that search the same directory share one index, and a Node package,
-> `@sakiori/fff-node`, that searches through that service. `fff-mcp` releases are on this
-> project's GitLab Releases and the Node package is on npm. [CUSTOM.md](./CUSTOM.md)
-> describes the downstream behavior, installation and maintenance; the rest of this README
-> is upstream's.
+> `@sakiori/fff-node`, that searches through that service. Install a release of `fff-mcp`
+> with `mise use -g gitlab:sakiori-oss/fff@<version>` and the Node package with
+> `npm install --save-exact @sakiori/fff-node@<version>`; the upstream install scripts and
+> packages below do not carry these changes; `<version>` is the release tag without its `v`.
+> Each release's files are at `https://gitlab.com/sakiori-oss/fff/-/releases/<tag>/downloads/binaries/<file>`
+> with cosign bundles (`cosign verify-blob --bundle <file>.sigstore.json
+> --certificate-oidc-issuer https://gitlab.com
+> --certificate-identity https://gitlab.com/sakiori-oss/fff//.gitlab-ci.yml@refs/tags/<tag> <file>`).
+> [CUSTOM.md](./CUSTOM.md) lists the downstream changes and how
+> the fork is maintained; the rest of this README is upstream's.
 
 <a href="./assets/logo-orange.png"><img alt="FFF" src="./assets/logo-orange.png" width="300"></a>
 
@@ -59,9 +65,9 @@ Pick what you are interested in:
 
 Works with Claude Code, Codex, OpenCode, Cursor, Cline, and any MCP-capable client. A resident Rust index supports file discovery and content search across tool calls.
 
-This fork shares MCP indexes across compatible clients. See
-[CUSTOM.md](./CUSTOM.md#shared-mcp-service) for installation, scope behavior and
-service lifecycle commands.
+This fork shares MCP indexes across compatible clients: the first client starts the shared
+service, which exits once idle. `fff-mcp --help` lists the service options, among them
+`--service-status` and `--service-stop`. Install the fork as the note at the top describes.
 
 ![Measured search time and tokens for FFF MCP versus normal shell search](./chart.png)
 

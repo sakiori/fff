@@ -11,8 +11,7 @@ checks = [
   # watch_subscription_test rename tests assert native rename pairing, which a
   # polling walk cannot guarantee. The fork's pipelines run the full suite
   # natively: native-tests on Linux in merge requests, macos-tests on macOS for
-  # main and releases; upstream's CI covers native delivery too. See CUSTOM.md,
-  # Verification.
+  # main and releases; upstream's CI covers native delivery too.
   { name = "test-rust", run = "FFF_TEST_POLL_WATCHER_MS=25 make test-rust TEST_ARGS='--exact --skip raw_notify_nonrecursive_detects_deletion --skip raw_notify_multi_nonrecursive_detects_deletion --skip debounced_nonrecursive_detects_deletion --skip renaming_out_of_a_watched_subtree_still_notifies --skip renaming_into_a_watched_subtree_still_notifies'" },
   { name = "test-mcp", run = "FFF_TEST_POLL_WATCHER_MS=25 make test-mcp TEST_ARGS='--exact --skip raw_notify_nonrecursive_detects_deletion --skip raw_notify_multi_nonrecursive_detects_deletion --skip debounced_nonrecursive_detects_deletion --skip renaming_out_of_a_watched_subtree_still_notifies --skip renaming_into_a_watched_subtree_still_notifies'" },
 ]
@@ -24,7 +23,7 @@ branch = "main"
 mode = "follow"
 
 # Releases are v<base>-sakiori.<YYYYMMDD>.<n>, the base being the newest upstream release
-# main contains with its patch raised. See CUSTOM.md, Releases.
+# main contains with its patch raised; see git-intake's README, "Downstream releases".
 [release]
 upstream = "fff"
 tags = "v*"

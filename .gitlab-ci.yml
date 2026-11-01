@@ -1,5 +1,5 @@
-# Pipelines of sakiori-oss/fff on GitLab.com. CUSTOM.md, "Releases", describes the process and
-# the project settings it relies on.
+# Pipelines of sakiori-oss/fff on GitLab.com. CUSTOM.md describes the release process and the
+# project settings it relies on.
 #
 # - Merge request: fmt, clippy, lint-mcp, ci-scripts, native-tests and node-tests on Linux, and
 #   check-build-linux, the Linux release builds, when a change can affect the build.
@@ -131,7 +131,7 @@ ci-scripts:
     - .gitlab/scripts/check-zig-pin.sh
 
 # The full test suite with the OS event service behind the watchers (inotify here): no polling
-# interval and no skipped tests (see "Verification" in CUSTOM.md).
+# interval and no skipped tests, unlike the checks of .git-intake.toml.
 native-tests:
   extends: .check
   timeout: 1h
@@ -172,7 +172,7 @@ node-tests:
     GIT_DEPTH: "0"
     GIT_STRATEGY: clone
   before_script:
-    - '[ -n "${GITLAB_TOKEN:-}" ] || { echo "GITLAB_TOKEN is not set; CUSTOM.md, Releases, describes it" >&2; exit 1; }'
+    - '[ -n "${GITLAB_TOKEN:-}" ] || { echo "GITLAB_TOKEN is not set; CUSTOM.md, Project settings, describes it" >&2; exit 1; }'
     - .gitlab/scripts/install-tools.sh "$TOOLS" git-intake
     - export PATH="$TOOLS/bin:$PATH"
     - git config user.name Sakiori

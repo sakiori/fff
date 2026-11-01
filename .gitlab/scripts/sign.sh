@@ -3,7 +3,7 @@
 # (SIGSTORE_ID_TOKEN, audience sigstore) obtains a short-lived certificate naming this
 # project's CI configuration and the tag, and each signature goes to Sigstore's transparency
 # log. Writes SHA256SUMS over the archives and <file>.sigstore.json for every archive and for
-# SHA256SUMS, then verifies each bundle against the identity users verify with (CUSTOM.md).
+# SHA256SUMS, then verifies each bundle against the identity users verify with (README.md).
 #
 # usage: .gitlab/scripts/sign.sh   (in a tag pipeline, with cosign on the PATH)
 set -eu
