@@ -31,6 +31,8 @@ use serde_json::{Value, json};
 const BIN: &str = env!("CARGO_BIN_EXE_fff-mcp");
 const PROTOCOL: u32 = fff_service::protocol::PROTOCOL;
 const EVENTUAL: Duration = Duration::from_secs(15);
+// The longest a test waits for one reply, from a client, a program or the service.
+const REPLY: Duration = Duration::from_secs(90);
 // Services watch through the polling backend, so watcher tests do not depend on
 // the OS event service delivering events.
 const POLL_WATCHER: (&str, &str) = ("FFF_TEST_POLL_WATCHER_MS", "25");
@@ -59,13 +61,27 @@ impl Client {
         extra: &[&str],
         env: &[(&str, &str)],
     ) -> Self {
-        let mut child = client_command(binary, scope, service, idle, extra)
+        let child = client_command(binary, scope, service, idle, extra)
             .envs(env.iter().copied())
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::inherit())
-            .spawn_serialized()
+            .spawn_isolated()
             .unwrap();
+        Self::attach(child)
+    }
+
+    // Initializes a client spawned with piped standard input and output.
+    fn attach(child: Child) -> Self {
+        let mut client = Self::wrap(child);
+        let result = client.request("initialize", json!({"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"shared-service-test","version":"1"}}));
+        assert!(result["serverInfo"].is_object(), "{result}");
+        client.send(json!({"jsonrpc":"2.0","method":"notifications/initialized"}));
+        client
+    }
+
+    // Talks to a client spawned with piped standard input and output, not initialized yet.
+    fn wrap(mut child: Child) -> Self {
         let input = child.stdin.take();
         let stdout = child.stdout.take().unwrap();
         let (tx, output) = mpsc::channel();
@@ -81,16 +97,12 @@ impl Client {
                 }
             }
         });
-        let mut client = Self {
+        Self {
             child,
             input,
             output,
             id: 0,
-        };
-        let result = client.request("initialize", json!({"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"shared-service-test","version":"1"}}));
-        assert!(result["serverInfo"].is_object(), "{result}");
-        client.send(json!({"jsonrpc":"2.0","method":"notifications/initialized"}));
-        client
+        }
     }
 
     fn send(&mut self, value: Value) {
@@ -111,7 +123,7 @@ impl Client {
         loop {
             let reply = self
                 .output
-                .recv_timeout(Duration::from_secs(90))
+                .recv_timeout(REPLY)
                 .expect("MCP response timeout");
             if reply["id"] == self.id {
                 return reply;
@@ -130,14 +142,7 @@ impl Client {
     }
 
     fn wait_exit(&mut self, timeout: Duration) -> Option<std::process::ExitStatus> {
-        let deadline = Instant::now() + timeout;
-        while Instant::now() < deadline {
-            if let Some(status) = self.child.try_wait().unwrap() {
-                return Some(status);
-            }
-            std::thread::sleep(Duration::from_millis(20));
-        }
-        None
+        exited_within(&mut self.child, timeout)
     }
 }
 
@@ -153,6 +158,56 @@ impl Drop for Client {
             std::thread::panicking(),
             "client did not exit after stdin closed"
         );
+    }
+}
+
+fn exited_within(child: &mut Child, timeout: Duration) -> Option<std::process::ExitStatus> {
+    let deadline = Instant::now() + timeout;
+    while Instant::now() < deadline {
+        if let Some(status) = child.try_wait().unwrap() {
+            return Some(status);
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    None
+}
+
+// Lines a child writes, read on a thread so a test can wait for them with a deadline.
+fn lines_of(output: impl std::io::Read + Send + 'static) -> mpsc::Receiver<String> {
+    let (sender, lines) = mpsc::channel();
+    std::thread::spawn(move || {
+        for line in BufReader::new(output).lines().map_while(Result::ok) {
+            if sender.send(line).is_err() {
+                break;
+            }
+        }
+    });
+    lines
+}
+
+// Waits for a line containing `text` and returns whether one came before the output ended.
+fn line_containing(lines: &mpsc::Receiver<String>, text: &str) -> bool {
+    let deadline = Instant::now() + REPLY;
+    loop {
+        match lines.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
+            Ok(line) if line.contains(text) => return true,
+            Ok(_) => {}
+            Err(mpsc::RecvTimeoutError::Disconnected) => return false,
+            Err(mpsc::RecvTimeoutError::Timeout) => panic!("no line containing {text:?}"),
+        }
+    }
+}
+
+// The remaining lines once the child exited.
+fn rest_of(lines: mpsc::Receiver<String>) -> Vec<String> {
+    let deadline = Instant::now() + REPLY;
+    let mut rest = Vec::new();
+    loop {
+        match lines.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
+            Ok(line) => rest.push(line),
+            Err(mpsc::RecvTimeoutError::Disconnected) => return rest,
+            Err(mpsc::RecvTimeoutError::Timeout) => panic!("output still open: {rest:?}"),
+        }
     }
 }
 
@@ -199,7 +254,7 @@ fn cli_with(
         .arg(service)
         .arg("--log-file")
         .arg(service.with_extension("log"))
-        .output_serialized()
+        .output_isolated()
         .unwrap()
 }
 
@@ -312,7 +367,7 @@ fn start_daemon_with(service: &Path, idle: &str, env: &[(&str, &Path)]) -> Daemo
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::inherit())
-            .spawn_serialized()
+            .spawn_isolated()
             .unwrap(),
     );
     wait_for_discovery(&mut child, service);
@@ -324,15 +379,32 @@ fn raw_hello(service: &Path, line: &[u8]) -> Value {
     let (recv, mut send) = connect(service).split();
     let line = line.to_vec();
     // The service may stop reading an oversized hello; the reply still arrives.
-    let writer = std::thread::spawn(move || {
+    let (written, writer) = mpsc::channel();
+    std::thread::spawn(move || {
         let _ = send.write_all(&line);
         let _ = send.flush();
-        send
+        let _ = written.send(send);
     });
-    let mut reply = String::new();
-    BufReader::new(recv).read_line(&mut reply).unwrap();
-    drop(writer.join());
+    let reply = reply_line(recv);
+    drop(
+        writer
+            .recv_timeout(REPLY)
+            .expect("the hello was never written"),
+    );
     serde_json::from_str(&reply).unwrap()
+}
+
+// One line the service sends, read on a thread, as a socket has no read timeout everywhere.
+fn reply_line(recv: impl std::io::Read + Send + 'static) -> String {
+    let (sender, reply) = mpsc::channel();
+    std::thread::spawn(move || {
+        let mut line = String::new();
+        let _ = BufReader::new(recv).read_line(&mut line);
+        let _ = sender.send(line);
+    });
+    reply
+        .recv_timeout(REPLY)
+        .expect("no reply from the service")
 }
 
 // Connects to the running service without a handshake.
@@ -1208,8 +1280,7 @@ fn stopped_service_spares_the_socket_of_its_replacement() {
     let replacement = service_pids(&service);
     assert!(old.iter().all(|pid| !replacement.contains(pid)));
     drop(startup);
-    let mut reply = String::new();
-    BufReader::new(recv).read_line(&mut reply).unwrap();
+    let reply = reply_line(recv);
     assert!(reply.contains(r#""reply":"stopped""#), "{reply}");
     drop(send);
     let deadline = Instant::now() + EVENTUAL;
@@ -1335,7 +1406,7 @@ fn service_of_another_build_refuses_to_start_for_a_client() {
         .arg(&service)
         .arg("--log-file")
         .arg(service.with_extension("log"))
-        .output_serialized()
+        .output_isolated()
         .unwrap();
     assert!(!output.status.success());
     let stderr = String::from_utf8_lossy(&output.stderr);
@@ -1561,7 +1632,7 @@ fn client_without_parent_exits_after_idle_timeout() {
             .stdin(Stdio::piped())
             .stdout(Stdio::null())
             .stderr(Stdio::inherit())
-            .spawn_serialized()
+            .spawn_isolated()
             .unwrap(),
     );
     let deadline = Instant::now() + Duration::from_secs(10);
@@ -1591,7 +1662,7 @@ fn home_and_root_scopes_require_opt_in() {
     for scope in [home.as_path(), Path::new("/")] {
         let refused = client_command(BIN, scope, &service, "1", &[])
             .env("HOME", &home)
-            .output_serialized()
+            .output_isolated()
             .unwrap();
         assert!(!refused.status.success());
         let stderr = String::from_utf8_lossy(&refused.stderr);
@@ -1629,7 +1700,7 @@ fn shared_or_public_namespaces_are_rejected() {
     std::fs::set_permissions(&writable, std::fs::Permissions::from_mode(0o777)).unwrap();
     for service in [public, writable.join("service")] {
         let refused = client_command(BIN, &project, &service, "1", &[])
-            .output_serialized()
+            .output_isolated()
             .unwrap();
         assert!(!refused.status.success());
         let stderr = String::from_utf8_lossy(&refused.stderr);
@@ -1683,48 +1754,33 @@ fn the_service_never_checks_upstream_for_updates() {
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::inherit())
-            .spawn_serialized()
+            .spawn_isolated()
             .unwrap(),
     );
     wait_for_discovery(&mut daemon, &service);
 
-    let mut client = Command::new(BIN)
-        .arg(&project)
-        .args(["--no-warmup", "--no-watch", "--idle-timeout-secs", "1"])
-        .arg("--service-dir")
-        .arg(&service)
-        .arg("--log-file")
-        .arg(service.with_extension("log"))
-        .env("PATH", &path)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::inherit())
-        .spawn_serialized()
-        .unwrap();
-    let mut input = client.stdin.take().unwrap();
-    let mut output = BufReader::new(client.stdout.take().unwrap()).lines();
-    let mut request = |id: u64, method: &str, params: Value| -> Value {
-        let message = json!({"jsonrpc":"2.0","id":id,"method":method,"params":params});
-        writeln!(input, "{message}").unwrap();
-        input.flush().unwrap();
-        loop {
-            let line = output.next().expect("MCP response").unwrap();
-            if let Ok(reply) = serde_json::from_str::<Value>(&line)
-                && reply["id"] == id
-            {
-                return reply;
-            }
-        }
-    };
+    let mut client = Client::wrap(
+        Command::new(BIN)
+            .arg(&project)
+            .args(["--no-warmup", "--no-watch", "--idle-timeout-secs", "1"])
+            .arg("--service-dir")
+            .arg(&service)
+            .arg("--log-file")
+            .arg(service.with_extension("log"))
+            .env("PATH", &path)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::inherit())
+            .spawn_isolated()
+            .unwrap(),
+    );
 
-    let init = request(
-        1,
+    let init = client.raw_request(
         "initialize",
         json!({"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"update-notice-test","version":"1"}}),
     );
     // Upstream appends its notice to the first tool result after the check answers.
-    let found = request(
-        2,
+    let found = client.raw_request(
         "tools/call",
         json!({"name":"find_files","arguments":{"query":"main"}}),
     )["result"]
@@ -1737,9 +1793,10 @@ fn the_service_never_checks_upstream_for_updates() {
 
     // Closing the transport ends the session; the idle service then exits, so
     // whatever it started has run by then.
-    drop(input);
-    assert!(client.wait().unwrap().success());
-    daemon.wait().unwrap();
+    client.input.take();
+    let exit = client.wait_exit(EVENTUAL).expect("client did not exit");
+    assert!(exit.success());
+    exited_within(&mut daemon, EVENTUAL).expect("idle service kept running");
     assert!(!ran.exists(), "fff-mcp ran curl to check for updates");
 }
 
@@ -2338,19 +2395,18 @@ fn program_session_ends_when_its_process_exits_during_a_request() {
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::inherit())
-            .spawn_serialized()
+            .spawn_isolated()
             .unwrap(),
     );
-    let mut lines = BufReader::new(holder.stdout.take().unwrap()).lines();
-    let held = lines
-        .by_ref()
-        .map_while(Result::ok)
-        .any(|line| line.contains("holding"));
-    assert!(held, "holder never opened its session");
+    let lines = lines_of(holder.stdout.take().unwrap());
+    assert!(
+        line_containing(&lines, "holding"),
+        "holder never opened its session"
+    );
     wait_status(&service, "program session not registered", shared_by(1));
     holder.kill().unwrap();
     holder.wait().unwrap();
-    let rest: Vec<_> = lines.map_while(Result::ok).collect();
+    let rest = rest_of(lines);
     assert!(rest.iter().all(|line| !line.contains("waited")), "{rest:?}");
     wait_status(&service, "a waiting program kept its session", |stats| {
         stats["sessions"].as_array().unwrap().is_empty()
@@ -2371,15 +2427,14 @@ fn program_session_ends_when_its_process_exits() {
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::inherit())
-            .spawn_serialized()
+            .spawn_isolated()
             .unwrap(),
     );
-    let stdout = holder.stdout.take().unwrap();
-    let held = BufReader::new(stdout)
-        .lines()
-        .map_while(Result::ok)
-        .any(|line| line.contains("holding"));
-    assert!(held, "holder never opened its session");
+    let lines = lines_of(holder.stdout.take().unwrap());
+    assert!(
+        line_containing(&lines, "holding"),
+        "holder never opened its session"
+    );
     wait_status(&service, "program session not registered", shared_by(2));
     holder.kill().unwrap();
     holder.wait().unwrap();
@@ -2685,8 +2740,8 @@ fn process_view(pid: u64, fd: i32) -> ProcessView {
 #[cfg(target_os = "macos")]
 fn process_view(pid: u64, fd: i32) -> ProcessView {
     let run = |program: &str, args: &[&str]| {
-        String::from_utf8_lossy(&Command::new(program).args(args).output().unwrap().stdout)
-            .into_owned()
+        let output = Command::new(program).args(args).output_isolated().unwrap();
+        String::from_utf8_lossy(&output.stdout).into_owned()
     };
     let pid = pid.to_string();
     let named = |listing: String| {
@@ -2734,19 +2789,21 @@ fn a_started_service_holds_nothing_of_the_program_that_started_it() {
     let stale = namespace.path().join("fff-mcp-0123456789abcdef");
     std::fs::write(&stale, "").unwrap();
     let start = || {
-        Client::start_configured(
-            binary.to_str().unwrap(),
-            &project,
-            &service,
-            "1",
-            &[],
-            &[
-                ("APPDIR", appdir.to_str().unwrap()),
-                ("NOT_FOR_THE_SERVICE", "1"),
-            ],
-        )
+        let child = client_command(binary.to_str().unwrap(), &project, &service, "1", &[])
+            .env("APPDIR", &appdir)
+            .env("NOT_FOR_THE_SERVICE", "1")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::inherit())
+            .spawn_keeping(&[inherited])
+            .unwrap();
+        Client::attach(child)
     };
     let mut client = start();
+    assert!(
+        process_view(client.child.id().into(), inherited).holds_fd,
+        "the client was not given descriptor {inherited}"
+    );
     assert!(!stale.exists(), "the stale copy was kept");
     for lock in ["startup", "owner"] {
         let created = namespace

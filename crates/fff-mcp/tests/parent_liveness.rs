@@ -36,7 +36,7 @@ fn stays_alive_while_parent_alive_despite_idle_timeout() {
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
-        .spawn_serialized()
+        .spawn_isolated()
         .unwrap();
 
     let mut stdin = child.stdin.take().unwrap();
@@ -73,7 +73,7 @@ fn exits_when_parent_dies_even_without_idle_timeout() {
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null())
-            .spawn_serialized()
+            .spawn_isolated()
             .unwrap(),
     );
     wait_for_discovery(&mut daemon, &service);
@@ -100,7 +100,7 @@ fn exits_when_parent_dies_even_without_idle_timeout() {
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
-        .spawn_serialized()
+        .spawn_isolated()
         .unwrap();
 
     let mut stdin = sh.stdin.take().unwrap();
@@ -108,7 +108,11 @@ fn exits_when_parent_dies_even_without_idle_timeout() {
     do_handshake(&mut stdin, &stdout_lines);
 
     std::fs::write(exit_signal, "").unwrap();
-    sh.wait().unwrap();
+    let deadline = Instant::now() + Duration::from_secs(15);
+    while sh.try_wait().unwrap().is_none() {
+        assert!(Instant::now() < deadline, "the parent shell did not exit");
+        std::thread::sleep(Duration::from_millis(20));
+    }
 
     // We still hold the stdin write end, so the only exit path is the parent
     // liveness check. EOF on stdout means fff-mcp closed it by exiting.
@@ -130,7 +134,7 @@ fn exits_when_parent_dies_even_without_idle_timeout() {
         .arg(&service)
         .arg("--log-file")
         .arg(&log_path)
-        .output_serialized()
+        .output_isolated()
         .unwrap();
     assert!(
         stopped.status.success(),

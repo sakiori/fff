@@ -774,9 +774,8 @@ fn ref_listeners_hear_upstream_and_remote_config_once() {
     }
 }
 
-// A common layout: linked worktrees below the main checkout, which ignores them, and one
-// beside it. Each change of the set of worktrees is heard by the main work tree, at least once
-// and at most once per write of the worktree's admin dir.
+// Linked worktrees below the main checkout, which ignores them, and one beside it. How often
+// one command is heard is timing: git writes the admin dir in place around a checkout.
 #[test]
 fn ref_listeners_hear_linked_worktrees_added_moved_and_removed() {
     hears_the_set_of_worktrees(make_ref_picker);
@@ -804,23 +803,19 @@ fn hears_the_set_of_worktrees(make_picker: fn(&Path) -> (SharedFilePicker, Share
     });
     let refs = RefChanges::subscribe(&picker, &main, &main);
 
-    // The first worktree also creates `worktrees`, and each its admin dir and `gitdir`.
-    for (writes, step) in [
-        (
-            3,
-            &["worktree", "add", "-q", "--detach", ".worktrees/inner"][..],
-        ),
-        (2, &["worktree", "add", "-q", "--detach", "../beside"]),
-        (1, &["worktree", "lock", ".worktrees/inner"]),
-        (1, &["worktree", "unlock", ".worktrees/inner"]),
-        (
-            2,
-            &["worktree", "move", ".worktrees/inner", ".worktrees/moved"],
-        ),
-        (2, &["worktree", "remove", ".worktrees/moved"]),
+    for step in [
+        &["worktree", "add", "-q", "--detach", ".worktrees/inner"][..],
+        &["worktree", "add", "-q", "--detach", "../beside"],
+        &["worktree", "lock", ".worktrees/inner"],
+        &["worktree", "unlock", ".worktrees/inner"],
+        &["worktree", "move", ".worktrees/inner", ".worktrees/moved"],
+        &["worktree", "remove", ".worktrees/moved"],
     ] {
-        let what = format!("git {}", step.join(" "));
-        refs.at_most(writes, &main, || git(&main, step), &what);
+        refs.only(
+            &main,
+            || git(&main, step),
+            &format!("git {}", step.join(" ")),
+        );
     }
     // Work in another worktree is its own: its admin dir changes, its set does not, and its
     // operations in progress are not the main checkout's.
@@ -866,8 +861,7 @@ fn hears_the_set_of_worktrees(make_picker: fn(&Path) -> (SharedFilePicker, Share
         );
     }
     fs::remove_dir_all(root.join("beside")).unwrap();
-    refs.at_most(
-        2,
+    refs.after(
         &main,
         || git(&main, &["worktree", "prune"]),
         "git worktree prune",
@@ -1350,14 +1344,32 @@ impl RefChanges {
     // Runs `change` and waits until the listener names `work_tree`, then lets the watcher
     // handle the rest of the change, so the next step starts from nothing heard.
     fn after(&self, work_tree: &Path, change: impl FnOnce(), what: &str) {
+        self.heard_after(work_tree, change, what);
+    }
+
+    // As `after`, and the listener names no other work tree for the change.
+    fn only(&self, work_tree: &Path, change: impl FnOnce(), what: &str) {
+        let others: Vec<_> = (self.heard_after(work_tree, change, what).into_iter())
+            .filter(|root| root != work_tree)
+            .collect();
+        assert!(others.is_empty(), "{what}: heard {others:?}");
+    }
+
+    // What the listener named besides `work_tree` until it named it, then until the fence.
+    fn heard_after(
+        &self,
+        work_tree: &Path,
+        change: impl FnOnce(),
+        what: &str,
+    ) -> Vec<std::path::PathBuf> {
         change();
         let deadline = Instant::now() + Duration::from_secs(10);
         let mut heard = Vec::new();
         while let Some(left) = deadline.checked_duration_since(Instant::now()) {
             match self.heard.recv_timeout(left) {
                 Ok(root) if root == work_tree => {
-                    self.fence();
-                    return;
+                    heard.extend(self.fence());
+                    return heard;
                 }
                 Ok(root) => heard.push(root),
                 Err(_) => break,
