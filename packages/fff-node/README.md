@@ -23,7 +23,7 @@ The native library and the `fff-mcp` service executable come in platform package
 | Linux    | x64 (musl)            | `@sakiori/fff-bin-linux-x64-musl`   |
 | Linux    | ARM64 (musl)          | `@sakiori/fff-bin-linux-arm64-musl` |
 
-On any other platform, `FileFinder.create` fails with `unsupportedPlatform`, naming the supported ones. An install that omits optional dependencies has no native files, and `FileFinder.create` fails with `libraryUnavailable`. The glibc packages need glibc 2.28 or later.
+The package installs on macOS, Linux and FreeBSD, on x64 and ARM64; npm and pnpm refuse it on any other platform (`EBADPLATFORM`). FreeBSD has no platform package: build the native files from source (see [Platforms without a prebuilt package](#platforms-without-a-prebuilt-package)), or `FileFinder.create` fails with `unsupportedPlatform`. An install that omits optional dependencies has no native files, and `FileFinder.create` fails with `libraryUnavailable`. The glibc packages need glibc 2.28 or later.
 
 A project that imports the upstream name `@ff-labs/fff-node` keeps its imports with a package-manager alias: `npm install @ff-labs/fff-node@npm:@sakiori/fff-node@<version>`.
 

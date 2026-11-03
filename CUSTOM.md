@@ -74,17 +74,22 @@ the next tag is the release and the failed tag stays.
 npm accepts a trusted publisher only for a package that exists, so the first
 version of a new package is published with a token:
 
-1. On npmjs.com, create a granular token with read and write access to the
-   `@sakiori` scope, allowed to publish without a two-factor prompt, expiring
-   within days.
+1. On npmjs.com, create a granular token with _Bypass two-factor
+   authentication_ checked, _Read and write_ access to the `@sakiori` scope
+   (publish and stage, not stage only), expiring within days.
 2. Store it as `NPM_TOKEN`: protected, masked and hidden, environment `npm`.
 3. Release: when the tip of `main` already carries a release, land a change
    first, then run the schedule by hand.
 4. In each new package's settings, add a GitLab CI/CD trusted publisher:
    namespace `sakiori-oss`, project `fff`, CI file `.gitlab-ci.yml`,
-   environment `npm`. Then require two-factor authentication and disallow
-   tokens.
-5. Delete `NPM_TOKEN` and revoke the token.
+   environment `npm`, _Allowed actions_ `npm publish`. Under _Publishing
+   access_, choose _Require two-factor authentication and disallow bypass 2fa
+   tokens_.
+5. Release again within two days: a trusted publisher that no publish has used
+   by then expires, and only a new one replaces it. `npm view
+   @sakiori/fff-node@<version> _npmUser` names the trusted publisher, not the
+   token's account.
+6. Delete `NPM_TOKEN` and revoke the token.
 
 ## Project settings
 
