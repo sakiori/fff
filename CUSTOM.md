@@ -13,18 +13,38 @@ rewritten. The project merges by fast-forward, with _Squash commits_ ticked by
 default.
 
 - A downstream change is one merge request from a branch off `main`, carrying
-  one logical change. Merge it squashed, as the project ticks by default, so it
-  lands on `main` as one commit, with the merge request's title as its subject
-  and its description as its body, so the description says what changed and why.
-  Do not squash or rewrite the branch by hand first. When `main` has moved on,
-  use GitLab's _Rebase_. A merged branch is not reused.
-- The upstream update's merge request, from `git-intake/update`, is merged
-  **without squashing and without rebasing**: its merge commit carries
-  upstream's history and the sync record git intake reads. git intake opens it
-  with squashing off; leave it unticked. When `main` has moved on, the next
-  `git intake sync` catches it up instead of a rebase.
+  one logical change. It lands squashed, as the project ticks by default, as one
+  commit on `main`, with the merge request's title as its subject and its
+  description as its body, so the description says what changed and why. Do not
+  squash or rewrite the branch by hand first. A merged branch is not reused.
+- A downstream merge request lands through the merge queue: once it is ready, a
+  Maintainer assigns it to the `sakiori-merge` service account
+  (`glab mr update <id> --ready --assignee sakiori-merge`), keeping the
+  project's squash default; only a Maintainer queues one, since the bot merges
+  it as a Maintainer. The bot takes the queue one merge request at a time: it
+  rebases each onto `main`, waits for its pipeline and merges it. Apart from the
+  two kinds below, never merge a merge request yourself, set auto-merge on it,
+  or rebase one that is queued: a merge outside the queue sends every queued
+  merge request back to a new pipeline. When the bot cannot merge one, it
+  assigns it back with a comment that says why; after a conflict, rebase it onto
+  `main`, the only rewrite allowed, and assign it again.
+- Two kinds stay out of the queue, and a Maintainer merges them with the queue
+  held: unassign the queued merge requests first, and assign them again once the
+  merge has landed.
+  - A merge request from a fork outside the group, since GitLab runs its
+    pipeline in this project only when a Maintainer starts it: the Maintainer
+    runs it on the merge request rebased onto the current `main` and merges it
+    once it passes.
+  - The upstream update's merge request, from `git-intake/update`, merged
+    **without squashing and without rebasing**: its merge commit carries
+    upstream's history and the sync record git intake reads. git intake opens it
+    with squashing off; leave it unticked. Hold the queue from the moment it is
+    ready. If `main` has moved since its last pipeline, catch it up with
+    `git intake sync` and `git intake finish` in a clone, as
+    [Upstream updates](#upstream-updates) shows, instead of a rebase, and let
+    that pipeline pass.
 
-Verify a change against the current `main` before merging it, and update
+Verify a change against the current `main` before queuing it, and update
 [Downstream changes](#downstream-changes) when it adds or removes one. The macOS
 runner takes protected refs only, so the native suite and `make test-node` run
 on macOS after the merge, in the pipeline of the push to `main`; a failure
