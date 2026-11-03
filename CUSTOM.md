@@ -55,7 +55,9 @@ and checksums in `.gitlab/scripts/install-tools.sh` in the same update.
 A release is the pipeline of a protected tag `v<base>-sakiori.<YYYYMMDD>.<n>` on
 a commit of `main`; git-intake's README, under "Downstream releases", describes
 the scheme. The schedule's `release-tag` job cuts the tag; nobody picks a version or pushes a release tag
-by hand, and running the schedule by hand cuts an off-cycle release. Rollback is
+by hand, and running the schedule by hand cuts an off-cycle release once `main`
+has a commit the last release lacks; a tip that already carries a release gets
+no new tag. Rollback is
 forward: a revert on `main` and an off-cycle release. A pipeline started by hand
 on `main` is a rehearsal that publishes nothing; run one after changing the
 build.
@@ -76,7 +78,8 @@ version of a new package is published with a token:
    `@sakiori` scope, allowed to publish without a two-factor prompt, expiring
    within days.
 2. Store it as `NPM_TOKEN`: protected, masked and hidden, environment `npm`.
-3. Release, off-cycle if needed.
+3. Release: when the tip of `main` already carries a release, land a change
+   first, then run the schedule by hand.
 4. In each new package's settings, add a GitLab CI/CD trusted publisher:
    namespace `sakiori-oss`, project `fff`, CI file `.gitlab-ci.yml`,
    environment `npm`. Then require two-factor authentication and disallow
