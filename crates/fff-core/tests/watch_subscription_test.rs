@@ -818,14 +818,16 @@ fn hears_the_set_of_worktrees(make_picker: fn(&Path) -> (SharedFilePicker, Share
         );
     }
     // Work in another worktree is its own: its admin dir changes, its set does not, and its
-    // operations in progress are not the main checkout's.
+    // operations in progress are not the main checkout's. Only its HEAD is ref state.
     let beside = root.join("beside");
     refs.quiet(
-        || {
-            git(&beside, &["status", "--short"]);
-            git(&beside, &["commit", "-q", "--allow-empty", "-m", "beside"]);
-        },
-        "work in another worktree",
+        || git(&beside, &["status", "--short"]),
+        "a status in another worktree",
+    );
+    refs.only(
+        &main,
+        || git(&beside, &["commit", "-q", "--allow-empty", "-m", "beside"]),
+        "a commit on another worktree's detached HEAD",
     );
     refs.after(
         &main,
@@ -969,6 +971,9 @@ fn ref_listeners_of_a_reftable_linked_worktree_hear_both_table_lists() {
         &main,
         &["worktree", "add", "-q", "-b", "linked", "../linked"],
     );
+    git(&main, &["branch", "side"]);
+    let beside = root.join("beside");
+    git(&main, &["worktree", "add", "-q", "--detach", "../beside"]);
     let (picker, _frecency) = make_ref_picker(&linked);
     let refs = RefChanges::subscribe(&picker, &linked, &linked);
 
@@ -983,6 +988,197 @@ fn ref_listeners_of_a_reftable_linked_worktree_hear_both_table_lists() {
         || git(&main, &["branch", "-D", "other"]),
         "a branch deleted",
     );
+    // The HEAD of a worktree the index does not follow moves its tables, not its HEAD file.
+    refs.only(
+        &linked,
+        || git(&beside, &["switch", "-q", "side"]),
+        "the HEAD of another worktree",
+    );
+    refs.quiet(
+        || {
+            fs::write(beside.join("staged.txt"), "staged\n").unwrap();
+            git(&beside, &["add", "staged.txt"]);
+        },
+        "the index of another worktree",
+    );
+}
+
+// A switch in a worktree the index does not follow moves its HEAD alone, in its admin dir, which
+// names the index's work tree. Other files there stay unheard, and it is no repository here.
+#[test]
+fn ref_listeners_hear_the_head_of_a_worktree_the_index_does_not_follow() {
+    let tmp = TempDir::new().unwrap();
+    let root = fff_search::path_utils::canonicalize(tmp.path()).unwrap();
+    let (main, linked, beside) = (root.join("main"), root.join("linked"), root.join("beside"));
+    committed_repository(&main);
+    for branch in ["side", "other"] {
+        git(&main, &["branch", branch]);
+    }
+    git(
+        &main,
+        &["worktree", "add", "-q", "-b", "linked", "../linked"],
+    );
+    git(&main, &["worktree", "add", "-q", "--detach", "../beside"]);
+    let (picker, _frecency) = make_ref_picker(&linked);
+    let (state_sender, state) = std::sync::mpsc::channel();
+    let _state = picker.subscribe_repository_state(move |root| {
+        let _ = state_sender.send(root.to_path_buf());
+    });
+    let refs = RefChanges::subscribe(&picker, &linked, &linked);
+
+    refs.only(
+        &linked,
+        || git(&beside, &["switch", "-q", "side"]),
+        "a switch in another worktree",
+    );
+    refs.quiet(
+        || {
+            fs::write(beside.join("staged.txt"), "staged\n").unwrap();
+            git(&beside, &["add", "staged.txt"]);
+            git(&beside, &["status", "--short"]);
+        },
+        "the index of another worktree",
+    );
+    let repository: Vec<_> = state.try_iter().collect();
+    assert!(repository.is_empty(), "no git state here: {repository:?}");
+
+    // Each worktree added after the watch began is followed once the watcher saw it. The first
+    // switch may come before that; the event after its watch stands for it, once.
+    let late = root.join("late");
+    refs.after(
+        &linked,
+        || git(&main, &["worktree", "add", "-q", "--detach", "../late"]),
+        "a worktree added",
+    );
+    let switches_in_late = |what: &str| {
+        for target in ["other", "--detach", "other"] {
+            refs.only(
+                &linked,
+                || git(&late, &["switch", "-q", target]),
+                &format!("{what}: switch {target}"),
+            );
+        }
+    };
+    switches_in_late("a worktree added after the watch began");
+
+    // Its admin dir gone and back, faster than the watcher looks, costs the old watch.
+    refs.after(
+        &linked,
+        || {
+            git(&main, &["worktree", "remove", "--force", "../late"]);
+            git(&main, &["worktree", "add", "-q", "--detach", "../late"]);
+        },
+        "a worktree added again",
+    );
+    switches_in_late("a worktree added again");
+    assert_eq!(picker.rescan_stats().total, 0);
+}
+
+// `git worktree remove` takes `worktrees` along with the last worktree, and inotify's debouncer
+// reports only that removal, also when the worktree is back by then.
+#[test]
+fn ref_listeners_hear_the_head_of_the_last_worktree_added_again() {
+    let tmp = TempDir::new().unwrap();
+    let root = fff_search::path_utils::canonicalize(tmp.path()).unwrap();
+    let (main, late) = (root.join("main"), root.join("late"));
+    tagged_repository(&main);
+    git(&main, &["worktree", "add", "-q", "--detach", "../late"]);
+    let (picker, _frecency) = make_ref_picker(&main);
+    let refs = RefChanges::subscribe(&picker, &main, &main);
+    refs.only(&main, || switch_to(&late, "one"), "a switch at first");
+
+    refs.after(
+        &main,
+        || {
+            git(&main, &["worktree", "remove", "--force", "../late"]);
+            git(&main, &["worktree", "add", "-q", "--detach", "../late"]);
+        },
+        "the last worktree added again",
+    );
+    for tag in ["one", "two", "one"] {
+        let what = format!("a switch to {tag} after it was added again");
+        refs.only(&main, || switch_to(&late, tag), &what);
+    }
+}
+
+// What a view of a main checkout relies on: a switch in any of its worktrees reaches its
+// subscribers, ignored below it, beside it or open below it, followed by another index or not.
+#[test]
+fn ref_listeners_of_a_main_checkout_hear_the_heads_of_all_its_worktrees() {
+    hears_the_heads_of_all_worktrees(make_ref_picker);
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn ref_listeners_of_a_main_checkout_hear_the_heads_of_all_its_worktrees_natively() {
+    hears_the_heads_of_all_worktrees(make_watched_picker);
+}
+
+fn hears_the_heads_of_all_worktrees(make_picker: fn(&Path) -> (SharedFilePicker, SharedFrecency)) {
+    let tmp = TempDir::new().unwrap();
+    let root = fff_search::path_utils::canonicalize(tmp.path()).unwrap();
+    let main = root.join("main");
+    seed(&main);
+    fs::write(main.join(".gitignore"), ".worktrees/\n").unwrap();
+    tagged_repository(&main);
+    let (ignored, beside, open) = (
+        main.join(".worktrees/ignored"),
+        root.join("beside"),
+        main.join("open"),
+    );
+    for path in [".worktrees/ignored", "../beside", "open"] {
+        git(&main, &["worktree", "add", "-q", "--detach", path]);
+    }
+    let (picker, _frecency) = make_picker(&main);
+    let broad = RefChanges::subscribe(&picker, &main, &main);
+    let narrow = RefChanges::subscribe(&picker, &main.join("src"), &main);
+    // A worktree open below the checkout is named to whoever's scope holds it.
+    let layouts = [
+        (&ignored, &main, "ignored"),
+        (&beside, &main, "beside"),
+        (&open, &open, "open"),
+    ];
+    let switches = |worktree: &Path, named: &Path, what: &str| {
+        for tag in ["one", "two"] {
+            broad.after(named, || switch_to(worktree, tag), what);
+            let heard = narrow.fence();
+            assert!(heard.contains(&main), "{what}, narrowly: heard {heard:?}");
+        }
+    };
+    for (worktree, named, what) in layouts {
+        switches(worktree, named, what);
+    }
+
+    // The index meets an ignored worktree through its git state, and follows it from then on.
+    broad.quiet(
+        || {
+            fs::write(ignored.join("staged.txt"), "staged\n").unwrap();
+            git(&ignored, &["add", "staged.txt"]);
+        },
+        "the index of an ignored worktree",
+    );
+    broad.after(
+        &main,
+        || git(&main, &["worktree", "add", "-q", "--detach", "../late"]),
+        "another worktree, whose set makes the watches follow",
+    );
+    narrow.fence();
+    switches(&ignored, &main, "ignored, once met");
+
+    for (worktree, named, what) in layouts {
+        let (other, _frecency) = make_picker(worktree);
+        let _own = RefChanges::subscribe(&other, worktree, worktree);
+        switches(
+            worktree,
+            named,
+            &format!("{what}, with an index of its own"),
+        );
+    }
+
+    // Nothing depends on another listener holding the worktree in its scope.
+    drop(broad);
+    narrow.fence();
+    narrow.after(&main, || switch_to(&open, "one"), "open, narrowly alone");
 }
 
 #[test]
@@ -1097,6 +1293,10 @@ fn a_linked_worktree_hears_its_refs_with_the_native_watcher() {
         &other,
         &["worktree", "add", "-q", "-b", "nested", "../linked/nested"],
     );
+    git(&main, &["worktree", "add", "-q", "--detach", "../beside"]);
+    let beside = root.join("beside");
+    git(&main, &["branch", "side"]);
+    git(&main, &["branch", "later"]);
     let (picker, _frecency) = make_watched_picker(&linked);
     assert_eq!(
         picker.rescan_stats().total,
@@ -1139,6 +1339,20 @@ fn a_linked_worktree_hears_its_refs_with_the_native_watcher() {
         !before.contains(&linked),
         "the main checkout's HEAD is its own: {before:?}"
     );
+    // A worktree the index does not follow: its HEAD alone, through the recursive watch of
+    // `worktrees`.
+    step(
+        &|| git(&beside, &["switch", "-q", "side"]),
+        "the HEAD of another worktree",
+    );
+    fs::write(beside.join("staged.txt"), "staged\n").unwrap();
+    git(&beside, &["add", "staged.txt"]);
+    git(&beside, &["status", "--short"]);
+    let before = fence();
+    assert!(
+        !before.contains(&linked),
+        "the index of another worktree is its own: {before:?}"
+    );
     // Upstreams and remotes in the main repository's config, heard at least once and at
     // most once per write of the config.
     // Worktrees added from the main checkout restart no stream: the linked worktree hears refs
@@ -1150,8 +1364,10 @@ fn a_linked_worktree_hears_its_refs_with_the_native_watcher() {
         git(&main, &["worktree", "add", "-q", "--detach", &path]);
         until_heard(&heard, &linked, &what);
         let later = fence();
+        // At most once per write of its admin dir's ref state, whatever a loaded machine
+        // spreads over batches: the dir, `locked` and its removal, `gitdir`, and HEAD twice.
         let times = 1 + later.iter().filter(|root| **root == linked).count();
-        assert!(times <= 2, "{what}: heard {times} times, {later:?}");
+        assert!(times <= 6, "{what}: heard {times} times, {later:?}");
         let spelled = |root: &std::path::PathBuf| root.as_os_str().to_string_lossy().ends_with('/');
         assert!(!later.iter().any(spelled), "{what}: {later:?}");
         let repository: Vec<_> = state.try_iter().collect();
@@ -1160,6 +1376,11 @@ fn a_linked_worktree_hears_its_refs_with_the_native_watcher() {
             "{what} restarted a stream: {repository:?}"
         );
     }
+    // The recursive watch has covered a worktree added since from its first file on.
+    step(
+        &|| git(&root.join("added-0"), &["switch", "-q", "later"]),
+        "the HEAD of a worktree added after the watch began",
+    );
     for (writes, args) in [
         (1, &["config", "branch.linked.merge", "refs/heads/main"][..]),
         (2, &["remote", "add", "origin", "../other"]),
@@ -1258,6 +1479,18 @@ fn make_ref_picker(base: &Path) -> (SharedFilePicker, SharedFrecency) {
         fff_search::watch::poll_watcher_for(base);
     }
     make_watched_picker(base)
+}
+
+// A repository with two tags, to switch a worktree's HEAD between without moving a ref.
+fn tagged_repository(dir: &Path) {
+    committed_repository(dir);
+    git(dir, &["tag", "one"]);
+    git(dir, &["commit", "-q", "--allow-empty", "-m", "two"]);
+    git(dir, &["tag", "two"]);
+}
+
+fn switch_to(worktree: &Path, tag: &str) {
+    git(worktree, &["switch", "-q", "--detach", tag]);
 }
 
 // A repository on `main` with one commit.

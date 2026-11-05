@@ -85,10 +85,12 @@ export interface ServiceWatchOptions extends WatchOptions {
    * Also deliver a `refs` event, naming the repository's work tree, when a
    * branch, tag or remote-tracking ref of a repository inside the instance's
    * directory, or containing it, is created, moved or deleted, as `git branch`,
-   * `git tag`, a commit, `git fetch` or `git pack-refs` do. A linked worktree
-   * shares its main repository's refs, so a change there names every work tree
-   * of the repository the subscription covers. The service watches refs only
-   * while a subscription asks for them. (default: false)
+   * `git tag`, a commit, `git fetch` or `git pack-refs` do, or its HEAD moves.
+   * A linked worktree shares its main repository's refs, so a change there
+   * names every work tree of the repository the subscription covers; a switch
+   * in a linked worktree does the same unless the subscription covers that
+   * worktree, which it then names. The service watches refs only while a
+   * subscription asks for them. (default: false)
    */
   refs?: boolean;
 }

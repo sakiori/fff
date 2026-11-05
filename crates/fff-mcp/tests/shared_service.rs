@@ -3244,6 +3244,55 @@ fn watch_subscription_hears_refs_only_when_asked() {
     );
 }
 
+// A worktree no subscription's directory holds moves only its HEAD, in its admin dir: a
+// subscription of another worktree of the repository hears it as a refs event of its own.
+#[test]
+fn watch_subscription_hears_the_head_of_a_worktree_no_index_follows() {
+    let tmp = Sandbox::new();
+    let service = tmp.service();
+    let (project, _) = repository_fixture(tmp.path());
+    commit_all(&project);
+    let repository = git2::Repository::open(&project).unwrap();
+    let head = repository.head().unwrap().peel_to_commit().unwrap();
+    repository.branch("side", &head, false).unwrap();
+    let (linked, beside) = (tmp.path().join("linked"), tmp.path().join("beside"));
+    repository.worktree("linked", &linked, None).unwrap();
+    repository.worktree("beside", &beside, None).unwrap();
+    let _daemon = start_daemon(&service, "0");
+    let with_refs = WatchRequest {
+        refs: true,
+        repository: true,
+        ..WatchRequest::default()
+    };
+    let (_refs, refs) = subscribe(&linked, &service, with_refs);
+    refs.fence(&linked, "before the switch");
+
+    let beside_repository = git2::Repository::open(&beside).unwrap();
+    beside_repository.set_head("refs/heads/side").unwrap();
+    let heard = refs.until("the other worktree's HEAD", refs_event(""));
+    assert!(
+        heard
+            .iter()
+            .all(|event| event.kind != WatchEventKind::Repository),
+        "its git state is its own: {heard:?}"
+    );
+    refs.fence(&linked, "after the switch");
+
+    // Its index stays its own, unheard. Two sentinels, as a batch's refs follow its files.
+    change_and_stage(&beside, "sub/src/inside.rs");
+    for name in ["sentinel-1.rs", "sentinel-2.rs"] {
+        std::fs::write(linked.join(name), "fn Sentinel() {}\n").unwrap();
+        let seen = refs.until("the sentinel", |event| event.path == name);
+        assert!(
+            seen.iter().all(|event| !matches!(
+                event.kind,
+                WatchEventKind::Refs | WatchEventKind::Repository
+            )),
+            "the other worktree's index was heard: {seen:?}"
+        );
+    }
+}
+
 #[test]
 fn nested_repositories_reach_their_own_and_enclosing_subscriptions() {
     let tmp = Sandbox::new();

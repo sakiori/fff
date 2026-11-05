@@ -150,7 +150,8 @@ its pipeline here.
   directory share one index (`fff-mcp --help` lists the service options).
 - Programs search through that service with the `fff-service` library, the C
   library's `fff_create_service_instance` and `@sakiori/fff-node`.
-- Watch subscriptions report file changes and, on request, repository refs.
+- Watch subscriptions report file changes and, on request, repository refs, among
+  them the HEADs of the repository's linked worktrees.
 - `fff-mcp` makes no upstream update check.
 
 The repository is MIT-licensed; keep upstream's `LICENSE` unchanged.

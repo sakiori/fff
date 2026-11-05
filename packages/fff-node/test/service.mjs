@@ -729,6 +729,100 @@ describe("FileFinder over the shared service", { concurrency: 1 }, () => {
     plainWatched.value();
   });
 
+  it("hears the HEAD of a worktree no index follows as refs of its own work tree", async () => {
+    const root = realpathSync(tree("watch-other-head", { "main/a.txt": "a\n", "other/a.txt": "a\n" }));
+    const [main, other] = [join(root, "main"), join(root, "other")];
+    const git = (dir, ...args) =>
+      execFileSync("git", ["-C", dir, "-c", "user.name=fff", "-c", "user.email=fff@example.invalid", ...args]);
+    for (const dir of [main, other]) {
+      git(dir, "init", "-q", "-b", "main");
+      git(dir, "add", "a.txt");
+      git(dir, "commit", "-q", "-m", "init");
+    }
+    git(main, "branch", "side");
+    const [linked, beside] = [join(root, "linked"), join(root, "beside")];
+    git(main, "worktree", "add", "-q", "-b", "linked", linked);
+    git(main, "worktree", "add", "-q", "--detach", beside);
+    // Refs of another repository outside the index come through the same watcher stream as
+    // those of the main repository, in order, and name a work tree of their own.
+    const nested = join(linked, "nested");
+    git(other, "worktree", "add", "-q", "-b", "nested", nested);
+    const finder = await open(linked);
+    const refs = collector();
+    const watched = await finder.watch(refs.callback, { refs: true });
+    assert.ok(watched.ok, JSON.stringify(watched));
+    // The second of two proves the batch of the first was handed over in full.
+    let fences = 0;
+    const fenced = async () => {
+      for (const _ of [1, 2]) {
+        const from = refs.events.length;
+        git(other, "branch", `fence-${++fences}`);
+        await refs.until((event) => event.kind === "refs" && event.path === nested, from);
+      }
+    };
+    await fenced();
+
+    const from = refs.events.length;
+    git(beside, "switch", "-q", "side");
+    const seen = await refs.until((event) => event.path === linked, from);
+    assert.deepEqual(seen.at(-1), { path: linked, kind: "refs" });
+    await fenced();
+
+    // Its index stays its own.
+    const before = refs.events.length;
+    writeFileSync(join(beside, "b.txt"), "b\n");
+    git(beside, "add", "b.txt");
+    await fenced();
+    const later = refs.events.slice(before).filter((event) => event.path === linked);
+    assert.deepEqual(later, []);
+    watched.value();
+  });
+
+  it("tells a main checkout of a switch in each of its worktrees, as a server relies on", { timeout: 180_000 }, async () => {
+    const root = realpathSync(tree("watch-all-heads", { "main/a.txt": "a\n", "main/.gitignore": ".worktrees/\n" }));
+    const main = join(root, "main");
+    const git = (dir, ...args) =>
+      execFileSync("git", ["-C", dir, "-c", "user.name=fff", "-c", "user.email=fff@example.invalid", ...args]);
+    git(main, "init", "-q", "-b", "main");
+    git(main, "add", ".");
+    git(main, "commit", "-q", "-m", "one");
+    git(main, "tag", "one");
+    git(main, "commit", "-q", "--allow-empty", "-m", "two");
+    git(main, "tag", "two");
+    // Ignored below the checkout, beside it, and open below it, which is named to its subscribers.
+    const layouts = [
+      [join(main, ".worktrees/ignored"), main],
+      [join(root, "beside"), main],
+      [join(main, "open"), join(main, "open")],
+    ];
+    for (const [worktree] of layouts) git(main, "worktree", "add", "-q", "--detach", worktree);
+    const options = { repository: true, refs: true };
+    const finder = await open(main);
+    const heard = collector();
+    const watched = await finder.watch(heard.callback, options);
+    assert.ok(watched.ok, JSON.stringify(watched));
+    let fences = 0;
+    const fenced = () => fence(heard, main, `heads-${++fences}`);
+    const switched = async ([worktree, named], tag) => {
+      await fenced();
+      const from = heard.events.length;
+      git(worktree, "switch", "-q", "--detach", tag);
+      await heard.until((event) => event.kind === "refs" && event.path === named, from);
+    };
+    for (const layout of layouts) {
+      await switched(layout, "one");
+      // An index of the worktree's own, as a view of the worktree holds, changes nothing here.
+      const other = await open(layout[0]);
+      const held = await other.watch(() => {}, options);
+      assert.ok(held.ok, JSON.stringify(held));
+      await switched(layout, "two");
+      await switched(layout, "one");
+      held.value();
+      await switched(layout, "two");
+    }
+    watched.value();
+  });
+
   it("replaces what a callback falling behind could not take with one rescan", async () => {
     const files = Object.fromEntries(Array.from({ length: 1500 }, (_, n) => [`f${n}.rs`, ""]));
     const dir = realpathSync(tree("watch-behind", files));

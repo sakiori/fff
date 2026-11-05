@@ -746,6 +746,9 @@ pub(crate) fn handle_debounced_events(
     for root in &git.ref_roots {
         shared_picker.notify_ref_change(root);
     }
+    for (moved, work_tree) in &git.heads_beside {
+        shared_picker.notify_head_beside(moved, work_tree);
+    }
     if (!git.watches.is_empty() || git.resync_refs)
         && let Ok(guard) = shared_picker.read()
         && let Some(watcher) = guard.as_ref().and_then(|p| p.background_watcher.as_ref())
@@ -754,6 +757,7 @@ pub(crate) fn handle_debounced_events(
             watcher.request_git_state(change);
         }
         if git.resync_refs {
+            watcher.watches.refs.renew(git.renewed_refs);
             watcher.send(WatchTask::SyncRefs);
         }
     }
@@ -794,6 +798,9 @@ struct GitChanges {
     ref_roots: ahash::AHashSet<PathBuf>,
     watches: Vec<GitStateChange>,
     resync_refs: bool,
+    renewed_refs: Vec<PathBuf>,
+    // See `RefChanges`.
+    heads_beside: ahash::AHashSet<(PathBuf, PathBuf)>,
 }
 
 enum GitStateChange {
@@ -902,7 +909,8 @@ fn apply_debounced_events(
         if let Some(signals) = &ref_signals
             && signals.may_hold(path, base_path)
         {
-            signals.classify(path, kind, &mut ref_changes);
+            let ignored = |work_tree: &Path| filter.is_ignored(work_tree);
+            signals.classify(path, kind, ignored, &mut ref_changes);
         }
         // A repository whose work tree or git dir went, or a directory above them, is
         // recorded anew when it returns. Linux reports a watched git dir's own removal too.
@@ -925,11 +933,13 @@ fn apply_debounced_events(
         }
     }
     if let Some(signals) = &ref_signals {
-        git.ref_roots.extend(
-            (ref_changes.work_trees.into_iter())
-                .filter(|work_tree| signals.is_own(work_tree) || !filter.is_ignored(work_tree)),
-        );
+        let told = |work_tree: &Path| signals.is_own(work_tree) || !filter.is_ignored(work_tree);
+        git.ref_roots
+            .extend((ref_changes.work_trees.into_iter()).filter(|work_tree| told(work_tree)));
+        git.heads_beside
+            .extend((ref_changes.heads_beside.into_iter()).filter(|(_, beside)| told(beside)));
         git.resync_refs = ref_changes.resync;
+        git.renewed_refs = ref_changes.renewed;
     }
 
     for debounced_event in &events {
@@ -2699,8 +2709,8 @@ mod tests {
         handle(git_dir.join("worktrees/wt/HEAD"));
         assert_eq!(drain(&heard), [base.join("wt")]);
         assert!(
-            drain(&src_heard) == [base.as_path()],
-            "src is not in the linked worktree"
+            drain(&src_heard) == [base.as_path(), base.as_path()],
+            "src is not in the linked worktree, so its own work tree stands for it"
         );
         assert_eq!(drain(&state), [base.clone(), base.join("wt")]);
 

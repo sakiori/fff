@@ -41,7 +41,7 @@ pub enum WatchEventKind {
     /// in progress such as a merge.
     Repository,
     /// A branch, tag or remote-tracking ref of the work tree at `path` was created, moved or
-    /// deleted, loose or in `packed-refs`. A linked worktree shares its main repository's.
+    /// deleted, loose or in `packed-refs`, or a linked worktree's HEAD moved; they share them.
     Refs,
 }
 

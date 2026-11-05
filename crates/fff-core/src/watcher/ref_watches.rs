@@ -61,6 +61,8 @@ struct RefState {
     missing: Vec<PathBuf>,
     // The ref storage of each common dir, read once until its config may have changed.
     storages: Vec<(PathBuf, RefStorage)>,
+    // Paths created or removed since the last plan, whose watch may have gone with the old one.
+    renewed: Vec<PathBuf>,
 }
 
 // The watch changes bringing the ref watches in line with the listeners, and the work trees
@@ -147,6 +149,7 @@ impl RefWatches {
         } else {
             self.followed(picker, &scopes, &mut state.storages)
         };
+        let renewed = std::mem::take(&mut state.renewed);
         let mut ops = Vec::new();
         let mut appeared = Vec::new();
         let mut watched = Vec::new();
@@ -160,13 +163,17 @@ impl RefWatches {
                 continue;
             }
             let known = state.watched.iter().any(|(known, _)| *known == path);
-            if !known || renew.is_some_and(|dir| path.starts_with(dir)) {
+            let anew = !known || renewed.iter().any(|dir| path.starts_with(dir));
+            if anew || renew.is_some_and(|dir| path.starts_with(dir)) {
                 ops.push(PathOp::Watch(
                     path.clone(),
                     notify::WatchPathConfig::new(mode),
                 ));
             }
-            if state.missing.contains(&path) {
+            // What changed in a directory that came after its parent's watch went unseen.
+            let below_watched = (path.parent())
+                .is_some_and(|parent| state.watched.iter().any(|(dir, _)| dir == parent));
+            if state.missing.contains(&path) || anew && below_watched {
                 appeared.extend(work_trees);
             }
             watched.push((path, mode));
@@ -197,6 +204,12 @@ impl RefWatches {
     // A ref store appeared or a config changed: storages are read again.
     pub(crate) fn reread_storages(&self) {
         self.state.lock().storages.clear();
+    }
+
+    // The next plan watches these anew: a directory gone and back before it looked lost its
+    // watch while its path stayed known.
+    pub(crate) fn renew(&self, paths: Vec<PathBuf>) {
+        self.state.lock().renewed.extend(paths);
     }
 
     // What a batch's ref changes are told by; none while nothing is followed or watched.
@@ -277,6 +290,9 @@ impl RefWatches {
 pub(crate) struct RefChanges {
     pub(crate) work_trees: ahash::AHashSet<PathBuf>,
     pub(crate) resync: bool,
+    pub(crate) renewed: Vec<PathBuf>,
+    // A worktree named for its HEAD, and a work tree sharing its refs to name to other listeners.
+    pub(crate) heads_beside: ahash::AHashSet<(PathBuf, PathBuf)>,
 }
 
 pub(crate) struct RefSignals {
@@ -297,8 +313,14 @@ impl RefSignals {
     }
 
     // Git writes every ref, HEAD, table list and config through a `.lock` file it renames into
-    // place.
-    pub(crate) fn classify(&self, path: &Path, kind: EventKind, changes: &mut RefChanges) {
+    // place. `ignored` tells the work trees the index tells nothing of, whatever it follows.
+    pub(crate) fn classify(
+        &self,
+        path: &Path,
+        kind: EventKind,
+        ignored: impl Fn(&Path) -> bool,
+        changes: &mut RefChanges,
+    ) {
         if path
             .extension()
             .is_some_and(|extension| extension == "lock")
@@ -327,13 +349,31 @@ impl RefSignals {
                 let config = inside == Path::new("config");
                 // An admin dir touched by the files of its worktree changes no set.
                 let worktrees = worktrees_change(inside).filter(|_| !namespace_touched(path, kind));
+                let below_admin_dir = in_admin_dir(inside);
                 if ref_changed || config || worktrees.is_some() {
                     changes.work_trees.insert(followed.work_tree.clone());
+                }
+                if below_admin_dir.is_some_and(|below| moves_head(followed.storage, below)) {
+                    match self.named_holder(path, &ignored) {
+                        Some(holder) if holder.git_dir == followed.git_dir => {}
+                        Some(holder) => {
+                            let beside = (holder.work_tree.clone(), followed.work_tree.clone());
+                            changes.heads_beside.insert(beside);
+                        }
+                        None => {
+                            changes.work_trees.insert(followed.work_tree.clone());
+                        }
+                    }
                 }
                 changes.resync |= ["refs", "reftable", "config"]
                     .iter()
                     .any(|store| inside == Path::new(store))
-                    || worktrees == Some(WorktreesChange::Set);
+                    || worktrees == Some(WorktreesChange::Set)
+                    || followed.storage == RefStorage::Reftable
+                        && below_admin_dir == Some(Path::new("reftable"));
+                if worktrees == Some(WorktreesChange::Set) {
+                    changes.renewed.push(path.to_path_buf());
+                }
             }
             // A work tree's own config, where `extensions.worktreeConfig` is set.
             if path
@@ -361,47 +401,54 @@ impl RefSignals {
     // git state.
     pub(crate) fn ref_only(&self, path: &Path, base_path: &Path) -> bool {
         !path.starts_with(base_path)
-            && !(self.followed.iter()).any(|followed| {
-                followed.git_dir != followed.common_dir && path.starts_with(&followed.git_dir)
-            })
+            && !(self.followed.iter()).any(|followed| followed.linked_holds(path))
             && self.watched.iter().any(|(dir, mode)| match mode {
                 RecursiveMode::Recursive => path.starts_with(dir),
                 RecursiveMode::NonRecursive => path.parent() == Some(dir.as_path()),
             })
     }
 
-    // A file of another worktree's admin dir that only the ref watches deliver, as its index,
-    // HEAD, logs or locks: it changes no worktree set, so a batch drops it by its prefix alone.
-    // The watch is the followed common dir's `worktrees` itself or one admin dir in it.
+    // A file of another worktree's admin dir that only the ref watches deliver and that is no
+    // ref state, as its index, logs or locks: a batch drops it by its prefix alone.
     pub(crate) fn foreign_admin_file(&self, path: &Path, base_path: &Path) -> bool {
         if path.starts_with(base_path)
-            || (self.followed.iter()).any(|followed| {
-                followed.git_dir != followed.common_dir && path.starts_with(&followed.git_dir)
-            })
+            || (self.followed.iter()).any(|followed| followed.linked_holds(path))
         {
             return false;
         }
         self.followed.iter().any(|followed| {
+            let below = (path.strip_prefix(&followed.common_dir).ok())
+                .and_then(in_admin_dir)
+                .filter(|below| !below.as_os_str().is_empty());
+            let Some(below) = below else {
+                return false;
+            };
             let worktrees = followed.common_dir.join("worktrees");
-            let Ok(rest) = path.strip_prefix(&worktrees) else {
-                return false;
-            };
-            let mut parts = rest.components().map(|part| part.as_os_str());
-            let (Some(id), Some(name)) = (parts.next(), parts.next()) else {
-                return false;
-            };
-            let deeper = parts.next().is_some();
-            let admin_dir = worktrees.join(id);
             let delivered = self.watched.iter().any(|(dir, mode)| match mode {
                 RecursiveMode::Recursive => *dir == worktrees,
-                RecursiveMode::NonRecursive => *dir == admin_dir && !deeper,
+                RecursiveMode::NonRecursive => path.parent() == Some(dir.as_path()),
             });
-            delivered && (deeper || (name != "gitdir" && name != "locked"))
+            delivered && !admin_ref_state(followed.storage, below)
         })
     }
 
     pub(crate) fn is_own(&self, work_tree: &Path) -> bool {
         self.own_work_tree.as_deref() == Some(work_tree)
+    }
+
+    // The followed worktree whose admin dir holds `path`, if the index tells of it by name.
+    fn named_holder(&self, path: &Path, ignored: &impl Fn(&Path) -> bool) -> Option<&Followed> {
+        self.followed.iter().find(|followed| {
+            followed.linked_holds(path)
+                && (self.is_own(&followed.work_tree) || !ignored(&followed.work_tree))
+        })
+    }
+}
+
+impl Followed {
+    // Whether `path` lies in this repository's git dir, being a linked worktree's admin dir.
+    fn linked_holds(&self, path: &Path) -> bool {
+        self.git_dir != self.common_dir && path.starts_with(&self.git_dir)
     }
 }
 
@@ -426,6 +473,32 @@ fn worktrees_change(inside: &Path) -> Option<WorktreesChange> {
         }
         _ => None,
     }
+}
+
+// What lies below the admin dir holding `inside`, a path in a common dir; empty for the admin
+// dir itself.
+fn in_admin_dir(inside: &Path) -> Option<&Path> {
+    let mut parts = inside.strip_prefix("worktrees").ok()?.components();
+    parts.next()?;
+    Some(parts.as_path())
+}
+
+// Whether a file below an admin dir is what moves with that worktree's HEAD: the file itself, or
+// in a reftable repository the worktree's table list, the file being a stub there.
+fn moves_head(storage: RefStorage, below: &Path) -> bool {
+    match storage {
+        RefStorage::Files => below == Path::new("HEAD"),
+        RefStorage::Reftable => below == Path::new("reftable/tables.list"),
+    }
+}
+
+// What of an admin dir is ref state whatever worktree it belongs to; see `worktrees_change`,
+// and the directory of a reftable worktree's tables, which needs a watch once it appears.
+fn admin_ref_state(storage: RefStorage, below: &Path) -> bool {
+    below == Path::new("gitdir")
+        || below == Path::new("locked")
+        || moves_head(storage, below)
+        || storage == RefStorage::Reftable && below == Path::new("reftable")
 }
 
 // A namespace directory changes with every ref and lock file in it; only its creation or
@@ -456,7 +529,7 @@ fn ref_targets(followed: &[Followed], keep: bool) -> Vec<(PathBuf, RecursiveMode
             RecursiveMode::NonRecursive,
             &followed.work_tree,
         );
-        // The linked worktrees' admin dirs, whose set and `gitdir` files are ref state.
+        // The linked worktrees' admin dirs, whose set, `gitdir` files and HEADs are ref state.
         let worktrees = common_dir.join("worktrees");
         if keep {
             add(worktrees, RecursiveMode::Recursive, &followed.work_tree);
@@ -468,6 +541,14 @@ fn ref_targets(followed: &[Followed], keep: bool) -> Vec<(PathBuf, RecursiveMode
             for admin_dir in
                 admin_dirs.filter(|entry| entry.file_type().is_ok_and(|kind| kind.is_dir()))
             {
+                // A reftable worktree's HEAD moves in tables of its own.
+                if followed.storage == RefStorage::Reftable {
+                    add(
+                        admin_dir.path().join("reftable"),
+                        RecursiveMode::NonRecursive,
+                        &followed.work_tree,
+                    );
+                }
                 add(
                     admin_dir.path(),
                     RecursiveMode::NonRecursive,
@@ -895,9 +976,12 @@ mod tests {
         let plan = refs.plan(&picker, None);
         assert!(ops(&plan).is_empty() && plan.appeared.is_empty());
         let mut changes = RefChanges::default();
-        refs.signals()
-            .unwrap()
-            .classify(&git_dir.join("refs"), modified(), &mut changes);
+        refs.signals().unwrap().classify(
+            &git_dir.join("refs"),
+            modified(),
+            |_| false,
+            &mut changes,
+        );
         assert!(changes.resync, "the ref store's appearance is followed");
 
         std::fs::create_dir_all(git_dir.join("refs/heads")).unwrap();
@@ -1218,7 +1302,7 @@ mod tests {
         let removed = EventKind::Remove(notify::event::RemoveKind::Any);
         let classify = |path: &Path, kind| {
             let mut changes = RefChanges::default();
-            refs.signals().unwrap().classify(path, kind, &mut changes);
+            (refs.signals().unwrap()).classify(path, kind, |_| false, &mut changes);
             (
                 changes.work_trees.into_iter().collect::<Vec<_>>(),
                 changes.resync,
@@ -1243,13 +1327,185 @@ mod tests {
         );
         // A worktree's own files, and its admin dir touched by them, are no change of the set.
         assert_eq!(classify(&worktrees.join("wt"), modified()), (vec![], false));
-        for own in ["wt/HEAD", "wt/index", "wt/gitdir.lock", "wt/logs/HEAD"] {
+        for own in [
+            "wt/index",
+            "wt/gitdir.lock",
+            "wt/HEAD.lock",
+            "wt/logs/HEAD",
+            "wt/sub/HEAD",
+            "wt/reftable/tables.list",
+        ] {
             assert_eq!(
                 classify(&worktrees.join(own), modified()),
                 (vec![], false),
                 "{own}"
             );
         }
+        // Its HEAD is state of the repository's refs, the worktree not being followed.
+        assert_eq!(
+            classify(&worktrees.join("wt/HEAD"), modified()),
+            (vec![repo.clone()], false)
+        );
+    }
+
+    #[test]
+    fn the_head_of_a_followed_worktree_names_it_and_of_another_those_sharing_its_refs() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = crate::path_utils::canonicalize(tmp.path()).unwrap();
+        let main = root.join("main");
+        std::fs::create_dir_all(&main).unwrap();
+        git(&main, &["init", "-q", "-b", "main"]);
+        git(&main, &["commit", "-q", "--allow-empty", "-m", "init"]);
+        for name in ["followed", "other", "ignored"] {
+            let path = format!("{}", root.join(name).display());
+            git(&main, &["worktree", "add", "-q", "--detach", &path]);
+        }
+        let worktrees = main.join(".git/worktrees");
+        let picker = SharedFilePicker::default();
+        picker.register_git_dir(&main.join(".git"), &main);
+        for name in ["followed", "ignored"] {
+            picker.register_git_dir(&worktrees.join(name), &root.join(name));
+        }
+        let _listener = picker.subscribe_ref_changes(&root, |_| {});
+        let refs = RefWatches::new(&root, false, None, false);
+        refs.plan(&picker, None);
+        let signals = refs.signals().unwrap();
+        let heard = |path: &Path| {
+            let ignored = |work_tree: &Path| work_tree.ends_with("ignored");
+            let mut changes = RefChanges::default();
+            signals.classify(path, modified(), ignored, &mut changes);
+            let mut heard: Vec<_> = changes.work_trees.into_iter().collect();
+            heard.sort();
+            heard
+        };
+        let (followed, ignored) = (root.join("followed"), root.join("ignored"));
+        assert_eq!(
+            heard(&worktrees.join("followed/HEAD")),
+            std::slice::from_ref(&followed)
+        );
+        let mut changes = RefChanges::default();
+        let path = worktrees.join("followed/HEAD");
+        signals.classify(&path, modified(), |_| false, &mut changes);
+        let mut beside: Vec<_> = changes.heads_beside.into_iter().collect();
+        beside.sort();
+        let beside_of = |work_tree: &Path| (followed.clone(), work_tree.to_path_buf());
+        assert_eq!(beside, [beside_of(&ignored), beside_of(&main)]);
+        let mut sorted = [followed, ignored, main.clone()];
+        sorted.sort();
+        assert_eq!(heard(&worktrees.join("other/HEAD")), sorted);
+        // The index tells nothing of an ignored worktree, so it is as good as another.
+        assert_eq!(heard(&worktrees.join("ignored/HEAD")), sorted);
+        for busy in ["other/index", "other/HEAD.lock", "other/logs/HEAD"] {
+            assert!(heard(&worktrees.join(busy)).is_empty(), "{busy}");
+        }
+    }
+
+    #[test]
+    fn an_admin_dir_added_or_back_is_watched_and_what_it_missed_is_told() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = crate::path_utils::canonicalize(tmp.path()).unwrap();
+        let repo = root.join("repo");
+        git2::Repository::init(&repo).unwrap();
+        let worktrees = repo.join(".git/worktrees");
+        std::fs::create_dir_all(worktrees.join("first")).unwrap();
+        let picker = SharedFilePicker::default();
+        picker.register_git_dir(&repo.join(".git"), &repo);
+        let _listener = picker.subscribe_ref_changes(&root, |_| {});
+        let refs = RefWatches::new(&root, false, None, false);
+        let plan = refs.plan(&picker, None);
+        assert!(ops(&plan).contains(&(true, worktrees.join("first"))));
+        assert!(plan.appeared.is_empty(), "the listener just came");
+
+        std::fs::create_dir(worktrees.join("late")).unwrap();
+        let plan = refs.plan(&picker, None);
+        assert_eq!(ops(&plan), [(true, worktrees.join("late"))]);
+        assert_eq!(plan.appeared, std::slice::from_ref(&repo));
+        let plan = refs.plan(&picker, None);
+        assert!(ops(&plan).is_empty() && plan.appeared.is_empty());
+
+        // Gone and back before a plan looked: the path stayed known, its watch did not.
+        std::fs::remove_dir(worktrees.join("late")).unwrap();
+        std::fs::create_dir(worktrees.join("late")).unwrap();
+        assert!(ops(&refs.plan(&picker, None)).is_empty());
+        let mut changes = RefChanges::default();
+        let created = EventKind::Create(notify::event::CreateKind::Folder);
+        let late = worktrees.join("late");
+        (refs.signals().unwrap()).classify(&late, created, |_| false, &mut changes);
+        assert!(changes.resync);
+        refs.renew(changes.renewed);
+        let plan = refs.plan(&picker, None);
+        assert_eq!(ops(&plan), [(true, late.clone())]);
+        assert_eq!(plan.appeared, std::slice::from_ref(&repo));
+        assert!(ops(&refs.plan(&picker, None)).is_empty(), "once");
+
+        // With the last worktree `worktrees` goes too, and the debouncer reports only that.
+        std::fs::remove_dir_all(&worktrees).unwrap();
+        std::fs::create_dir_all(&late).unwrap();
+        let removed = EventKind::Remove(notify::event::RemoveKind::Folder);
+        let mut changes = RefChanges::default();
+        (refs.signals().unwrap()).classify(&worktrees, removed, |_| false, &mut changes);
+        refs.renew(changes.renewed);
+        let plan = refs.plan(&picker, None);
+        let watched = ops(&plan);
+        assert!(watched.contains(&(true, worktrees.clone())), "{watched:?}");
+        assert!(watched.contains(&(true, late)), "{watched:?}");
+        assert_eq!(plan.appeared, [repo]);
+    }
+
+    #[test]
+    fn a_reftable_worktree_s_tables_are_watched_as_its_head() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = crate::path_utils::canonicalize(tmp.path()).unwrap();
+        let main = root.join("main");
+        if let Err(reason) = reftable_repository(&main) {
+            eprintln!("skipped: the installed git cannot create a reftable repository: {reason}");
+            return;
+        }
+        git(&main, &["worktree", "add", "-q", "--detach", "../other"]);
+        let common_dir = main.join(".git");
+        let picker = SharedFilePicker::default();
+        picker.register_git_dir(&common_dir, &main);
+        let _listener = picker.subscribe_ref_changes(&main, |_| {});
+        let refs = RefWatches::new(&main, false, None, false);
+        let admin_dir = common_dir.join("worktrees/other");
+        let watched = ops(&refs.plan(&picker, None));
+        assert!(watched.contains(&(true, admin_dir.join("reftable"))));
+
+        assert_eq!(
+            heard(&refs, &admin_dir.join("reftable/tables.list")),
+            std::slice::from_ref(&main)
+        );
+        for unrelated in ["HEAD", "reftable/tables.list.lock", "index"] {
+            assert!(
+                heard(&refs, &admin_dir.join(unrelated)).is_empty(),
+                "{unrelated}"
+            );
+        }
+        let signals = refs.signals().unwrap();
+        for dropped in ["HEAD", "index", "reftable/0001.ref"] {
+            assert!(signals.foreign_admin_file(&admin_dir.join(dropped), &root.join("elsewhere")));
+        }
+        for kept in ["reftable", "reftable/tables.list", "gitdir"] {
+            assert!(!signals.foreign_admin_file(&admin_dir.join(kept), &root.join("elsewhere")));
+        }
+
+        // Git writes the tables after the admin dir, which a plan may have met without them.
+        let late = common_dir.join("worktrees/late");
+        std::fs::create_dir(&late).unwrap();
+        assert!(ops(&refs.plan(&picker, None)).contains(&(true, late.clone())));
+        std::fs::create_dir(late.join("reftable")).unwrap();
+        let mut changes = RefChanges::default();
+        let created = EventKind::Create(notify::event::CreateKind::Folder);
+        (refs.signals().unwrap()).classify(
+            &late.join("reftable"),
+            created,
+            |_| false,
+            &mut changes,
+        );
+        assert!(changes.resync, "its tables need a watch");
+        let plan = refs.plan(&picker, None);
+        assert_eq!(ops(&plan), [(true, late.join("reftable"))]);
+        assert_eq!(plan.appeared, [main]);
     }
 
     #[test]
@@ -1284,9 +1540,10 @@ mod tests {
             let dropped = |path: &Path| signals.foreign_admin_file(path, &base);
             for busy in [
                 "other/index",
-                "other/HEAD",
+                "other/HEAD.lock",
                 "other/index.lock",
                 "other/gitdir.lock",
+                "other/ORIG_HEAD",
             ] {
                 assert!(dropped(&worktrees.join(busy)), "{busy}, keep {keep}");
             }
@@ -1295,6 +1552,7 @@ mod tests {
             }
             for kept in [
                 "other",
+                "other/HEAD",
                 "other/gitdir",
                 "other/locked",
                 "added",
@@ -1378,9 +1636,7 @@ mod tests {
 
     fn heard(refs: &RefWatches, path: &Path) -> Vec<PathBuf> {
         let mut changes = RefChanges::default();
-        refs.signals()
-            .unwrap()
-            .classify(path, modified(), &mut changes);
+        (refs.signals().unwrap()).classify(path, modified(), |_| false, &mut changes);
         let mut heard: Vec<_> = changes.work_trees.into_iter().collect();
         heard.sort();
         heard

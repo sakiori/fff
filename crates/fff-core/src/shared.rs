@@ -584,7 +584,8 @@ impl SharedFilePicker {
     /// `packed-refs` or in a reftable repository's tables, or its HEAD moved, as by a switch
     /// or a commit on a detached HEAD. A linked worktree's branches live in its main
     /// repository's common dir, so a change there names every work tree of the index sharing
-    /// it; its HEAD names only itself. The work trees are those
+    /// it; its HEAD names itself to the listeners whose scope is related to it, and to any
+    /// other listener a work tree sharing its common dir. The work trees are those
     /// [`Self::subscribe_repository_state`] names. The watcher watches the refs of the
     /// repositories related to a listener's scope only while one is subscribed, from before
     /// this returns. This and dropping the subscription change the watcher's watches, so call
@@ -618,6 +619,15 @@ impl SharedFilePicker {
         self.0
             .refs
             .notify_where(&work_tree, |scope| related(scope, &work_tree));
+    }
+
+    // Tells the ref listeners of `work_tree` whose scope is not related to `moved` of its HEAD.
+    pub(crate) fn notify_head_beside(&self, moved: &Path, work_tree: &Path) {
+        let moved: PathBuf = moved.components().collect();
+        let work_tree: PathBuf = work_tree.components().collect();
+        self.0.refs.notify_where(&work_tree, |scope| {
+            related(scope, &work_tree) && !related(scope, &moved)
+        });
     }
 
     // Brings the watcher's ref watches in line with the ref listeners, outside the picker lock.
