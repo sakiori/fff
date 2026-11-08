@@ -153,5 +153,7 @@ its pipeline here.
 - Watch subscriptions report file changes and, on request, repository refs, among
   them the HEADs of the repository's linked worktrees.
 - `fff-mcp` makes no upstream update check.
+- The index follows directories that are rewalked or replaced while it watches
+  them, and reports rewalked directories exactly.
 
 The repository is MIT-licensed; keep upstream's `LICENSE` unchanged.

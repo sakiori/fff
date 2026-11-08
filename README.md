@@ -1,17 +1,105 @@
-> [!NOTE]
-> This is `sakiori-oss/fff`, a downstream fork of [fff](https://github.com/dmtrKovalenko/fff)
-> that follows upstream's `main`. It adds a shared index service, so the MCP clients of one
-> user that search the same directory share one index, and a Node package,
-> `@sakiori/fff-node`, that searches through that service. Install a release of `fff-mcp`
-> with `mise use -g gitlab:sakiori-oss/fff@<version>` and the Node package with
-> `npm install --save-exact @sakiori/fff-node@<version>`; the upstream install scripts and
-> packages below do not carry these changes; `<version>` is the release tag without its `v`.
-> Each release's files are at `https://gitlab.com/sakiori-oss/fff/-/releases/<tag>/downloads/binaries/<file>`
-> with cosign bundles (`cosign verify-blob --bundle <file>.sigstore.json
-> --certificate-oidc-issuer https://gitlab.com
-> --certificate-identity https://gitlab.com/sakiori-oss/fff//.gitlab-ci.yml@refs/tags/<tag> <file>`).
-> [CUSTOM.md](./CUSTOM.md) lists the downstream changes and how
-> the fork is maintained; the rest of this README is upstream's.
+# fff: the sakiori-oss fork
+
+This is `sakiori-oss/fff`, a fork of [fff](https://github.com/dmtrKovalenko/fff) that
+follows upstream's `main` through regular updates. It changes how fff runs, not how it
+searches: MCP agents and Node programs of one OS user search a directory through **one
+shared index**, where upstream builds an index in every process. The search and ranking
+code and the MCP tools agents see are upstream's; the frecency data is shared by every
+client of an index.
+
+Use this fork when several agents, or agents and your own Node program, search the same
+projects at the same time. Otherwise, use upstream.
+
+## How this fork differs from upstream
+
+| Part | Upstream fff | This fork |
+| --- | --- | --- |
+| `fff-mcp` | Each MCP client's server process scans and indexes the directory itself and keeps its own copy in memory. | The first client starts a shared service for the OS user. A later client that searches the same directory, or one inside it, uses the index already there. |
+| Shared service | — | Exits after an hour without clients (`--idle-timeout-secs`). `fff-mcp --service-status` lists running services; `--service-stop` stops those without clients. Only clients of the same fork release share a service. |
+| Update check | `fff-mcp` tells you when upstream has a newer release. | None: it would point you to upstream's build. |
+| Node package | `@ff-labs/fff-node` keeps the index in your process and answers synchronously. | `@sakiori/fff-node` opens a session on the shared service. Its instance methods return Promises, and `watch` also reports git state and ref changes. It is **not** a drop-in replacement; the [package README](./packages/fff-node/README.md) lists what differs. |
+| C library | Each instance holds its own index. | Adds `fff_create_service_instance`, an instance backed by the shared service, whose watch subscriptions can also report repository and ref events. Upstream's functions keep their signatures. |
+| Rust crates | `fff-search` and the other crates. | The same crates, plus `fff-service`, the shared service's server and client. Nothing is published to crates.io. |
+| Neovim plugin, Bun, Python, pi-fff | | No fork features. Their installers download upstream's releases, so install them from upstream. |
+
+The fork also fixes how the index follows directories that are rewalked or replaced
+while it watches them. The fixes are in the core, so every build of this repository has
+them, the Neovim plugin and Python bindings included.
+
+## Installing this fork
+
+[Releases](https://gitlab.com/sakiori-oss/fff/-/releases) carry `fff-mcp` for macOS on
+arm64 and x64, and for Linux on x64 and arm64 as statically linked binaries. There are
+no Windows builds. The install script, Homebrew formula, GitHub releases and `@ff-labs/*`
+packages in the rest of this README install upstream, without the shared service.
+
+### Installing the MCP server
+
+Install a release with [mise](https://mise.jdx.dev), where `<version>` is the release tag
+without its leading `v`, or `latest` for the newest release:
+
+```sh
+mise use -g gitlab:sakiori-oss/fff@<version>
+```
+
+Register the binary by its absolute path for every project, and again after an upgrade,
+since the path names the version:
+
+```sh
+claude mcp add -s user fff -- "$(mise which fff-mcp)"
+codex mcp add fff -- "$(mise which fff-mcp)"
+```
+
+Clients of different releases start separate services with separate indexes, so upgrade
+every client's registration together.
+
+### Installing the Node package
+
+```sh
+npm install @sakiori/fff-node
+```
+
+The package shares a service only with the `fff-mcp` of the same fork release, so install
+the package version that matches your `fff-mcp`. The
+[package README](./packages/fff-node/README.md) covers the API and the supported platforms.
+
+### Installing the C library
+
+Build it from source as the [C library](#c-library) section below shows, or take
+`libfff_c` from the `@sakiori/fff-bin-<platform>` npm package of a release. The release
+downloads carry `fff-mcp` only.
+
+### Verifying a download
+
+mise checks a download against the release's checksums. To check the signature as well,
+download the archive from the release: each archive and `SHA256SUMS` comes with a
+Sigstore bundle signed by the release's pipeline. `<tag>` is the release tag with its `v`:
+
+```sh
+cosign verify-blob --bundle <file>.sigstore.json \
+  --certificate-oidc-issuer https://gitlab.com \
+  --certificate-identity "https://gitlab.com/sakiori-oss/fff//.gitlab-ci.yml@refs/tags/<tag>" \
+  <file>
+```
+
+## Release versions
+
+A release is tagged `v<base>-sakiori.<YYYYMMDD>.<n>`. `<base>` is the version after the
+newest upstream release the fork contains, so `0.11.1-sakiori.*` carries upstream `0.11.0`
+and the upstream commits after it. The date and the day's number order the releases.
+The npm packages are published at the release's version. Each release's notes list the
+fork's own changes and the upstream updates it took.
+
+## Issues and maintenance
+
+Report problems with the shared service, the Node package or a release of this fork in
+[this project's issues](https://gitlab.com/sakiori-oss/fff/-/issues), and everything else
+[upstream](https://github.com/dmtrKovalenko/fff/issues). [CUSTOM.md](./CUSTOM.md)
+describes how the fork is maintained and released.
+
+---
+
+_Everything below is upstream's README._
 
 <a href="./assets/logo-orange.png"><img alt="FFF" src="./assets/logo-orange.png" width="300"></a>
 
@@ -65,9 +153,8 @@ Pick what you are interested in:
 
 Works with Claude Code, Codex, OpenCode, Cursor, Cline, and any MCP-capable client. A resident Rust index supports file discovery and content search across tool calls.
 
-This fork shares MCP indexes across compatible clients: the first client starts the shared
-service, which exits once idle. `fff-mcp --help` lists the service options, among them
-`--service-status` and `--service-stop`. Install the fork as the note at the top describes.
+In this fork, MCP clients share one index per directory and install differently; see
+[Installing this fork](#installing-this-fork).
 
 ![Measured search time and tokens for FFF MCP versus normal shell search](./chart.png)
 
@@ -698,6 +785,8 @@ The best file search picker for neovim. Period. Faster and more intuitive querie
 <h2>Node & Bun SDK</h2>
 </summary>
 
+For Node in this fork, use `@sakiori/fff-node`; see [Installing the Node package](#installing-the-node-package). The Bun package is upstream's.
+
 ```bash
 npm install @ff-labs/fff-node
 # or
@@ -784,6 +873,8 @@ Native rust crate that is performing all the search. Stable and well documented.
 <summary>
 <h2>C library</h2>
 </summary>
+
+For this fork's library, see [Installing the C library](#installing-the-c-library).
 
 ### Build
 
@@ -1055,7 +1146,8 @@ If you are running one grep from a terminal, `rg` is still the right tool. If yo
 - `crates/fff-c` - C FFI used by every language binding.
 - `crates/fff-nvim` - Lua/mlua bindings for the Neovim plugin.
 - `crates/fff-mcp` - MCP server binary.
-- `packages/fff-node` - Node.js SDK (`@ff-labs/fff-node`).
+- `crates/fff-service` - the shared index service.
+- `packages/fff-node` - Node.js SDK (`@sakiori/fff-node`).
 - `packages/fff-bun` - Bun SDK (`@ff-labs/fff-bun`).
 - `packages/pi-fff` - pi extension (`@ff-labs/pi-fff`).
 - `lua/` - Neovim-side plugin code.
