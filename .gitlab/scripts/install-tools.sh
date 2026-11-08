@@ -75,9 +75,9 @@ for tool in "$@"; do
       ;;
     cargo-zigbuild)
       [ "$host" = Linux-x86_64 ] || unpinned
-      version=0.23.4
+      version=0.24.1
       unpack "https://github.com/rust-cross/cargo-zigbuild/releases/download/v$version/cargo-zigbuild-x86_64-unknown-linux-musl.tar.xz" \
-        9e3cf73485edbd45905c8aadbc0fdf869c7ddc3848f0c898229f2680db52e44b \
+        f09b180a517af0e4dd4bffc921bb88e5ab705452a9dd948c61e489b3020c68c2 \
         cargo-zigbuild-x86_64-unknown-linux-musl/cargo-zigbuild
       ;;
     cosign)
