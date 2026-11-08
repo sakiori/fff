@@ -5,7 +5,8 @@
 #   check-build-linux, the Linux release builds, when a change can affect the build.
 # - Push to main: macos-tests, the native suite on the macOS runner.
 # - Schedule on main: git-intake-sync takes upstream through a merge request, and release-tag
-#   cuts v<base>-sakiori.<YYYYMMDD>.<n> on the tip unless a release points at it.
+#   cuts v<base>-sakiori.<YYYYMMDD>.<n> on the tip unless a release points at it, once
+#   compute-quota finds the group's compute minutes enough for publish-npm.
 # - Release tag: release-check, release-version, build-linux, build-darwin and macos-tests,
 #   pack-npm, sign, publish-npm, publish, and release last: the GitLab Release.
 # - Started by hand on main: a rehearsal of a release with the version <base>-sakiori.<day>.0,
@@ -200,8 +201,31 @@ git-intake-sync:
   script:
     - git intake sync
 
+# publish-npm is the only job on GitLab.com's shared runners, and the group's compute quota pays
+# for it. A release whose npm job cannot run is not cut. COMPUTE_QUOTA_TOKEN is scoped to the
+# compute-quota environment, which only this job names.
+compute-quota:
+  stage: check
+  needs: []
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "schedule" && $CI_PROJECT_PATH == "sakiori-oss/fff"
+  environment:
+    name: compute-quota
+    action: prepare
+  cache: []
+  variables:
+    GIT_STRATEGY: clone
+    # publish-npm takes under two minutes; the rest covers a retry.
+    PUBLISH_NPM_MINUTES: "10"
+  script:
+    - .gitlab/scripts/install-tools.sh "$TOOLS" jq
+    - export PATH="$TOOLS/bin:$PATH"
+    - .gitlab/scripts/check-compute-quota.sh "$PUBLISH_NPM_MINUTES"
+
 release-tag:
   extends: .git-intake-bot
+  needs:
+    - job: compute-quota
   resource_group: release-tag
   script:
     - git intake release tag

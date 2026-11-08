@@ -77,7 +77,10 @@ a commit of `main`; git-intake's README, under "Downstream releases", describes
 the scheme. The schedule's `release-tag` job cuts the tag; nobody picks a version or pushes a release tag
 by hand, and running the schedule by hand cuts an off-cycle release once `main`
 has a commit the last release lacks; a tip that already carries a release gets
-no new tag. Rollback is
+no new tag. Nor does a schedule while the group's compute minutes cannot run
+`publish-npm`: its `compute-quota` job fails and says how many remain, and once
+minutes are bought or the monthly quota resets, running the schedule by hand
+cuts the release. Rollback is
 forward: a revert on `main` and an off-cycle release. A pipeline started by hand
 on `main` is a rehearsal that publishes nothing; run one after changing the
 build.
@@ -127,11 +130,17 @@ version of a new package is published with a token:
 - `GITLAB_TOKEN`: the group release bot's personal access token (`api`,
   `write_repository`), protected, masked and hidden, environment `git-intake`.
   Replace it before it expires.
+- `COMPUTE_QUOTA_TOKEN`: a personal access token (`read_api`) of a dedicated
+  account that is an Owner of the group, because GitLab shows compute usage to
+  Owners only; protected, masked and hidden, environment `compute-quota`.
+  Replace it before it expires.
 - One daily pipeline schedule on `main`, owned by the release bot.
 - Project members are Maintainers or above: npm's trusted publisher binds the
   project and the environment `npm`, not a protected ref.
 - Instance runners stay on: the npm job runs on GitLab.com's shared runners,
-  the only ones trusted publishing accepts.
+  the only ones trusted publishing accepts, and is the only job that selects
+  them. The group keeps them off for its other projects, so the group's compute
+  quota is spent on npm publishing alone.
 
 ## Runners
 
