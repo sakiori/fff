@@ -4,7 +4,8 @@
 The system SHALL reuse an index for a request whenever the index holds the files
 the request's policy includes and offers every capability the request needs.
 Options that decide which files an index holds (repository context, exclusion
-semantics, following symlinks) SHALL match. Capabilities (content indexing,
+semantics, extra ignore rules and the ignore sources a request turns off,
+following symlinks) SHALL match. Capabilities (content indexing,
 watching, warmup, content cache budget) MAY exceed the request and SHALL NOT
 fall short of it. Search mode and the frecency database belong to the index; a
 request that names its own frecency database only shares indexes that use the
@@ -34,6 +35,18 @@ SHALL NOT separate indexes.
 #### Scenario: Different symlink policy
 - **WHEN** two requests for the same directory differ in following symlinks
 - **THEN** they use separate indexes
+
+#### Scenario: Different ignore options
+- **WHEN** two requests for the same directory differ in their extra ignore rules, or in turning off Git integration or ignore files
+- **THEN** they use separate indexes
+
+#### Scenario: Extra ignore rules inside a broader index
+- **WHEN** a request with extra ignore rules arrives for a directory inside the directory of an existing index
+- **THEN** the service builds an index of the request's own directory, since the rules are relative to it, and does not use the broader index
+
+#### Scenario: Index without Git integration
+- **WHEN** a request turns off Git integration
+- **THEN** its session reports no repository, and its watch subscriptions receive no repository or refs events
 
 #### Scenario: Snapshot request
 - **WHEN** a request with watching disabled arrives where a watched index exists
