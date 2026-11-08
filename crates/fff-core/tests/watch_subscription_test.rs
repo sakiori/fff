@@ -587,6 +587,61 @@ fn an_index_below_the_work_tree_root_applies_its_rules() {
     assert!(!indexed(&base.join("node_modules/dep/added.js")));
 }
 
+// A glob without `/`, as a pattern or an ignore entry, matches the file name at any depth,
+// not the directories above it.
+#[test]
+fn slash_less_globs_match_file_names_at_any_depth() {
+    let tmp = TempDir::new().unwrap();
+    let base = fff_search::path_utils::canonicalize(tmp.path()).unwrap();
+    seed(&base);
+    for dir in ["a/b", "generated"] {
+        fs::create_dir_all(base.join(dir)).unwrap();
+    }
+    let (picker, _frecency) = make_watched_picker(&base);
+    let sources = watch_collect(&picker, "*.rs", WatchOptions::default());
+    let all = watch_collect(
+        &picker,
+        "",
+        WatchOptions {
+            ignore: vec!["*.log".to_string(), "gen*".to_string()],
+        },
+    );
+
+    for path in [
+        "a/b/deep.rs",
+        "a/b/x.log",
+        "a/b/gen.txt",
+        "generated/out.txt",
+        "top.txt",
+    ] {
+        fs::write(base.join(path), "x\n").unwrap();
+    }
+    let heard =
+        |events: &Collected, path: &str| events.lock().iter().any(|e| e.path == base.join(path));
+    assert!(
+        wait_for(
+            || heard(&sources, "a/b/deep.rs")
+                && heard(&all, "top.txt")
+                && heard(&all, "generated/out.txt"),
+            Duration::from_secs(10)
+        ),
+        "slash-less globs must match nested file names: {:?} {:?}",
+        sources.lock(),
+        all.lock()
+    );
+    std::thread::sleep(Duration::from_millis(300));
+    assert!(
+        sources
+            .lock()
+            .iter()
+            .all(|e| e.path.extension().is_some_and(|ext| ext == "rs")),
+        "{:?}",
+        sources.lock()
+    );
+    assert!(!heard(&all, "a/b/x.log"), "{:?}", all.lock());
+    assert!(!heard(&all, "a/b/gen.txt"), "{:?}", all.lock());
+}
+
 #[test]
 fn dir_subscription_with_ignore_option() {
     let tmp = TempDir::new().unwrap();

@@ -317,7 +317,7 @@ export interface WatchEvent {
 
 /** Options for watch subscriptions. */
 export interface WatchOptions {
-  /** Additional glob wildcard patterns to ignore */
+  /** Additional glob wildcard patterns to ignore; one without `/` matches the file name at any depth */
   ignore?: string[];
 }
 

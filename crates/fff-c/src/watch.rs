@@ -36,8 +36,8 @@ pub struct FffWatchOptions {
     /// Set to [`FFF_WATCH_OPTIONS_VERSION`] when allocating.
     pub version: u32,
     /// Per-subscription excludes (parcel-watcher style): entries with wildcards
-    /// are base-relative globs, entries without are path prefixes. NULL when
-    /// `ignore_count` is 0.
+    /// are base-relative globs, entries without are path prefixes. A glob without
+    /// `/` matches the file name at any depth. NULL when `ignore_count` is 0.
     pub ignore: *const *const c_char,
     pub ignore_count: u32,
     // ----- new version 2+ fields go here, ALWAYS appended -----
@@ -279,7 +279,8 @@ pub unsafe extern "C" fn fff_set_watch_callback(
 /// Returns the watch id, pass it to `fff_unwatch` to stop.
 ///
 /// `pattern` if non `NULL` can be wildcard pattern, absolute, or relative path
-/// that will be used to filter the events triggering exact subscription.
+/// that will be used to filter the events triggering exact subscription. A
+/// wildcard pattern without `/` matches the file name at any depth.
 ///
 /// On a service-backed instance the subscription lives in the shared service,
 /// and the call returns at once: a ready event (kind 7) follows once every later

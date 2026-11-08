@@ -557,8 +557,8 @@ typedef struct FffWatchOptions {
   uint32_t version;
   /**
    * Per-subscription excludes (parcel-watcher style): entries with wildcards
-   * are base-relative globs, entries without are path prefixes. NULL when
-   * `ignore_count` is 0.
+   * are base-relative globs, entries without are path prefixes. A glob without
+   * `/` matches the file name at any depth. NULL when `ignore_count` is 0.
    */
   const char *const *ignore;
   uint32_t ignore_count;
@@ -1706,7 +1706,8 @@ struct FffResult *fff_set_watch_callback(void *fff_handle,
  * Returns the watch id, pass it to `fff_unwatch` to stop.
  *
  * `pattern` if non `NULL` can be wildcard pattern, absolute, or relative path
- * that will be used to filter the events triggering exact subscription.
+ * that will be used to filter the events triggering exact subscription. A
+ * wildcard pattern without `/` matches the file name at any depth.
  *
  * On a service-backed instance the subscription lives in the shared service,
  * and the call returns at once: a ready event (kind 7) follows once every later
