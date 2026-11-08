@@ -106,7 +106,7 @@ An index shared with agents may track frecency, which moves recently and frequen
 
 ## Ignore rules
 
-`extraIgnore` adds `.gitignore` rules, relative to `basePath`, to the rules the index applies; a `!` prefix re-includes a path, and an ignored parent directory needs re-including too. `disableGit: true` skips Git discovery, status, ranking and Git ignore rules, and the index then includes hidden files but not Git metadata under `.git`. `disableIgnoreFiles: true` skips the rules of `.ignore` files. Instances share an index only when these options match, and an instance with `extraIgnore` uses an index rooted at its own directory.
+`extraIgnore` adds `.gitignore` rules, relative to `basePath`, to the rules the index applies; a `!` prefix re-includes a path, and an ignored parent directory needs re-including too. `disableGit: true` skips Git discovery, status, ranking and Git ignore rules, and the index then includes hidden files but not Git metadata under `.git`. `disableIgnoreFiles: true` skips the rules of `.ignore` files. Instances share an index only when these options match, and an instance with `extraIgnore` uses an index rooted at its own directory, which inside a repository still applies the repository's rules above it.
 
 ```ts
 await FileFinder.create({ basePath: process.cwd(), extraIgnore: ["/generated/", "!/keep.log"] });

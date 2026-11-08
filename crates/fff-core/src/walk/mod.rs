@@ -507,6 +507,46 @@ mod tests {
         );
     }
 
+    // A root below its work tree's root applies the rules above it, as an index of the
+    // work tree does there; a root those rules ignore still lists its own files.
+    #[test]
+    fn root_below_the_work_tree_inherits_its_rules() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path().canonicalize().unwrap().join("repo");
+        git2::Repository::init(&repo).unwrap();
+        fs::write(repo.join(".gitignore"), "*.log\nnode_modules/\nbuild/\n").unwrap();
+        fs::create_dir_all(repo.join("pkg/node_modules")).unwrap();
+        fs::create_dir_all(repo.join("build")).unwrap();
+        fs::write(repo.join("pkg/a.rs"), "x").unwrap();
+        fs::write(repo.join("pkg/x.log"), "x").unwrap();
+        fs::write(repo.join("pkg/node_modules/m.js"), "x").unwrap();
+        fs::write(repo.join("build/out.rs"), "x").unwrap();
+
+        let walk = |root: &std::path::Path| {
+            let counter = Arc::new(AtomicUsize::new(0));
+            walk_collect_files(root, None, true, policy(false), 1, &counter, None).unwrap()
+        };
+        let names = |out: &super::WalkOutput| {
+            let mut names: Vec<String> = out.pairs.iter().map(|(_, rel)| rel.clone()).collect();
+            names.sort();
+            names
+        };
+        let pkg = walk(&repo.join("pkg"));
+        assert_eq!(names(&pkg), ["a.rs"]);
+        #[cfg(feature = "zlob")]
+        {
+            let rules = pkg
+                .ignore_rules
+                .as_ref()
+                .expect("zlob surfaces ignore rules");
+            // The rules see only existing paths.
+            assert!(rules.is_ignored(std::path::Path::new("x.log")));
+            assert!(rules.is_ignored(std::path::Path::new("node_modules/")));
+            assert!(!rules.is_ignored(std::path::Path::new("a.rs")));
+        }
+        assert_eq!(names(&walk(&repo.join("build"))), ["out.rs"]);
+    }
+
     fn policy(follow_symlinks: bool) -> WalkPolicy<'static> {
         static NO_RULES: LazyLock<FilePickerIgnoreOptions> = LazyLock::new(Default::default);
         WalkPolicy {

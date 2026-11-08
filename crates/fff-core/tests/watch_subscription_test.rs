@@ -538,6 +538,55 @@ fn gitignored_files_are_never_delivered() {
     );
 }
 
+// An index of a directory inside a repository applies the rules above it, in its scan and
+// to the changes its watcher sees.
+#[test]
+fn an_index_below_the_work_tree_root_applies_its_rules() {
+    let tmp = TempDir::new().unwrap();
+    let repo = fff_search::path_utils::canonicalize(tmp.path()).unwrap();
+    git2::Repository::init(&repo).unwrap();
+    fs::write(repo.join(".gitignore"), "node_modules/\n*.log\n").unwrap();
+    let base = repo.join("pkg");
+    seed(&base);
+    fs::create_dir_all(base.join("node_modules/dep")).unwrap();
+    fs::write(base.join("node_modules/dep/index.js"), "js").unwrap();
+    fs::write(base.join("old.log"), "log").unwrap();
+    let (picker, _frecency) = make_watched_picker(&base);
+    let indexed = |path: &Path| {
+        let guard = picker.read().unwrap();
+        (guard.as_ref().unwrap().get_file_by_path(path)).is_some_and(|file| !file.is_deleted())
+    };
+    assert!(indexed(&base.join("src/main.rs")));
+    assert!(!indexed(&base.join("old.log")));
+    assert!(!indexed(&base.join("node_modules/dep/index.js")));
+
+    let events = watch_collect(&picker, "", WatchOptions::default());
+    fs::write(base.join("node_modules/dep/added.js"), "js").unwrap();
+    fs::write(base.join("noise.log"), "log").unwrap();
+    fs::write(base.join("visible.txt"), "txt").unwrap();
+    assert!(
+        wait_for(
+            || events
+                .lock()
+                .iter()
+                .any(|e| e.path == base.join("visible.txt")),
+            Duration::from_secs(10)
+        ),
+        "non-ignored file must be delivered, got {:?}",
+        events.lock()
+    );
+    std::thread::sleep(Duration::from_millis(500));
+    let collected = events.lock();
+    assert!(
+        collected
+            .iter()
+            .all(|e| e.path.ends_with("visible.txt") || e.path.ends_with(".gitignore")),
+        "files the repository ignores must not be delivered: {collected:?}"
+    );
+    assert!(!indexed(&base.join("noise.log")));
+    assert!(!indexed(&base.join("node_modules/dep/added.js")));
+}
+
 #[test]
 fn dir_subscription_with_ignore_option() {
     let tmp = TempDir::new().unwrap();

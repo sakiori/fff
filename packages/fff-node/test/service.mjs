@@ -674,8 +674,9 @@ describe("FileFinder over the shared service", { concurrency: 1 }, () => {
     assert.deepEqual(await logs(), ["keep-initial.log", "sub/keep-sub.log"]);
     assert.deepEqual(await logs(plain), []);
 
-    // The rules are relative to the directory a session names, so it gets an index of its own.
-    const nested = await open(join(dir, "sub"), { extraIgnore: ["keep-*.log"] });
+    // The rules are relative to the directory a session names, so it gets an index of its own,
+    // which still applies the repository's rules above it.
+    const nested = await open(join(dir, "sub"), { extraIgnore: ["/generated/"] });
     assert.deepEqual(await logs(nested), []);
     const [service] = namespace.status().services;
     const roots = (scope) =>

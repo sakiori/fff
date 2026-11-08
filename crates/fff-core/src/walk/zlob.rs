@@ -38,6 +38,11 @@ pub(crate) fn walk_collect_files(
     if use_non_git_defaults {
         flags |= WalkFlags::SKIP_HIDDEN;
     }
+    // A root below its work tree's root inherits the rules above it, as the ripgrep walker
+    // does; zlob would list nothing in an ignored root, so that one walks on its own rules.
+    if is_git_repo && !ignore_options.disable_git && !root_is_ignored(base_path) {
+        flags |= WalkFlags::GITIGNORE_PARENTS;
+    }
     if follow_symlinks {
         flags |= WalkFlags::FOLLOW_SYMLINKS;
     }
@@ -185,4 +190,9 @@ pub(crate) fn walk_collect_files(
         dirs,
         ignore_rules,
     })
+}
+
+fn root_is_ignored(base_path: &Path) -> bool {
+    git2::Repository::discover(base_path)
+        .is_ok_and(|repo| repo.workdir().is_some() && repo.is_path_ignored(base_path) == Ok(true))
 }
