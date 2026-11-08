@@ -1,4 +1,4 @@
 # Building zlob requires Zig. Keep this pin equal to the version upstream's
 # setup-zig workflow steps and flake.nix use.
 [tools]
-zig = "0.16.0"
+zig = "0.17.1"

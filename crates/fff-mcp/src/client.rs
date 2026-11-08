@@ -78,6 +78,9 @@ fn index_options(args: &crate::Args) -> io::Result<IndexOptions> {
             .transpose()?,
         enable_home_scan: args.enable_home_scan,
         enable_root_scan: args.enable_root_scan,
+        extra_ignore: Vec::new(),
+        disable_git: false,
+        disable_ignore_files: false,
     })
 }
 

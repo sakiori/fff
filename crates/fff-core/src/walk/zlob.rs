@@ -3,7 +3,7 @@ use crate::file_picker::{
 };
 use crate::ignore::ignored_dir_globs;
 use crate::types::FileItem;
-use crate::walk::{DirHook, WalkIgnoreRules, WalkOutput};
+use crate::walk::{DirHook, WalkIgnoreRules, WalkOutput, WalkPolicy};
 use parking_lot::Mutex;
 use std::path::Path;
 use std::sync::Arc;
@@ -18,15 +18,24 @@ pub(crate) fn walk_collect_files(
     base_path: &Path,
     subtree: Option<&Path>,
     is_git_repo: bool,
-    follow_symlinks: bool,
+    policy: WalkPolicy<'_>,
     threads: usize,
     synced_files_count: &Arc<AtomicUsize>,
     on_dir: Option<&DirHook>,
 ) -> crate::Result<WalkOutput> {
-    // gitignore on; skip hidden on non-git roots (so `~/` doesn't recurse into
-    // ~/.cache, ~/.config, etc.); optionally follow symlinks.
+    let WalkPolicy {
+        follow_symlinks,
+        ignore: ignore_options,
+    } = policy;
+    let use_non_git_defaults = !is_git_repo && !ignore_options.disable_git;
     let mut flags = WalkFlags::GITIGNORE;
-    if !is_git_repo {
+    if ignore_options.disable_git {
+        flags |= WalkFlags::SKIP_GITIGNORE | WalkFlags::NO_GIT_EXCLUDE | WalkFlags::NO_GIT_GLOBAL;
+    }
+    if ignore_options.disable_ignore_files {
+        flags |= WalkFlags::SKIP_DOT_IGNORE;
+    }
+    if use_non_git_defaults {
         flags |= WalkFlags::SKIP_HIDDEN;
     }
     if follow_symlinks {
@@ -41,11 +50,16 @@ pub(crate) fn walk_collect_files(
         // Bulk-fetch the only metadata FileItem needs; zlob never stats more.
         .metadata(WalkMetadata::SIZE | WalkMetadata::MTIME | WalkMetadata::INODE);
 
-    if !is_git_repo && let Err(e) = builder.extra_ignore(&ignored_dir_globs().collect::<Vec<_>>()) {
-        // Interior NUL in one of the extra_ignore patterns would fail
-        // here — treat as if no extras were supplied rather than
-        // aborting the whole walk.
-        tracing::warn!(?e, "zlob extra_ignore rejected; walking without it");
+    let extra_ignore = &ignore_options.extra_ignore;
+    if use_non_git_defaults || !extra_ignore.is_empty() {
+        let defaults = use_non_git_defaults
+            .then(ignored_dir_globs)
+            .into_iter()
+            .flatten();
+        let rules: Vec<String> = defaults.chain(extra_ignore.iter().cloned()).collect();
+        builder
+            .extra_ignore(&rules)
+            .map_err(|e| crate::Error::WalkFailed(format!("invalid extra ignore rules: {e:?}")))?;
     }
 
     // Single lock for both collections: every entry is either a file or a
@@ -56,6 +70,10 @@ pub(crate) fn walk_collect_files(
         .map(|subtree| super::subtree_relative(base_path, subtree))
         .transpose()?;
     let outcome = match builder.run(|entry| {
+        if ignore_options.disable_git && entry.path().file_name().is_some_and(|name| name == ".git")
+        {
+            return WalkState::SkipDir;
+        }
         let relative_path = entry.relative_path_lossy();
         if let Some(subtree) = subtree {
             let path = Path::new(relative_path.as_ref());

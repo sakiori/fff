@@ -10,7 +10,7 @@ use tokio::sync::Notify;
 use fff_service::protocol::{IndexOptions, IndexStatus, ServiceError, SessionKind, SessionStatus};
 
 use crate::service::Lease;
-use crate::shared_index::{Index, IndexKey, RepositoryProbe, allows_root, upgrade};
+use crate::shared_index::{Index, IndexKey, RepositoryProbe, allows_root, same_file_set, upgrade};
 
 // Upper bound for a tool call waiting on an index that is still being built.
 const INDEX_READY_TIMEOUT: Duration = Duration::from_secs(30);
@@ -97,7 +97,7 @@ impl Registry {
             if !allows_root(&policy, &canonical) {
                 return Err(ServiceError::ScopeRefused { path: canonical });
             }
-            let probe = RepositoryProbe::discover(&canonical);
+            let probe = RepositoryProbe::discover(&canonical, &policy);
             Ok((canonical, probe))
         })
         .await
@@ -172,7 +172,11 @@ impl Registry {
             .collect();
         let selection = {
             let scope = scope.to_path_buf();
-            let root = repository.clone().unwrap_or_else(|| scope.clone());
+            // Extra ignore rules are relative to the scope, so its index is rooted there.
+            let root = match &repository {
+                Some(repository) if options.extra_ignore.is_empty() => repository.clone(),
+                _ => scope.clone(),
+            };
             let options = options.clone();
             tokio::task::spawn_blocking(move || {
                 let root = if allows_root(&options, &root) {
@@ -209,7 +213,7 @@ impl Registry {
             if !kept.iter().any(|kept| Arc::ptr_eq(kept, &index))
                 && index.root == root
                 && index.repository == repository
-                && index.options.follow_symlinks == options.follow_symlinks
+                && same_file_set(&index.options, &options)
                 && index.options.frecency_db == options.frecency_db
             {
                 upgrade(&mut options, &index.options);

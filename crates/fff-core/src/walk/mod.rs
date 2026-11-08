@@ -5,6 +5,7 @@
 //! Both expose [`walk_collect_files`] with identical semantics so the rest of
 //! the crate stays backend-agnostic, including walks limited to a subtree.
 
+use crate::file_picker::FilePickerIgnoreOptions;
 use crate::types::FileItem;
 use std::path::Path;
 use std::sync::Arc;
@@ -30,6 +31,13 @@ fn subtree_relative<'a>(base_path: &Path, subtree: &'a Path) -> crate::Result<&'
             base_path.display()
         ))
     })
+}
+
+// What every walk of an index keeps besides the repository's own rules.
+#[derive(Clone, Copy)]
+pub(crate) struct WalkPolicy<'a> {
+    pub(crate) follow_symlinks: bool,
+    pub(crate) ignore: &'a FilePickerIgnoreOptions,
 }
 
 /// Receives the absolute path of every directory the walk reports, before the
@@ -89,10 +97,11 @@ impl WalkIgnoreRules {
 
 #[cfg(test)]
 mod tests {
-    use super::walk_collect_files;
+    use super::{WalkPolicy, walk_collect_files};
+    use crate::file_picker::FilePickerIgnoreOptions;
     use std::fs;
-    use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Arc, LazyLock};
 
     // Backend-agnostic parity check: both the zlob and ripgrep walkers must
     // respect .gitignore, skip hidden files in a git repo, and surface the
@@ -111,7 +120,7 @@ mod tests {
         fs::write(root.join("target/out.bin"), "bin").unwrap();
 
         let counter = Arc::new(AtomicUsize::new(0));
-        let out = walk_collect_files(root, None, true, false, 1, &counter, None).unwrap();
+        let out = walk_collect_files(root, None, true, policy(false), 1, &counter, None).unwrap();
 
         let mut names: Vec<String> = out.pairs.into_iter().map(|(_, rel)| rel).collect();
         names.sort();
@@ -135,7 +144,7 @@ mod tests {
         fs::write(root.join("index.js"), "x").unwrap();
 
         let counter = Arc::new(AtomicUsize::new(0));
-        let out = walk_collect_files(root, None, false, false, 1, &counter, None).unwrap();
+        let out = walk_collect_files(root, None, false, policy(false), 1, &counter, None).unwrap();
         let names: Vec<String> = out.pairs.into_iter().map(|(_, rel)| rel).collect();
 
         assert!(names.iter().any(|n| n.ends_with("index.js")));
@@ -161,7 +170,7 @@ mod tests {
             root,
             Some(&root.join("sub")),
             true,
-            false,
+            policy(false),
             1,
             &counter,
             None,
@@ -183,7 +192,7 @@ mod tests {
             dir.path(),
             Some(other.path()),
             false,
-            false,
+            policy(false),
             1,
             &counter,
             None,
@@ -218,8 +227,16 @@ mod tests {
                 })
             };
             let counter = Arc::new(AtomicUsize::new(0));
-            let out = walk_collect_files(root, None, true, false, threads, &counter, Some(&hook))
-                .unwrap();
+            let out = walk_collect_files(
+                root,
+                None,
+                true,
+                policy(false),
+                threads,
+                &counter,
+                Some(&hook),
+            )
+            .unwrap();
             let mut names: Vec<String> = out.pairs.into_iter().map(|(_, rel)| rel).collect();
             names.sort();
             assert_eq!(
@@ -241,8 +258,16 @@ mod tests {
 
             seen.lock().clear();
             let subtree = root.join("a/b");
-            walk_collect_files(root, Some(&subtree), true, false, 1, &counter, Some(&hook))
-                .unwrap();
+            walk_collect_files(
+                root,
+                Some(&subtree),
+                true,
+                policy(false),
+                1,
+                &counter,
+                Some(&hook),
+            )
+            .unwrap();
             assert_eq!(*seen.lock(), [std::path::Path::new("a/b")]);
         }
     }
@@ -265,7 +290,7 @@ mod tests {
         std::os::unix::fs::symlink("../dotfiles/missing", root.join("broken")).unwrap();
 
         let counter = Arc::new(AtomicUsize::new(0));
-        let out = walk_collect_files(&root, None, false, true, 1, &counter, None).unwrap();
+        let out = walk_collect_files(&root, None, false, policy(true), 1, &counter, None).unwrap();
         let mut names: Vec<String> = out.pairs.iter().map(|(_, rel)| rel.clone()).collect();
         names.sort();
 
@@ -276,7 +301,7 @@ mod tests {
         assert_eq!(item.size, 10);
         assert_eq!(&rel[item.filename_offset_in_relative_path()..], "sesh.toml");
 
-        let out = walk_collect_files(&root, None, false, false, 1, &counter, None).unwrap();
+        let out = walk_collect_files(&root, None, false, policy(false), 1, &counter, None).unwrap();
         let names: Vec<String> = out.pairs.into_iter().map(|(_, rel)| rel).collect();
         assert_eq!(names, ["projects.toml"]);
     }
@@ -295,11 +320,198 @@ mod tests {
         fs::write(root.join("Cargo.toml"), "x").unwrap();
 
         let counter = Arc::new(AtomicUsize::new(0));
-        let out = walk_collect_files(root, None, true, false, 1, &counter, None).unwrap();
+        let out = walk_collect_files(root, None, true, policy(false), 1, &counter, None).unwrap();
 
         let rules = out.ignore_rules.expect("zlob surfaces ignore rules");
         assert!(rules.is_ignored(Path::new("target/")));
         assert!(rules.is_ignored(Path::new("debug.log")));
         assert!(!rules.is_ignored(Path::new("Cargo.toml")));
+    }
+
+    // Both backends must honor `info/exclude`, which linked worktrees read from
+    // the common git dir (#982).
+    #[test]
+    fn honors_git_info_exclude() {
+        use std::path::Path;
+        use std::process::Command;
+
+        let git = |dir: &Path, args: &[&str]| {
+            let status = Command::new("git")
+                .args(args)
+                .current_dir(dir)
+                .env("GIT_AUTHOR_NAME", "t")
+                .env("GIT_AUTHOR_EMAIL", "t@t")
+                .env("GIT_COMMITTER_NAME", "t")
+                .env("GIT_COMMITTER_EMAIL", "t@t")
+                .status()
+                .unwrap();
+            assert!(status.success(), "git {args:?}");
+        };
+
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("repo");
+        fs::create_dir_all(root.join("src")).unwrap();
+        fs::create_dir_all(root.join("excluded")).unwrap();
+        fs::write(root.join("src/a.txt"), "a").unwrap();
+        fs::write(root.join(".gitignore"), "*.log\n").unwrap();
+        git(&root, &["init", "-q"]);
+        git(&root, &["add", "."]);
+        git(&root, &["commit", "-q", "-m", "init"]);
+        fs::write(root.join("excluded/b.txt"), "b").unwrap();
+        fs::write(root.join(".git/info/exclude"), "# comment\nexcluded/\n").unwrap();
+
+        let worktree = dir.path().join("wt");
+        git(
+            &root,
+            &["worktree", "add", "-q", worktree.to_str().unwrap()],
+        );
+        fs::create_dir_all(worktree.join("excluded")).unwrap();
+        fs::write(worktree.join("excluded/c.txt"), "c").unwrap();
+
+        for base in [&root, &worktree] {
+            let counter = Arc::new(AtomicUsize::new(0));
+            let out =
+                walk_collect_files(base, None, true, policy(false), 1, &counter, None).unwrap();
+            let names: Vec<String> = out.pairs.iter().map(|(_, rel)| rel.clone()).collect();
+
+            assert!(names.iter().any(|n| n == "src/a.txt"), "{names:?}");
+            assert!(
+                !names.iter().any(|n| n.starts_with("excluded")),
+                "{names:?}"
+            );
+
+            // The watcher filters incremental updates with these rules.
+            #[cfg(feature = "zlob")]
+            {
+                let rules = out.ignore_rules.expect("zlob surfaces ignore rules");
+                assert!(rules.is_ignored(Path::new("excluded/later/new.txt")));
+                assert!(rules.is_ignored(Path::new("debug.log")));
+                assert!(!rules.is_ignored(Path::new("src/a.txt")));
+            }
+        }
+    }
+
+    // zlob 1.8 reads core.excludesFile below the root .gitignore, as git does (#874).
+    #[cfg(feature = "zlob")]
+    #[test]
+    fn honors_git_excludes_file_with_git_precedence() {
+        use std::process::Command;
+
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        fs::create_dir_all(root.join("src")).unwrap();
+        fs::create_dir_all(root.join(".worktrees/wt1")).unwrap();
+        fs::write(root.join("src/hit.ts"), "x").unwrap();
+        fs::write(root.join(".worktrees/wt1/hit.ts"), "x").unwrap();
+        fs::write(root.join("drop.tmp"), "x").unwrap();
+        fs::write(root.join("keep.tmp"), "x").unwrap();
+        fs::write(root.join(".gitignore"), "!keep.tmp\n").unwrap();
+
+        let excludes = dir.path().join("excludes");
+        fs::write(&excludes, "# comment\n.worktrees/\n*.tmp\nexcludes\n").unwrap();
+        for args in [
+            vec!["init", "-q"],
+            vec!["config", "core.excludesFile", excludes.to_str().unwrap()],
+        ] {
+            let status = Command::new("git")
+                .args(args)
+                .current_dir(root)
+                .status()
+                .unwrap();
+            assert!(status.success());
+        }
+
+        let counter = Arc::new(AtomicUsize::new(0));
+        let out = walk_collect_files(root, None, true, policy(false), 1, &counter, None).unwrap();
+        let names: Vec<String> = out.pairs.iter().map(|(_, rel)| rel.clone()).collect();
+
+        assert!(names.iter().any(|n| n == "src/hit.ts"), "{names:?}");
+        assert!(names.iter().any(|n| n == "keep.tmp"), "{names:?}");
+        assert!(!names.iter().any(|n| n == "drop.tmp"), "{names:?}");
+        assert!(!names.iter().any(|n| n.contains(".worktrees")), "{names:?}");
+
+        // The watcher filters incremental updates with these rules.
+        let rules = out.ignore_rules.expect("zlob surfaces ignore rules");
+        assert!(rules.is_ignored(std::path::Path::new(".worktrees/wt1/new.ts")));
+        assert!(!rules.is_ignored(std::path::Path::new("src/hit.ts")));
+    }
+
+    // disable_git must also turn off the git exclude files, not only .gitignore.
+    #[cfg(feature = "zlob")]
+    #[test]
+    fn disable_git_skips_every_git_ignore_source() {
+        use std::process::Command;
+
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("repo");
+        fs::create_dir_all(&root).unwrap();
+        for name in ["from-gitignore", "from-exclude", "from-global", "from-dot"] {
+            fs::write(root.join(name), "x").unwrap();
+        }
+        fs::write(root.join(".gitignore"), "from-gitignore\n").unwrap();
+        fs::write(root.join(".ignore"), "from-dot\n").unwrap();
+        let excludes = dir.path().join("excludes");
+        fs::write(&excludes, "from-global\n").unwrap();
+
+        for args in [
+            vec!["init", "-q"],
+            vec!["config", "core.excludesFile", excludes.to_str().unwrap()],
+        ] {
+            let status = Command::new("git")
+                .args(args)
+                .current_dir(&root)
+                .status()
+                .unwrap();
+            assert!(status.success());
+        }
+        fs::write(root.join(".git/info/exclude"), "from-exclude\n").unwrap();
+
+        let walk = |disable_git| -> Vec<String> {
+            let options = FilePickerIgnoreOptions {
+                disable_git,
+                ..Default::default()
+            };
+            let counter = Arc::new(AtomicUsize::new(0));
+            walk_collect_files(
+                &root,
+                None,
+                true,
+                WalkPolicy {
+                    follow_symlinks: false,
+                    ignore: &options,
+                },
+                1,
+                &counter,
+                None,
+            )
+            .unwrap()
+            .pairs
+            .into_iter()
+            .map(|(_, rel)| rel)
+            .collect()
+        };
+
+        let enabled = walk(false);
+        for name in ["from-gitignore", "from-exclude", "from-global", "from-dot"] {
+            assert!(!enabled.iter().any(|n| n == name), "{name}: {enabled:?}");
+        }
+
+        let disabled = walk(true);
+        for name in ["from-gitignore", "from-exclude", "from-global"] {
+            assert!(disabled.iter().any(|n| n == name), "{name}: {disabled:?}");
+        }
+        assert!(!disabled.iter().any(|n| n == "from-dot"), "{disabled:?}");
+        assert!(
+            !disabled.iter().any(|n| n.starts_with(".git/")),
+            "{disabled:?}"
+        );
+    }
+
+    fn policy(follow_symlinks: bool) -> WalkPolicy<'static> {
+        static NO_RULES: LazyLock<FilePickerIgnoreOptions> = LazyLock::new(Default::default);
+        WalkPolicy {
+            follow_symlinks,
+            ignore: &NO_RULES,
+        }
     }
 }

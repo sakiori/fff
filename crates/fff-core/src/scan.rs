@@ -6,14 +6,16 @@ use tracing::{error, info, warn};
 
 use crate::FileSync;
 use crate::error::Error;
-use crate::file_picker::FFFMode;
+use crate::file_picker::{FFFMode, FilePickerIgnoreOptions};
 use crate::git::GitDiscovery;
 use crate::index::{build_bigram_index, sniff_binary_for_non_indexable};
 use crate::parallelism::BACKGROUND_THREAD_POOL;
 use crate::rescan_stats::RescanReason;
 use crate::shared::{SharedFilePicker, SharedFrecency};
 use crate::types::ContentCacheBudget;
-use crate::watch::{BackgroundWatcher, Released, handle_debounced_events, request_recovery_rescan};
+use crate::watch::{
+    BackgroundWatcher, Released, WatcherOptions, handle_debounced_events, request_recovery_rescan,
+};
 
 #[derive(Clone, Default)]
 pub(crate) struct ScanSignals {
@@ -99,7 +101,7 @@ impl BackgroundStatus {
 }
 
 /// Which optional phases a scan should run.
-#[derive(Clone, Copy, Default, Debug)]
+#[derive(Clone, Default, Debug)]
 pub(crate) struct ScanConfig {
     pub(crate) warmup: bool,
     pub(crate) content_indexing: bool,
@@ -107,8 +109,21 @@ pub(crate) struct ScanConfig {
     pub(crate) auto_cache_budget: bool,
     pub(crate) install_watcher: bool,
     pub(crate) follow_symlinks: bool,
+    pub(crate) ignore_options: FilePickerIgnoreOptions,
     pub(crate) enable_fs_root_scanning: bool,
     pub(crate) enable_home_dir_scanning: bool,
+}
+
+impl ScanConfig {
+    fn watcher_options(&self, mode: FFFMode) -> WatcherOptions {
+        WatcherOptions {
+            mode,
+            follow_symlinks: self.follow_symlinks,
+            ignore_options: self.ignore_options.clone(),
+            enable_fs_root_scanning: self.enable_fs_root_scanning,
+            enable_home_dir_scanning: self.enable_home_dir_scanning,
+        }
+    }
 }
 
 /// A fully-configured scan job ready to run on a background thread.
@@ -198,6 +213,7 @@ impl ScanJob {
             auto_cache_budget: !picker.has_explicit_cache_budget(),
             install_watcher: false, // the watcher is independent of rescan, it is not restarting EVER
             follow_symlinks: picker.follows_symlinks(),
+            ignore_options: picker.ignore_options().clone(),
             enable_fs_root_scanning: picker.fs_root_scanning_enabled(),
             enable_home_dir_scanning: picker.home_dir_scanning_enabled(),
         };
@@ -279,7 +295,7 @@ impl ScanJob {
         let mut watcher_install =
             WatcherInstallGuard::new(&signals, config.install_watcher && config.watch);
         scanned_files_counter.store(0, Ordering::Relaxed);
-        let git = FileSync::discover_git(&base_path);
+        let git = FileSync::discover_git(&base_path, config.ignore_options.disable_git);
         let git_workdir = git.as_ref().map(|git| git.workdir.clone());
 
         // 1. Subscribe before walking. Events arriving from now on are held until
@@ -326,7 +342,10 @@ impl ScanJob {
             &scanned_files_counter,
             &shared_frecency,
             mode,
-            config.follow_symlinks,
+            crate::walk::WalkPolicy {
+                follow_symlinks: config.follow_symlinks,
+                ignore: &config.ignore_options,
+            },
             dir_hook.as_ref(),
         ) {
             Ok(sync) => sync,
@@ -335,7 +354,12 @@ impl ScanJob {
                 if config.install_watcher {
                     Self::remove_watcher(&shared_picker, &base_path, &signals);
                 } else if let Some(held_events) = held_events {
-                    held_events.replay(&shared_frecency, &base_path, &git_workdir, mode);
+                    held_events.replay(
+                        &shared_frecency,
+                        &base_path,
+                        &git_workdir,
+                        &config.watcher_options(mode),
+                    );
                 }
                 return;
             }
@@ -346,6 +370,7 @@ impl ScanJob {
 
         // 3. Populate the file list
         let git_status_worker;
+        let previous;
         if let Ok(mut guard) = shared_picker.write()
             && let Some(picker) = guard.as_mut()
         {
@@ -355,7 +380,7 @@ impl ScanJob {
             }
 
             let live_count = sync.live_count;
-            picker.commit_new_sync(sync);
+            previous = picker.commit_new_sync(sync);
             git_status_worker = Arc::clone(&picker.git_status_worker);
 
             if config.auto_cache_budget && !picker.has_explicit_cache_budget() {
@@ -374,7 +399,12 @@ impl ScanJob {
         }
 
         if let Some(held_events) = held_events {
-            held_events.replay(&shared_frecency, &base_path, &git_workdir, mode);
+            held_events.replay(
+                &shared_frecency,
+                &base_path,
+                &git_workdir,
+                &config.watcher_options(mode),
+            );
         }
 
         // 4. Every change since the walk began is now indexed or queued behind the
@@ -404,11 +434,24 @@ impl ScanJob {
 
         signals.scanning.store(false, Ordering::Relaxed); // file are searchable
 
+        // The post scan skips files the previous index already read as text and that did not change
+        let known_text = shared_picker
+            .read()
+            .ok()
+            .and_then(|guard| {
+                guard
+                    .as_ref()
+                    .filter(|picker| picker.base_path() == base_path)
+                    .map(|picker| picker.unchanged_text_files(&previous))
+            })
+            .unwrap_or_default();
+        drop(previous);
+
         // 5. Runs post scna in parallel with git status collection
         if !signals.cancelled.load(Ordering::Acquire)
             && let Some(snap) = snapshot.as_ref()
         {
-            Self::run_post_scan(&shared_picker, &signals, &config, snap);
+            Self::run_post_scan(&shared_picker, &signals, &config, snap, &known_text);
         }
 
         drop(snapshot); // SNAPSHOT SHOULD NOT BE USED AFTER THIS POINT
@@ -438,9 +481,7 @@ impl ScanJob {
             git.clone(),
             shared_picker.clone(),
             shared_frecency.clone(),
-            mode,
-            config.enable_fs_root_scanning,
-            config.enable_home_dir_scanning,
+            config.watcher_options(mode),
             git_status_worker,
             tracing::Span::current(),
         ) {
@@ -483,6 +524,7 @@ impl ScanJob {
         signals: &ScanSignals,
         config: &ScanConfig,
         unsafe_snapshot: &crate::file_picker::PostScanUnsafeSnapshot,
+        known_text: &[u64],
     ) {
         let Some(arena) = unsafe_snapshot
             .arena // we are never touching overlays so this arena is always correct
@@ -521,6 +563,8 @@ impl ScanJob {
             if !signals.cancelled.load(Ordering::Acquire) {
                 sniff_binary_for_non_indexable(
                     non_indexable_files,
+                    indexable_count,
+                    known_text,
                     &unsafe_snapshot.base_path,
                     arena,
                     &signals.cancelled,
@@ -530,6 +574,8 @@ impl ScanJob {
             // this potentially a long running as we are not parallelizing it but it's okay
             sniff_binary_for_non_indexable(
                 files,
+                0,
+                known_text,
                 &unsafe_snapshot.base_path,
                 arena,
                 &signals.cancelled,
@@ -566,7 +612,7 @@ impl<'a> HeldEvents<'a> {
         shared_frecency: &SharedFrecency,
         base_path: &Path,
         git_workdir: &Option<PathBuf>,
-        mode: FFFMode,
+        options: &WatcherOptions,
     ) {
         let shared_picker = self.shared_picker;
         let Some(git_status_worker) = shared_picker.read().ok().and_then(|guard| {
@@ -592,7 +638,7 @@ impl<'a> HeldEvents<'a> {
                 }
             };
             let new_dirs = handle_debounced_events(
-                mode,
+                options,
                 events,
                 base_path,
                 git_workdir,
@@ -1151,10 +1197,11 @@ mod tests {
             auto_cache_budget: false,
             install_watcher: false,
             follow_symlinks: false,
+            ignore_options: Default::default(),
             enable_fs_root_scanning: false,
             enable_home_dir_scanning: false,
         };
-        ScanJob::run_post_scan(&shared, &signals, &config, &snapshot);
+        ScanJob::run_post_scan(&shared, &signals, &config, &snapshot, &[]);
         drop(snapshot);
         drop(old);
 

@@ -1,6 +1,6 @@
 use crate::ignore::non_git_repo_overrides;
 use crate::types::FileItem;
-use crate::walk::{DirHook, WalkOutput};
+use crate::walk::{DirHook, WalkOutput, WalkPolicy};
 use crate::watch::is_git_file;
 use ignore::WalkBuilder;
 use std::path::Path;
@@ -14,11 +14,18 @@ pub(crate) fn walk_collect_files(
     base_path: &Path,
     subtree: Option<&Path>,
     is_git_repo: bool,
-    follow_symlinks: bool,
+    policy: WalkPolicy<'_>,
     threads: usize,
     synced_files_count: &Arc<AtomicUsize>,
     on_dir: Option<&DirHook>,
 ) -> crate::Result<WalkOutput> {
+    let ignore = policy.ignore;
+    if !ignore.extra_ignore.is_empty() || ignore.disable_git || ignore.disable_ignore_files {
+        return Err(crate::Error::WalkFailed(
+            "ignore options require the zlob walker".into(),
+        ));
+    }
+    let follow_symlinks = policy.follow_symlinks;
     let mut walk_builder = WalkBuilder::new(base_path);
     walk_builder
         // this is a very important guard for the user opening ~/ or other root non-git dir

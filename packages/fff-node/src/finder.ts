@@ -261,6 +261,9 @@ export class FileFinder {
         options.enableFsRootScanning ?? false,
         options.enableHomeDirScanning ?? false,
         options.followSymlinks ?? false,
+        options.extraIgnore?.join("\n") ?? "",
+        options.disableGit ?? false,
+        options.disableIgnoreFiles ?? false,
         options.serviceDir ?? "",
         timeoutMs,
       );

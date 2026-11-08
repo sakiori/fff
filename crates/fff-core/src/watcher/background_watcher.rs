@@ -2,13 +2,13 @@ use super::dir_walk::{DirWalk, ReplacedDirs};
 use super::ref_watches::{RefChanges, RefWatches};
 use crate::constants::MAX_OVERFLOW_FILES;
 use crate::error::Error;
-use crate::file_picker::{FFFMode, FilePicker, IndexUpdateError};
+use crate::file_picker::{FFFMode, FilePicker, FilePickerIgnoreOptions, IndexUpdateError};
 use crate::git::GitDiscovery;
 use crate::git_status_worker::GitStatusWorker;
 use crate::rescan_stats::RescanReason;
 use crate::shared::{RescanRequest, SharedFilePicker, SharedFrecency};
 use crate::sort_buffer::sort_with_buffer;
-use crate::walk::DirHook;
+use crate::walk::{DirHook, WalkPolicy};
 use crate::watch::{RawWatchEvent, WatchEventKind};
 use git2::Repository;
 use notify::event::{AccessKind, AccessMode, ModifyKind, RemoveKind, RenameMode};
@@ -114,6 +114,8 @@ pub(crate) struct Watches {
     base_path: PathBuf,
     // Set when the index's first walk begins; what a stream misses before, the walk reads.
     walking: AtomicBool,
+    // False for an index without Git integration, which follows no repository's state.
+    follows_git: bool,
 }
 
 // The tree's stream, and on FSEvents one for the paths outside the tree. FSEvents restarts a
@@ -232,6 +234,27 @@ impl Watches {
     }
 }
 
+#[derive(Clone, Default)]
+pub(crate) struct WatcherOptions {
+    pub(crate) mode: FFFMode,
+    pub(crate) follow_symlinks: bool,
+    pub(crate) ignore_options: FilePickerIgnoreOptions,
+    pub(crate) enable_fs_root_scanning: bool,
+    pub(crate) enable_home_dir_scanning: bool,
+}
+
+impl WatcherOptions {
+    pub(crate) fn of(picker: &FilePicker) -> Self {
+        Self {
+            mode: picker.mode(),
+            follow_symlinks: picker.follows_symlinks(),
+            ignore_options: picker.ignore_options().clone(),
+            enable_fs_root_scanning: picker.fs_root_scanning_enabled(),
+            enable_home_dir_scanning: picker.home_dir_scanning_enabled(),
+        }
+    }
+}
+
 enum WatchTask {
     /// This is requires a separate walk of the new directory copies or created within a scan
     /// window because it might contain subdirectories we have to walk, prune, and add to index
@@ -256,15 +279,12 @@ const MAX_CONSECUTIVE_WATCH_FAILURES: usize = 16;
 const AI_MODE_COOLDOWN_SECS: u64 = 5 * 60;
 
 impl BackgroundWatcher {
-    #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
         base_path: PathBuf,
         git: Option<GitDiscovery>,
         shared_picker: SharedFilePicker,
         shared_frecency: SharedFrecency,
-        mode: FFFMode,
-        enable_fs_root_scanning: bool,
-        enable_home_dir_scanning: bool,
+        options: WatcherOptions,
         git_status_worker: Arc<GitStatusWorker>,
         trace_span: tracing::Span,
     ) -> Result<Self, Error> {
@@ -272,14 +292,14 @@ impl BackgroundWatcher {
         info!(
             "Initializing background watcher for path: {}, mode: {:?}",
             base_path.display(),
-            mode,
+            options.mode,
         );
 
         // Root and home watching are error prone; consumers must opt in explicitly.
         crate::path_utils::validate_base_path(
             &base_path,
-            enable_fs_root_scanning,
-            enable_home_dir_scanning,
+            options.enable_fs_root_scanning,
+            options.enable_home_dir_scanning,
         )?;
 
         // macOS: always use a single recursive FSEvent stream.
@@ -327,26 +347,27 @@ impl BackgroundWatcher {
                 git_workdir.clone(),
                 shared_picker.clone(),
                 shared_frecency.clone(),
+                options.clone(),
                 watch_tx_for_debouncer.clone(),
                 Arc::clone(&git_status_worker),
             )
         };
         let mut tree = match poll_interval {
             None => {
-                let (base, workdir, picker, frecency, tx, worker) = handler();
+                let (base, workdir, picker, frecency, options, tx, worker) = handler();
                 Debouncer::Native(Self::create_debouncer(
-                    base, workdir, picker, frecency, mode, tx, worker, None,
+                    base, workdir, picker, frecency, options, tx, worker, None,
                 )?)
             }
             Some(interval) => {
                 info!(?interval, "File watcher uses the polling backend");
-                let (base, workdir, picker, frecency, tx, worker) = handler();
+                let (base, workdir, picker, frecency, options, tx, worker) = handler();
                 Debouncer::Poll(Self::create_debouncer(
                     base,
                     workdir,
                     picker,
                     frecency,
-                    mode,
+                    options,
                     tx,
                     worker,
                     Some(interval),
@@ -355,9 +376,9 @@ impl BackgroundWatcher {
         };
         let mut outside = match fsevents {
             true => {
-                let (base, workdir, picker, frecency, tx, worker) = handler();
+                let (base, workdir, picker, frecency, options, tx, worker) = handler();
                 Some(Debouncer::Native(Self::create_debouncer(
-                    base, workdir, picker, frecency, mode, tx, worker, None,
+                    base, workdir, picker, frecency, options, tx, worker, None,
                 )?))
             }
             false => None,
@@ -407,6 +428,7 @@ impl BackgroundWatcher {
             git_status: Arc::clone(&owner_git_worker),
             base_path: base_path.clone(),
             walking: AtomicBool::new(false),
+            follows_git: !options.ignore_options.disable_git,
         });
         let owner_watches = Arc::clone(&watches);
 
@@ -514,7 +536,7 @@ impl BackgroundWatcher {
         git_workdir: Option<PathBuf>,
         shared_picker: SharedFilePicker,
         shared_frecency: SharedFrecency,
-        mode: FFFMode,
+        options: WatcherOptions,
         watch_tx: mpsc::Sender<WatchTask>,
         git_status_worker: Arc<GitStatusWorker>,
         poll_interval: Option<Duration>,
@@ -547,7 +569,7 @@ impl BackgroundWatcher {
                         };
 
                         let new_dirs = handle_debounced_events(
-                            mode,
+                            &options,
                             events,
                             &base_path_for_handler,
                             &git_workdir_for_handler,
@@ -660,11 +682,11 @@ pub(crate) fn apply_reported_changes(
     shared_frecency: &SharedFrecency,
     paths: Vec<PathBuf>,
 ) -> bool {
-    let Some((mode, base_path, git_workdir, git_status_worker, follow_symlinks)) =
+    let Some((options, base_path, git_workdir, git_status_worker, follow_symlinks)) =
         shared_picker.read().ok().and_then(|guard| {
             guard.as_ref().map(|picker| {
                 (
-                    picker.mode(),
+                    WatcherOptions::of(picker),
                     picker.base_path().to_path_buf(),
                     picker.git_root().map(Path::to_path_buf),
                     Arc::clone(&picker.git_status_worker),
@@ -695,7 +717,7 @@ pub(crate) fn apply_reported_changes(
         return false;
     };
     let new_dirs = handle_debounced_events(
-        mode,
+        &options,
         events,
         &base_path,
         &git_workdir,
@@ -716,7 +738,7 @@ pub(crate) fn apply_reported_changes(
 }
 
 pub(crate) fn handle_debounced_events(
-    mode: FFFMode,
+    options: &WatcherOptions,
     events: Vec<DebouncedEvent>,
     base_path: &Path,
     git_workdir: &Option<PathBuf>,
@@ -730,7 +752,7 @@ pub(crate) fn handle_debounced_events(
     }
     let mut git = GitChanges::default();
     let new_dirs = apply_debounced_events(
-        mode,
+        options,
         events,
         base_path,
         git_workdir,
@@ -812,9 +834,9 @@ enum GitStateChange {
 
 // Applies a batch and collects the work trees whose git state it changed.
 #[allow(clippy::too_many_arguments)]
-#[tracing::instrument(name = "fs_events", skip(events, shared_picker, shared_frecency, git_status_worker, git), level = Level::DEBUG)]
+#[tracing::instrument(name = "fs_events", skip(options, events, shared_picker, shared_frecency, git_status_worker, git), fields(mode = ?options.mode), level = Level::DEBUG)]
 fn apply_debounced_events(
-    mode: FFFMode,
+    options: &WatcherOptions,
     events: Vec<DebouncedEvent>,
     base_path: &Path,
     git_workdir: &Option<PathBuf>,
@@ -841,7 +863,13 @@ fn apply_debounced_events(
     let ref_only = |path: &Path| {
         (ref_signals.as_ref()).is_some_and(|signals| signals.ref_only(path, base_path))
     };
-    let filter = IgnoreFilter::new(base_path, walker_rules, repo.as_ref());
+    let ignore_options = &options.ignore_options;
+    let filter = IgnoreFilter::new(
+        base_path,
+        walker_rules,
+        repo.as_ref(),
+        ignore_options.disable_git,
+    );
     let mut need_full_git_rescan = false;
     let mut batch_overflow_attempted = false;
     let mut paths_to_remove = Vec::new();
@@ -905,7 +933,8 @@ fn apply_debounced_events(
     });
     // Refs are looked at only while a listener follows a repository.
     let mut ref_changes = RefChanges::default();
-    for (path, kind, removed) in paths {
+    let follows_git = !ignore_options.disable_git;
+    for (path, kind, removed) in paths.filter(|_| follows_git) {
         if let Some(signals) = &ref_signals
             && signals.may_hold(path, base_path)
         {
@@ -985,10 +1014,12 @@ fn apply_debounced_events(
         }
 
         for path in &debounced_event.event.paths {
-            if matches!(
-                path.file_name().and_then(|f| f.to_str()),
-                Some(".ignore") | Some(".gitignore")
-            ) {
+            let ignore_file_changed = match path.file_name().and_then(|f| f.to_str()) {
+                Some(".ignore") => !ignore_options.disable_ignore_files,
+                Some(".gitignore") => !ignore_options.disable_git,
+                _ => false,
+            };
+            if ignore_file_changed {
                 if path
                     .parent()
                     .is_some_and(|parent| filter.is_ignored(parent))
@@ -1024,7 +1055,8 @@ fn apply_debounced_events(
             if is_git_file(path) || outside || in_own_git_dir {
                 // A repository created in a directory the walk already reached: its git
                 // state gets watches of its own, as a walked one's does.
-                if !outside
+                if follows_git
+                    && !outside
                     && path.file_name().is_some_and(|name| name == ".git")
                     && path.parent().is_some_and(|parent| {
                         git_workdir.as_deref() != Some(parent) && !filter.is_ignored(parent)
@@ -1037,7 +1069,8 @@ fn apply_debounced_events(
                 }
                 // A git dir's log appears with the first update of HEAD after `git init`,
                 // after its git dir was watched: it needs a watch of its own.
-                if path.file_name().is_some_and(|name| name == "logs")
+                if follows_git
+                    && path.file_name().is_some_and(|name| name == "logs")
                     && let Some(git_dir) = path.parent()
                     && is_git_dir(git_dir)
                     && path.is_dir()
@@ -1134,7 +1167,10 @@ fn apply_debounced_events(
         dirs_to_reconcile,
         base_path,
         repo.is_some(),
-        follow_symlinks,
+        WalkPolicy {
+            follow_symlinks,
+            ignore: ignore_options,
+        },
         shared_picker,
     );
     // The walks supersede the batch's other changes inside them; those still name
@@ -1446,7 +1482,7 @@ fn apply_debounced_events(
     // Uses a 5-minute cooldown per file to prevent score inflation from rapid
     // burst edits (AI agents often edit the same file many times in minutes).
     // This runs after apply_changes so the picker write lock is released.
-    if mode.is_ai() && !paths_to_add_or_modify.is_empty() {
+    if options.mode.is_ai() && !paths_to_add_or_modify.is_empty() {
         let mut tracked_count = 0usize;
         let shared_base = shared_picker.read().ok().and_then(|guard| {
             guard
@@ -1578,20 +1614,23 @@ pub(super) fn index_new_directory(
     dir_hook: Option<&DirHook>,
 ) {
     let repo = git_workdir.as_ref().and_then(|p| Repository::open(p).ok());
-    let (base_path, follow_symlinks) = match shared_picker.read().ok().and_then(|g| {
+    let Some((base_path, options)) = shared_picker.read().ok().and_then(|g| {
         g.as_ref()
-            .map(|p| (p.base_path().to_path_buf(), p.follows_symlinks()))
-    }) {
-        Some(state) => state,
-        None => return,
+            .map(|p| (p.base_path().to_path_buf(), WatcherOptions::of(p)))
+    }) else {
+        return;
     };
+    let base_path = base_path.as_path();
 
     if !dir.is_dir() {
         return;
     }
 
-    let Some(walk) = DirWalk::new(dir, &base_path, repo.is_some(), follow_symlinks, dir_hook)
-    else {
+    let policy = WalkPolicy {
+        follow_symlinks: options.follow_symlinks,
+        ignore: &options.ignore_options,
+    };
+    let Some(walk) = DirWalk::new(dir, base_path, repo.is_some(), policy, dir_hook) else {
         return;
     };
 
@@ -1609,7 +1648,7 @@ pub(super) fn index_new_directory(
         };
 
         // Once capacity runs out the rescan covers the rest of the subtree.
-        walk.apply(picker, &base_path, &mut file_events, &mut indexed_files)
+        walk.apply(picker, base_path, &mut file_events, &mut indexed_files)
             .is_err()
     };
     // The lock is released before the rescan is requested. A started rescan
@@ -1619,7 +1658,7 @@ pub(super) fn index_new_directory(
         && request_rescan(
             shared_picker,
             shared_frecency,
-            &base_path,
+            base_path,
             RescanReason::IndexUpdateRejected,
         );
     let added = indexed_files.len();
@@ -1636,7 +1675,7 @@ pub(super) fn index_new_directory(
             })
             .collect();
 
-        watch_registry.dispatch(&base_path, events);
+        watch_registry.dispatch(base_path, events);
     }
 
     if !rescan_started && repo.is_some() {
@@ -1680,7 +1719,9 @@ impl DirSubscriptions {
             if !subscriptions.recursive {
                 subscriptions.subscribe(dir);
             }
-            subscriptions.watch_git_state(dir);
+            if subscriptions.watches.follows_git {
+                subscriptions.watch_git_state(dir);
+            }
         })
     }
 
@@ -1775,6 +1816,7 @@ struct IgnoreFilter<'a> {
     /// libgit2 repo, consulted only when `rules` is `None`. Borrowed from the
     /// caller's repo (also used for git-status queries) to avoid re-opening.
     repo: Option<&'a Repository>,
+    disable_git: bool,
 }
 
 impl<'a> IgnoreFilter<'a> {
@@ -1782,11 +1824,13 @@ impl<'a> IgnoreFilter<'a> {
         base_path: &'a Path,
         rules: Option<Arc<crate::walk::WalkIgnoreRules>>,
         repo: Option<&'a Repository>,
+        disable_git: bool,
     ) -> Self {
         Self {
             base_path,
             rules,
             repo,
+            disable_git,
         }
     }
 
@@ -1803,6 +1847,7 @@ impl<'a> IgnoreFilter<'a> {
         }
         match self.repo {
             Some(repo) => repo.is_path_ignored(path) == Ok(true),
+            None if self.disable_git => false,
             // No repo and no rules: the non-code-dir heuristic, applied to the
             // base-relative path so ancestors of the base (e.g. a temp dir
             // under AppData/Local on Windows) never match.
@@ -2516,7 +2561,7 @@ mod tests {
             let event = Event::new(EventKind::Remove(notify::event::RemoveKind::Folder))
                 .add_path(path.to_path_buf());
             handle_debounced_events(
-                FFFMode::Neovim,
+                &WatcherOptions::default(),
                 vec![DebouncedEvent::new(event, Instant::now())],
                 &base,
                 &None,
@@ -2563,7 +2608,7 @@ mod tests {
             let event =
                 Event::new(EventKind::Modify(notify::event::ModifyKind::Any)).add_path(path.into());
             handle_debounced_events(
-                FFFMode::Neovim,
+                &WatcherOptions::default(),
                 vec![DebouncedEvent::new(event, Instant::now())],
                 &base,
                 &None,
@@ -2608,7 +2653,7 @@ mod tests {
             let event =
                 Event::new(EventKind::Modify(notify::event::ModifyKind::Any)).add_path(path);
             handle_debounced_events(
-                FFFMode::Neovim,
+                &WatcherOptions::default(),
                 vec![DebouncedEvent::new(event, Instant::now())],
                 &base,
                 &workdir,
@@ -2657,6 +2702,70 @@ mod tests {
         handle(repo.path().join("modules/sub/HEAD"));
         assert_eq!(heard.try_recv().unwrap(), base.join("sub"));
         assert!(heard.try_recv().is_err());
+    }
+
+    // An index without Git integration follows no repository: git state changes and new
+    // repositories inside it are not heard, and no walk records a git dir.
+    #[test]
+    fn an_index_without_git_follows_no_repository_state() {
+        let tmp = tempfile::tempdir().unwrap();
+        let base = crate::path_utils::canonicalize(tmp.path()).unwrap();
+        let inner = base.join("inner");
+        git2::Repository::init(&inner).unwrap();
+        std::fs::write(inner.join("file.txt"), "a").unwrap();
+        let (shared_picker, _events) = subscribed_picker(&base);
+        let (sender, heard) = mpsc::channel::<PathBuf>();
+        let _subscription = shared_picker
+            .subscribe_repository_state(move |root| sender.send(root.to_path_buf()).unwrap());
+        let handle = |options: &WatcherOptions, path: PathBuf| {
+            let event =
+                Event::new(EventKind::Modify(notify::event::ModifyKind::Any)).add_path(path);
+            handle_debounced_events(
+                options,
+                vec![DebouncedEvent::new(event, Instant::now())],
+                &base,
+                &None,
+                &shared_picker,
+                &SharedFrecency::noop(),
+                &GitStatusWorker::new(),
+            );
+        };
+        let without_git = WatcherOptions {
+            ignore_options: FilePickerIgnoreOptions {
+                disable_git: true,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        handle(&without_git, inner.join(".git/index"));
+        assert!(
+            heard.try_recv().is_err(),
+            "an index without git heard git state"
+        );
+        handle(&WatcherOptions::default(), inner.join(".git/index"));
+        assert_eq!(heard.try_recv().unwrap(), inner);
+
+        poll_watcher_for(&base);
+        let shared_picker = SharedFilePicker::default();
+        FilePicker::new_with_shared_state_and_ignore_options(
+            shared_picker.clone(),
+            SharedFrecency::noop(),
+            FilePickerOptions {
+                base_path: base.to_string_lossy().into_owned(),
+                enable_content_indexing: false,
+                watch: true,
+                ..Default::default()
+            },
+            without_git.ignore_options.clone(),
+        )
+        .unwrap();
+        assert!(shared_picker.wait_for_scan(Duration::from_secs(30)));
+        assert!(shared_picker.wait_for_watcher(Duration::from_secs(30)));
+        assert!(
+            shared_picker
+                .registered_git_dir(&inner.join(".git/index"))
+                .is_none()
+        );
     }
 
     #[test]
@@ -3090,7 +3199,7 @@ mod tests {
     fn modified(picker: &SharedFilePicker, base: &Path, workdir: &Option<PathBuf>, path: PathBuf) {
         let event = Event::new(EventKind::Modify(ModifyKind::Any)).add_path(path);
         handle_debounced_events(
-            FFFMode::Neovim,
+            &WatcherOptions::default(),
             vec![DebouncedEvent::new(event, Instant::now())],
             base,
             workdir,
@@ -3125,7 +3234,7 @@ mod tests {
             .map(|kind| DebouncedEvent::new(Event::new(kind).add_path(path.to_path_buf()), now))
             .collect();
         handle_debounced_events(
-            FFFMode::Neovim,
+            &WatcherOptions::default(),
             events,
             base,
             &None,

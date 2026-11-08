@@ -8,6 +8,7 @@ import {
   mkdirSync,
   mkdtempSync,
   realpathSync,
+  renameSync,
   rmSync,
   symlinkSync,
   utimesSync,
@@ -94,6 +95,17 @@ async function fence(collected, dir, name) {
     writeFileSync(sentinel, "sentinel\n");
     await collected.until((event) => event.path === sentinel, from);
   }
+}
+
+// Polls `cond` every 50ms until it holds or the timeout passes, then returns its last value.
+async function waitFor(cond, timeoutMs = 10_000) {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    const value = await cond();
+    if (value) return value;
+    await new Promise((resolve) => setTimeout(resolve, 50));
+  }
+  return cond();
 }
 
 const paths = (result) => {
@@ -641,6 +653,103 @@ describe("FileFinder over the shared service", { concurrency: 1 }, () => {
       assert.equal(refused.ok, false, outside);
       assert.equal(refused.code, ErrorCode.outsideScope, refused.error);
     }
+  });
+
+  it("applies extraIgnore rules during scans, watch updates and rescans", async () => {
+    const dir = realpathSync(
+      tree("extra-ignore", {
+        ".gitignore": "*.log\n",
+        "keep-initial.log": "keep\n",
+        "drop.log": "drop\n",
+        "generated/keep-excluded.log": "drop\n",
+        "sub/keep-sub.log": "keep\n",
+      }),
+    );
+    execFileSync("git", ["init", "-q", dir]);
+    const extraIgnore = ["/generated/", "!keep-*.log"];
+    const plain = await open(dir);
+    const finder = await open(dir, { extraIgnore });
+    const logs = async (of = finder) =>
+      paths(await of.glob("**/*.log", { excludeFrecency: true })).sort();
+    assert.deepEqual(await logs(), ["keep-initial.log", "sub/keep-sub.log"]);
+    assert.deepEqual(await logs(plain), []);
+
+    // The rules are relative to the directory a session names, so it gets an index of its own.
+    const nested = await open(join(dir, "sub"), { extraIgnore: ["keep-*.log"] });
+    assert.deepEqual(await logs(nested), []);
+    const [service] = namespace.status().services;
+    const roots = (scope) =>
+      service.sessions.filter((s) => s.kind === "program" && s.scope === scope).map((s) => s.root);
+    assert.deepEqual(roots(join(dir, "sub")), [join(dir, "sub")]);
+    const indexes = new Set(
+      service.sessions.filter((s) => s.scope === dir).map((s) => s.index),
+    );
+    assert.equal(indexes.size, 2, JSON.stringify(service.sessions));
+
+    writeFileSync(join(dir, "generated", "keep-added-excluded.log"), "drop\n");
+    writeFileSync(join(dir, "keep-added.log"), "keep\n");
+    assert.ok(await waitFor(async () => (await logs()).includes("keep-added.log")));
+    assert.deepEqual(await logs(), ["keep-added.log", "keep-initial.log", "sub/keep-sub.log"]);
+
+    const moved = join(namespace.root, "extra-ignore-moved");
+    mkdirSync(moved);
+    writeFileSync(join(moved, ".gitignore"), "*.log\n");
+    writeFileSync(join(moved, "keep-moved.log"), "keep\n");
+    writeFileSync(join(moved, "drop-moved.log"), "drop\n");
+    renameSync(moved, join(dir, "moved"));
+    const expected = [
+      "keep-added.log",
+      "keep-initial.log",
+      "moved/keep-moved.log",
+      "sub/keep-sub.log",
+    ];
+    assert.ok(await waitFor(async () => (await logs()).includes("moved/keep-moved.log")));
+    assert.deepEqual(await logs(), expected);
+
+    assert.ok((await finder.scanFiles()).ok);
+    assert.deepEqual(await finder.waitForScan(10_000), { ok: true, value: true });
+    assert.deepEqual(await logs(), expected);
+  });
+
+  it("keeps Git and .ignore rules disabled across watch updates and rescans", async () => {
+    const dir = realpathSync(
+      tree("ignore-controls", {
+        ".gitignore": "git-*.txt\n",
+        ".ignore": "ignored-*.txt\n",
+        "git-initial.txt": "keep\n",
+        "ignored-initial.txt": "drop\n",
+        "extra-initial.txt": "drop\n",
+      }),
+    );
+    execFileSync("git", ["init", "-q", dir]);
+    const listed = async (of) =>
+      paths(await of.glob("**/*.txt", { excludeFrecency: true })).sort();
+    for (const [options, expected] of [
+      [{}, []],
+      [{ disableGit: true }, ["git-initial.txt"]],
+      [{ disableIgnoreFiles: true }, ["ignored-initial.txt"]],
+      [{ disableGit: true, disableIgnoreFiles: true }, ["git-initial.txt", "ignored-initial.txt"]],
+    ]) {
+      const finder = await open(dir, { ...options, extraIgnore: ["extra-*.txt"] });
+      assert.deepEqual(await listed(finder), expected, JSON.stringify(options));
+    }
+
+    const finder = await open(dir, { disableGit: true, extraIgnore: ["extra-*.txt"] });
+    const [service] = namespace.status().services;
+    const index = service.indexes.find(
+      (i) => i.root === dir && i.options.disable_git && !i.options.disable_ignore_files,
+    );
+    assert.equal(index?.repository, null, JSON.stringify(service.indexes));
+
+    writeFileSync(join(dir, "ignored-added.txt"), "drop\n");
+    writeFileSync(join(dir, "extra-added.txt"), "drop\n");
+    writeFileSync(join(dir, "git-added.txt"), "keep\n");
+    assert.ok(await waitFor(async () => (await listed(finder)).includes("git-added.txt")));
+    assert.deepEqual(await listed(finder), ["git-added.txt", "git-initial.txt"]);
+
+    assert.ok((await finder.scanFiles()).ok);
+    assert.deepEqual(await finder.waitForScan(10_000), { ok: true, value: true });
+    assert.deepEqual(await listed(finder), ["git-added.txt", "git-initial.txt"]);
   });
 
   it("watches the directory once subscribed and delivers batches on the event loop", async () => {

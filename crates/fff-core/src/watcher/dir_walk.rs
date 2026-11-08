@@ -1,6 +1,6 @@
 use crate::file_picker::{FilePicker, IndexUpdateError};
 use crate::shared::SharedFilePicker;
-use crate::walk::DirHook;
+use crate::walk::{DirHook, WalkPolicy};
 use crate::watch::{BackgroundWatcher, WatchEventKind};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -26,14 +26,14 @@ impl DirWalk {
         dir: &Path,
         base_path: &Path,
         is_git_repo: bool,
-        follow_symlinks: bool,
+        policy: WalkPolicy<'_>,
         dir_hook: Option<&DirHook>,
     ) -> Option<Self> {
         let walk = match crate::walk::walk_collect_files(
             base_path,
             Some(dir),
             is_git_repo,
-            follow_symlinks,
+            policy,
             1,
             &Arc::new(AtomicUsize::new(0)),
             dir_hook,
@@ -143,7 +143,7 @@ impl ReplacedDirs {
         mut dirs: Vec<PathBuf>,
         base_path: &Path,
         is_git_repo: bool,
-        follow_symlinks: bool,
+        policy: WalkPolicy<'_>,
         shared_picker: &SharedFilePicker,
     ) -> Self {
         dirs.sort_unstable();
@@ -170,13 +170,7 @@ impl ReplacedDirs {
                 if let Some(subscribe) = &dir_hook {
                     subscribe(dir);
                 }
-                DirWalk::new(
-                    dir,
-                    base_path,
-                    is_git_repo,
-                    follow_symlinks,
-                    dir_hook.as_ref(),
-                )
+                DirWalk::new(dir, base_path, is_git_repo, policy, dir_hook.as_ref())
             })
             .collect();
         Self { walks, generation }

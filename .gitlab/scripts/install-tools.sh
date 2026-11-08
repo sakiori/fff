@@ -48,15 +48,15 @@ for tool in "$@"; do
   case "$tool" in
     zig)
       # zlob is built with the Zig that mise.toml pins, which is upstream's (CUSTOM.md).
-      version=0.16.0
+      version=0.17.1
       pinned=$(sed -n 's/^zig = "\(.*\)"$/\1/p' "$root/mise.toml")
       [ "$pinned" = "$version" ] || {
         echo "mise.toml pins Zig ${pinned:-(none)}, this script $version: update both together" >&2
         exit 1
       }
       case "$host" in
-        Linux-x86_64) platform=x86_64-linux sum=70e49664a74374b48b51e6f3fdfbf437f6395d42509050588bd49abe52ba3d00 ;;
-        Darwin-arm64) platform=aarch64-macos sum=b23d70deaa879b5c2d486ed3316f7eaa53e84acf6fc9cc747de152450d401489 ;;
+        Linux-x86_64) platform=x86_64-linux sum=3581863e3cbcfd0fce0efc682ce7e9e93da96668a977791d356a26d2a7e9b17a ;;
+        Darwin-arm64) platform=aarch64-macos sum=75f1bc7a1e9852f17ec9a0c1895f767c4ec56d46bc8a834920eece1d0359dd8d ;;
       esac
       name="zig-$platform-$version"
       distribution "https://ziglang.org/download/$version/$name.tar.xz" "$sum" "$name"

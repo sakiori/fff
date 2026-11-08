@@ -1800,6 +1800,103 @@ fn the_service_never_checks_upstream_for_updates() {
     assert!(!ran.exists(), "fff-mcp ran curl to check for updates");
 }
 
+// Ignore options decide the file set, so they separate indexes; extra rules are relative to
+// the session's directory, whose index is rooted there.
+#[cfg(feature = "zlob")]
+#[test]
+fn ignore_options_separate_indexes() {
+    let tmp = Sandbox::new();
+    let service = tmp.service();
+    let (project, sub) = fixture(tmp.path());
+    git2::Repository::init(&project).unwrap();
+    std::fs::write(sub.join(".gitignore"), "*.log\n").unwrap();
+    std::fs::write(sub.join("src/kept.log"), "log\n").unwrap();
+    std::fs::write(sub.join("src/dropped.rs"), "fn dropped() {}\n").unwrap();
+    let _daemon = start_daemon(&service, "0");
+    let names = |session: &ProgramSession| {
+        let mut names: Vec<_> = (session.search_files(search("", 0, 0)).unwrap().items)
+            .into_iter()
+            .map(|item| item.relative_path)
+            .collect();
+        names.sort();
+        names
+    };
+    let plain = open_program(&sub, &service, program_options());
+    let filtered = IndexOptions {
+        extra_ignore: vec!["dropped.rs".into()],
+        ..program_options()
+    };
+    let filtered = open_program(&sub, &service, filtered);
+    let without_git = IndexOptions {
+        disable_git: true,
+        ..program_options()
+    };
+    let without_git = open_program(&sub, &service, without_git);
+    assert_eq!(
+        names(&plain),
+        [".gitignore", "src/dropped.rs", "src/inside.rs"]
+    );
+    assert_eq!(names(&filtered), [".gitignore", "src/inside.rs"]);
+    assert_eq!(
+        names(&without_git),
+        [
+            ".gitignore",
+            "src/dropped.rs",
+            "src/inside.rs",
+            "src/kept.log"
+        ]
+    );
+    assert_eq!(without_git.repository().unwrap(), None);
+
+    let stats = status(&service);
+    let project = project.canonicalize().unwrap();
+    let sub = sub.canonicalize().unwrap();
+    let index = |extra: bool, disable_git: bool| {
+        let found: Vec<_> = (stats["indexes"].as_array().unwrap().iter())
+            .filter(|index| {
+                index["options"]["extra_ignore"]
+                    .as_array()
+                    .unwrap()
+                    .is_empty()
+                    != extra
+                    && index["options"]["disable_git"] == disable_git
+            })
+            .collect();
+        assert_eq!(found.len(), 1, "{stats}");
+        found[0].clone()
+    };
+    assert_eq!(index(false, false)["root"], json!(project), "{stats}");
+    assert_eq!(index(true, false)["root"], json!(sub), "{stats}");
+    assert_eq!(index(true, false)["repository"], json!(project), "{stats}");
+    assert_eq!(index(false, true)["root"], json!(sub), "{stats}");
+    assert_eq!(index(false, true)["repository"], Value::Null, "{stats}");
+}
+
+// The ripgrep walker cannot apply ignore options, so the service refuses to build such an index.
+#[cfg(not(feature = "zlob"))]
+#[test]
+fn ignore_options_need_the_zlob_walker() {
+    let tmp = Sandbox::new();
+    let service = tmp.service();
+    let (_, sub) = fixture(tmp.path());
+    let _daemon = start_daemon(&service, "0");
+    let refused = ProgramSession::open(&ProgramConfig {
+        options: IndexOptions {
+            disable_ignore_files: true,
+            ..program_options()
+        },
+        ..program_config(&sub, &service)
+    });
+    assert!(
+        matches!(
+            refused,
+            Err(ClientError::Service(ServiceError::Index { .. }))
+        ),
+        "{:?}",
+        refused.err()
+    );
+}
+
 fn program_options() -> IndexOptions {
     IndexOptions {
         warmup: false,
@@ -1810,6 +1907,9 @@ fn program_options() -> IndexOptions {
         frecency_db: None,
         enable_home_scan: false,
         enable_root_scan: false,
+        extra_ignore: Vec::new(),
+        disable_git: false,
+        disable_ignore_files: false,
     }
 }
 

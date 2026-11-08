@@ -104,6 +104,14 @@ While the shared index scans, the `scannedFilesCount` of `getScanProgress` count
 
 An index shared with agents may track frecency, which moves recently and frequently used files up. Pass `excludeFrecency: true` to `fileSearch`, `directorySearch`, `mixedSearch`, `glob`, `grep` or `multiGrep` to get the order an index without frecency gives: an empty query lists entries in path order, and grep searches the newest files first. Other clients of the index keep their ranking.
 
+## Ignore rules
+
+`extraIgnore` adds `.gitignore` rules, relative to `basePath`, to the rules the index applies; a `!` prefix re-includes a path, and an ignored parent directory needs re-including too. `disableGit: true` skips Git discovery, status, ranking and Git ignore rules, and the index then includes hidden files but not Git metadata under `.git`. `disableIgnoreFiles: true` skips the rules of `.ignore` files. Instances share an index only when these options match, and an instance with `extraIgnore` uses an index rooted at its own directory.
+
+```ts
+await FileFinder.create({ basePath: process.cwd(), extraIgnore: ["/generated/", "!/keep.log"] });
+```
+
 ## Service namespace
 
 Services live in a per-user namespace directory. `serviceDir` in `FileFinder.create`, or the `FFF_MCP_SERVICE_DIR` environment variable, selects another one, for example for tests. `FFF_MCP_IDLE_TIMEOUT_SECS` sets how long a service this package starts keeps running without clients; the default is one hour.

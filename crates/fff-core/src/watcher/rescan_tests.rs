@@ -12,13 +12,14 @@ use notify::event::{
 use notify_debouncer_full::DebouncedEvent;
 use tempfile::TempDir;
 
-use super::handle_debounced_events;
+use super::{WatcherOptions, handle_debounced_events};
 use crate::constants::MAX_OVERFLOW_FILES;
 use crate::file_picker::{FFFMode, FilePicker, FilePickerOptions};
 use crate::frecency::FrecencyTracker;
 use crate::git_status_worker::GitStatusWorker;
 use crate::rescan_stats::{RescanReason, RescanStats};
 use crate::shared::{SharedFilePicker, SharedFrecency};
+use crate::walk::WalkPolicy;
 use crate::watch::{WatchEvent, WatchEventKind, WatchOptions};
 use std::sync::mpsc;
 
@@ -1352,8 +1353,16 @@ fn a_walk_older_than_the_index_does_not_remove_its_files() {
     f.write("d/kept.rs", "fn kept() {}");
     f.index();
 
-    let replaced =
-        super::dir_walk::ReplacedDirs::walk(vec![f.path("d")], &f.base, false, false, &f.picker);
+    let replaced = super::dir_walk::ReplacedDirs::walk(
+        vec![f.path("d")],
+        &f.base,
+        false,
+        WalkPolicy {
+            follow_symlinks: false,
+            ignore: &Default::default(),
+        },
+        &f.picker,
+    );
     f.write("d/later.rs", "fn later() {}");
     f.picker
         .write()
@@ -1438,8 +1447,17 @@ fn a_directory_removed_while_it_is_walked_is_gone_not_a_failure() {
             let _ = std::fs::remove_dir_all(dir);
         }
     });
-    let walk = super::dir_walk::DirWalk::new(&f.path("d"), &f.base, false, false, Some(&hook))
-        .expect("a vanished directory does not fail the walk");
+    let walk = super::dir_walk::DirWalk::new(
+        &f.path("d"),
+        &f.base,
+        false,
+        WalkPolicy {
+            follow_symlinks: false,
+            ignore: &Default::default(),
+        },
+        Some(&hook),
+    )
+    .expect("a vanished directory does not fail the walk");
 
     let mut guard = f.picker.write().unwrap();
     walk.apply(
@@ -1723,7 +1741,7 @@ impl Fixture {
     fn feed(&self, events: impl IntoIterator<Item = DebouncedEvent>) -> RescanStats {
         let before = self.picker.rescan_stats();
         handle_debounced_events(
-            FFFMode::Neovim,
+            &self.options(),
             events.into_iter().collect(),
             &self.base,
             &self.git_workdir,
@@ -1741,7 +1759,7 @@ impl Fixture {
     ) -> (RescanStats, Vec<PathBuf>) {
         let before = self.picker.rescan_stats();
         let new_dirs = handle_debounced_events(
-            FFFMode::Neovim,
+            &self.options(),
             events.into_iter().collect(),
             &self.base,
             &self.git_workdir,
@@ -1750,6 +1768,10 @@ impl Fixture {
             &self.git_worker,
         );
         (self.picker.rescan_stats().since(&before), new_dirs)
+    }
+
+    fn options(&self) -> WatcherOptions {
+        WatcherOptions::of(self.picker.read().unwrap().as_ref().unwrap())
     }
 
     fn index_new_dirs(&self, dirs: &[PathBuf]) {

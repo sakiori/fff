@@ -6,7 +6,7 @@ use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 // Bump whenever a message below or a program frame changes shape.
-pub const PROTOCOL: u32 = 6;
+pub const PROTOCOL: u32 = 7;
 /// Largest hello the service reads.
 pub const MAX_MESSAGE_BYTES: usize = 64 * 1024;
 /// Largest reply a client reads; a status lists every index and session.
@@ -117,6 +117,12 @@ pub struct IndexOptions {
     pub frecency_db: Option<String>,
     pub enable_home_scan: bool,
     pub enable_root_scan: bool,
+    /// `.gitignore` rules relative to the session's directory, added to the index's own.
+    pub extra_ignore: Vec<String>,
+    /// Skip Git integration and Git ignore rules.
+    pub disable_git: bool,
+    /// Skip rules from `.ignore` files.
+    pub disable_ignore_files: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]

@@ -2,7 +2,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Weak};
 use std::time::Duration;
 
-use fff::file_picker::FilePicker;
+use fff::file_picker::{FilePicker, FilePickerIgnoreOptions};
 use fff::scope::SearchScope;
 use fff::{
     BackgroundStatus, FFFMode, FilePickerOptions, ListenerSubscription, SharedFilePicker,
@@ -69,7 +69,7 @@ impl Index {
         }
         let picker = SharedFilePicker::default();
         let coverage = picker.subscribe_coverage(on_coverage_change);
-        FilePicker::new_with_shared_state(
+        FilePicker::new_with_shared_state_and_ignore_options(
             picker.clone(),
             frecency.clone(),
             FilePickerOptions {
@@ -88,6 +88,11 @@ impl Index {
                 enable_fs_root_scanning: options.enable_root_scan,
                 mode: FFFMode::Ai,
                 ..Default::default()
+            },
+            FilePickerIgnoreOptions {
+                extra_ignore: options.extra_ignore.clone().into(),
+                disable_git: options.disable_git,
+                disable_ignore_files: options.disable_ignore_files,
             },
         )
         .map_err(|e| index_error(e.to_string()))?;
@@ -190,7 +195,7 @@ impl Index {
     // names a frecency database only accepts that one.
     pub fn serves(&self, request: &IndexOptions) -> bool {
         let own = &self.options;
-        own.follow_symlinks == request.follow_symlinks
+        same_file_set(own, request)
             && offers(own, request)
             && (request.frecency_db.is_none() || own.frecency_db == request.frecency_db)
     }
@@ -261,9 +266,15 @@ impl Index {
         SearchScope::new(&self.root, scope).is_ok_and(|scope| self.keeps_exclusions(&scope))
     }
 
-    // A repository index applies the repository's own ignore rules at every depth.
+    // A repository index applies the repository's own ignore rules at every depth, and an
+    // index without Git integration has no root-dependent exclusions. Extra rules are
+    // relative to the directory the session named, so they hold at the root only.
     fn keeps_exclusions(&self, scope: &SearchScope) -> bool {
-        self.repository.is_some() || fff::ignore::subtree_keeps_ignored_dirs(Path::new(scope.dir()))
+        scope.is_root()
+            || self.options.extra_ignore.is_empty()
+                && (self.repository.is_some()
+                    || self.options.disable_git
+                    || fff::ignore::subtree_keeps_ignored_dirs(Path::new(scope.dir())))
     }
 
     pub fn search_scope(&self, scope: &Path) -> Result<SearchScope, ServiceError> {
@@ -279,6 +290,14 @@ fn readiness_held() -> bool {
     cfg!(debug_assertions)
         && std::env::var_os("FFF_MCP_TEST_HOLD_READINESS")
             .is_some_and(|file| Path::new(&file).exists())
+}
+
+// Whether indexes built with either options hold the same files.
+pub(crate) fn same_file_set(a: &IndexOptions, b: &IndexOptions) -> bool {
+    a.follow_symlinks == b.follow_symlinks
+        && a.extra_ignore == b.extra_ignore
+        && a.disable_git == b.disable_git
+        && a.disable_ignore_files == b.disable_ignore_files
 }
 
 // Whether `own` offers every capability `request` needs.
@@ -333,13 +352,23 @@ impl Drop for Index {
 pub(crate) struct RepositoryProbe {
     marker: Option<PathBuf>,
     root: Option<PathBuf>,
+    // Without Git integration a scope belongs to no repository.
+    disabled: bool,
 }
 
 impl RepositoryProbe {
-    pub fn discover(scope: &Path) -> Self {
+    pub fn discover(scope: &Path, options: &IndexOptions) -> Self {
+        if options.disable_git {
+            return Self {
+                marker: None,
+                root: None,
+                disabled: true,
+            };
+        }
         Self {
             marker: git_marker(scope),
             root: repository_root(scope),
+            disabled: false,
         }
     }
 
@@ -349,6 +378,9 @@ impl RepositoryProbe {
 
     // Returns true when the repository containing `scope` changed.
     pub fn refresh(&mut self, scope: &Path) -> bool {
+        if self.disabled {
+            return false;
+        }
         let marker = git_marker(scope);
         if marker == self.marker {
             return false;
@@ -386,6 +418,9 @@ mod tests {
             frecency_db: None,
             enable_home_scan: false,
             enable_root_scan: false,
+            extra_ignore: Vec::new(),
+            disable_git: false,
+            disable_ignore_files: false,
         }
     }
 
@@ -411,13 +446,21 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let scope = temp.path().canonicalize().unwrap().join("scope");
         std::fs::create_dir(&scope).unwrap();
-        let mut probe = RepositoryProbe::discover(&scope);
+        let mut probe = RepositoryProbe::discover(&scope, &options(false, None));
         let outer = probe.root().cloned();
         assert!(!probe.refresh(&scope));
         git2::Repository::init(&scope).unwrap();
         assert!(probe.refresh(&scope));
         assert_ne!(probe.root().cloned(), outer);
         assert_eq!(probe.root(), Some(&scope));
+
+        let without_git = IndexOptions {
+            disable_git: true,
+            ..options(false, None)
+        };
+        let mut probe = RepositoryProbe::discover(&scope, &without_git);
+        assert_eq!(probe.root(), None);
+        assert!(!probe.refresh(&scope));
         assert!(!probe.refresh(&scope));
     }
 }
