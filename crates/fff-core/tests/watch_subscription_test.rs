@@ -758,6 +758,74 @@ fn ref_listeners_of_a_reftable_repository_hear_its_tables() {
     hears_every_ref_step(&upstream, &root.join("clone"), false);
 }
 
+// An index without Git integration hears no refs or repository state, also of a reftable
+// repository, which git's library cannot open.
+#[cfg(feature = "zlob")]
+#[test]
+fn an_index_without_git_hears_no_refs_of_a_reftable_repository() {
+    let tmp = TempDir::new().unwrap();
+    let root = fff_search::path_utils::canonicalize(tmp.path()).unwrap();
+    let base = root.join("repo");
+    seed(&base);
+    if let Err(reason) = try_git(
+        &base,
+        &["init", "-q", "--ref-format=reftable", "-b", "main"],
+    ) {
+        eprintln!("skipped: the installed git cannot create a reftable repository: {reason}");
+        return;
+    }
+    git(&base, &["add", "-A"]);
+    git(&base, &["commit", "-q", "-m", "init"]);
+    fff_search::watch::poll_watcher_for(&base);
+    let picker = SharedFilePicker::default();
+    FilePicker::new_with_shared_state_and_ignore_options(
+        picker.clone(),
+        SharedFrecency::noop(),
+        FilePickerOptions {
+            base_path: base.to_string_lossy().into_owned(),
+            enable_content_indexing: false,
+            watch: true,
+            ..Default::default()
+        },
+        fff_search::file_picker::FilePickerIgnoreOptions {
+            disable_git: true,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    assert!(picker.wait_for_scan(Duration::from_secs(30)));
+    assert!(picker.wait_for_watcher(Duration::from_secs(30)));
+    let (sender, heard) = std::sync::mpsc::channel();
+    let state_sender = sender.clone();
+    let _state = picker.subscribe_repository_state(move |root| {
+        let _ = state_sender.send(root.to_path_buf());
+    });
+    let _refs = picker.subscribe_ref_changes(&base, move |root| {
+        let _ = sender.send(root.to_path_buf());
+    });
+    let events = watch_collect(&picker, "", WatchOptions::default());
+
+    git(&base, &["branch", "feature"]);
+    git(&base, &["commit", "-q", "--allow-empty", "-m", "second"]);
+    fs::write(base.join("staged.txt"), "staged\n").unwrap();
+    git(&base, &["add", "staged.txt"]);
+    // Events are applied in order, so once the fence is heard the git changes were seen.
+    fs::write(base.join("fence.txt"), "fence\n").unwrap();
+    assert!(
+        wait_for(
+            || events
+                .lock()
+                .iter()
+                .any(|e| e.path == base.join("fence.txt")),
+            Duration::from_secs(10)
+        ),
+        "the fence was not delivered: {:?}",
+        events.lock()
+    );
+    let heard: Vec<_> = heard.try_iter().collect();
+    assert!(heard.is_empty(), "an index without git heard {heard:?}");
+}
+
 // Every step changes the refs of `base`, a clone of `upstream`, as a terminal would.
 fn hears_every_ref_step(upstream: &Path, base: &Path, packs: bool) {
     let (picker, _frecency) = make_ref_picker(base);

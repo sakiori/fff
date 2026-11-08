@@ -324,7 +324,14 @@ impl BackgroundWatcher {
         let fsevents = poll_interval.is_none()
             && <notify::RecommendedWatcher as Watcher>::kind() == WatcherKind::Fsevent;
         // Removing a watch restarts the FSEvents stream, so ref watches stay once added there.
-        let refs = RefWatches::new(&base_path, use_recursive, git_workdir.as_deref(), fsevents);
+        let follows_git = !options.ignore_options.disable_git;
+        let refs = RefWatches::new(
+            &base_path,
+            use_recursive,
+            git_workdir.as_deref(),
+            fsevents,
+            follows_git,
+        );
         // The own git dir is watched from the start, so a walk reaching the work tree finds it
         // known, and watches it anew only once it was created again.
         if let Some(workdir) = &git_workdir
@@ -428,7 +435,7 @@ impl BackgroundWatcher {
             git_status: Arc::clone(&owner_git_worker),
             base_path: base_path.clone(),
             walking: AtomicBool::new(false),
-            follows_git: !options.ignore_options.disable_git,
+            follows_git,
         });
         let owner_watches = Arc::clone(&watches);
 

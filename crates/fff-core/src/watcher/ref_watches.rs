@@ -75,17 +75,21 @@ pub(crate) struct RefPlan {
 }
 
 impl RefWatches {
+    // An index without Git integration has no repository of its own, a reftable one included.
     pub(crate) fn new(
         base_path: &Path,
         recursive: bool,
         git_workdir: Option<&Path>,
         keep: bool,
+        follows_git: bool,
     ) -> Self {
         Self {
             base_path: base_path.to_path_buf(),
             recursive,
             keep,
-            own: own_repository(base_path, git_workdir),
+            own: follows_git
+                .then(|| own_repository(base_path, git_workdir))
+                .flatten(),
             state: Mutex::default(),
         }
     }
@@ -937,7 +941,7 @@ mod tests {
             git2::Repository::init(root.join(name)).unwrap();
             picker.register_git_dir(&root.join(name).join(".git"), &root.join(name));
         }
-        let refs = RefWatches::new(&root, false, None, false);
+        let refs = RefWatches::new(&root, false, None, false, true);
         let a_refs = root.join("a/.git/refs");
         let b_refs = root.join("b/.git/refs");
         assert!(ops(&refs.plan(&picker, None)).is_empty());
@@ -971,7 +975,7 @@ mod tests {
         let picker = SharedFilePicker::default();
         picker.register_git_dir(&git_dir, &repo);
         let _listener = picker.subscribe_ref_changes(&root, |_| {});
-        let refs = RefWatches::new(&root, false, None, false);
+        let refs = RefWatches::new(&root, false, None, false, true);
 
         let plan = refs.plan(&picker, None);
         assert!(ops(&plan).is_empty() && plan.appeared.is_empty());
@@ -1017,7 +1021,7 @@ mod tests {
         picker.register_git_dir(&common_dir, &main);
         picker.register_git_dir(&linked_git_dir, &linked);
         let _listener = picker.subscribe_ref_changes(&root, |_| {});
-        let refs = RefWatches::new(&root, false, None, false);
+        let refs = RefWatches::new(&root, false, None, false, true);
 
         assert_eq!(
             ops(&refs.plan(&picker, None)),
@@ -1057,7 +1061,11 @@ mod tests {
         std::fs::remove_dir_all(main.join(".git/worktrees/wt")).unwrap();
 
         // Git stops at the worktree's `.git` file, so the main checkout is not its repository.
-        assert!(RefWatches::new(&worktree, false, None, false).own.is_none());
+        assert!(
+            RefWatches::new(&worktree, false, None, false, true)
+                .own
+                .is_none()
+        );
     }
 
     #[test]
@@ -1072,7 +1080,7 @@ mod tests {
         git(&refused, &["config", "extensions.fffunknown", "true"]);
         assert!(Repository::open(&refused).is_err());
         assert!(
-            RefWatches::new(&refused.join("src"), false, None, false)
+            RefWatches::new(&refused.join("src"), false, None, false, true)
                 .own
                 .is_none()
         );
@@ -1083,11 +1091,36 @@ mod tests {
             return;
         }
         std::fs::create_dir(reftable.join("src")).unwrap();
-        let own = RefWatches::new(&reftable.join("src"), false, None, false)
+        let own = RefWatches::new(&reftable.join("src"), false, None, false, true)
             .own
             .unwrap();
         assert_eq!(own.work_tree, reftable);
         assert_eq!(own.common_dir, reftable.join(".git"));
+    }
+
+    // Without Git integration the index follows no repository of its own: no ref watches
+    // are set up or planned for it, as none would be for a repository libgit2 opens.
+    #[test]
+    fn an_index_without_git_has_no_reftable_repository_of_its_own() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = crate::path_utils::canonicalize(tmp.path()).unwrap();
+        let main = root.join("main");
+        if let Err(reason) = reftable_repository(&main) {
+            eprintln!("skipped: the installed git cannot create a reftable repository: {reason}");
+            return;
+        }
+        let picker = SharedFilePicker::default();
+        let _listener = picker.subscribe_ref_changes(&main, |_| {});
+        let following = RefWatches::new(&main, false, None, true, true);
+        assert!(following.own_git_dir().is_some());
+        assert!(!following.own_targets(&picker).is_empty());
+
+        let without_git = RefWatches::new(&main, false, None, true, false);
+        assert!(without_git.own_git_dir().is_none());
+        assert!(without_git.own_work_tree_outside().is_none());
+        assert!(without_git.own_targets(&picker).is_empty());
+        let plan = without_git.plan(&picker, None);
+        assert!(ops(&plan).is_empty() && plan.appeared.is_empty());
     }
 
     #[cfg(unix)]
@@ -1105,10 +1138,18 @@ mod tests {
             eprintln!("skipped: the installed git cannot create a reftable repository: {reason}");
             return;
         }
-        assert!(RefWatches::new(&repo, false, None, false).own.is_some());
+        assert!(
+            RefWatches::new(&repo, false, None, false, true)
+                .own
+                .is_some()
+        );
         let path = std::ffi::CString::new(repo.as_os_str().as_encoded_bytes()).unwrap();
         assert_eq!(unsafe { libc::chown(path.as_ptr(), 65534, 65534) }, 0);
-        assert!(RefWatches::new(&repo, false, None, false).own.is_none());
+        assert!(
+            RefWatches::new(&repo, false, None, false, true)
+                .own
+                .is_none()
+        );
     }
 
     #[cfg(unix)]
@@ -1277,7 +1318,7 @@ mod tests {
         let picker = SharedFilePicker::default();
         picker.register_git_dir(&repo.join(".git"), &repo);
         let _listener = picker.subscribe_ref_changes(&root, |_| {});
-        let refs = RefWatches::new(&root, false, None, false);
+        let refs = RefWatches::new(&root, false, None, false, true);
         let watched: Vec<_> = ops(&refs.plan(&picker, None))
             .into_iter()
             .map(|(_, path)| path)
@@ -1285,7 +1326,7 @@ mod tests {
         assert!(watched.contains(&worktrees) && watched.contains(&worktrees.join("wt")));
 
         // Where watches stay, one recursive watch of `worktrees` serves every admin dir.
-        let kept = RefWatches::new(&root, false, None, true);
+        let kept = RefWatches::new(&root, false, None, true, true);
         let kept_ops = kept.plan(&picker, None).ops;
         let recursive = |path: &Path| {
             (kept_ops.iter())
@@ -1367,7 +1408,7 @@ mod tests {
             picker.register_git_dir(&worktrees.join(name), &root.join(name));
         }
         let _listener = picker.subscribe_ref_changes(&root, |_| {});
-        let refs = RefWatches::new(&root, false, None, false);
+        let refs = RefWatches::new(&root, false, None, false, true);
         refs.plan(&picker, None);
         let signals = refs.signals().unwrap();
         let heard = |path: &Path| {
@@ -1411,7 +1452,7 @@ mod tests {
         let picker = SharedFilePicker::default();
         picker.register_git_dir(&repo.join(".git"), &repo);
         let _listener = picker.subscribe_ref_changes(&root, |_| {});
-        let refs = RefWatches::new(&root, false, None, false);
+        let refs = RefWatches::new(&root, false, None, false, true);
         let plan = refs.plan(&picker, None);
         assert!(ops(&plan).contains(&(true, worktrees.join("first"))));
         assert!(plan.appeared.is_empty(), "the listener just came");
@@ -1466,7 +1507,7 @@ mod tests {
         let picker = SharedFilePicker::default();
         picker.register_git_dir(&common_dir, &main);
         let _listener = picker.subscribe_ref_changes(&main, |_| {});
-        let refs = RefWatches::new(&main, false, None, false);
+        let refs = RefWatches::new(&main, false, None, false, true);
         let admin_dir = common_dir.join("worktrees/other");
         let watched = ops(&refs.plan(&picker, None));
         assert!(watched.contains(&(true, admin_dir.join("reftable"))));
@@ -1534,7 +1575,7 @@ mod tests {
 
         // With FSEvents' one recursive watch and with one watch per admin dir alike.
         for keep in [true, false] {
-            let refs = RefWatches::new(&base, false, None, keep);
+            let refs = RefWatches::new(&base, false, None, keep, true);
             refs.plan(&picker, None);
             let signals = refs.signals().unwrap();
             let dropped = |path: &Path| signals.foreign_admin_file(path, &base);
@@ -1595,7 +1636,7 @@ mod tests {
         let _listener = picker.subscribe_ref_changes(&linked, |_| {});
 
         for keep in [true, false] {
-            let refs = RefWatches::new(&linked, false, Some(&linked), keep);
+            let refs = RefWatches::new(&linked, false, Some(&linked), keep, true);
             refs.plan(&picker, None);
             let signals = refs.signals().unwrap();
             let dropped = |path: &Path| signals.foreign_admin_file(path, &linked);
