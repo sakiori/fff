@@ -275,7 +275,7 @@ impl Index {
         if !self.options.extra_ignore.is_empty() {
             return false;
         }
-        // A walk below its work tree's root inherits the rules above it.
+        // A repository index applies the repository's own ignore rules at every depth.
         if self.repository.is_some() {
             return true;
         }

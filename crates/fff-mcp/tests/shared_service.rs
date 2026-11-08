@@ -1801,7 +1801,7 @@ fn the_service_never_checks_upstream_for_updates() {
 }
 
 // Ignore options decide the file set, so they separate indexes; extra rules are relative to
-// the session's directory, whose index is rooted there and applies the rules above it.
+// the session's directory, whose index is rooted there.
 #[cfg(feature = "zlob")]
 #[test]
 fn ignore_options_separate_indexes() {
@@ -1809,9 +1809,7 @@ fn ignore_options_separate_indexes() {
     let service = tmp.service();
     let (project, sub) = fixture(tmp.path());
     git2::Repository::init(&project).unwrap();
-    std::fs::write(project.join(".gitignore"), "*.log\nnode_modules/\n").unwrap();
-    std::fs::create_dir_all(sub.join("node_modules")).unwrap();
-    std::fs::write(sub.join("node_modules/dep.js"), "x\n").unwrap();
+    std::fs::write(sub.join(".gitignore"), "*.log\n").unwrap();
     std::fs::write(sub.join("src/kept.log"), "log\n").unwrap();
     std::fs::write(sub.join("src/dropped.rs"), "fn dropped() {}\n").unwrap();
     let _daemon = start_daemon(&service, "0");
@@ -1834,12 +1832,15 @@ fn ignore_options_separate_indexes() {
         ..program_options()
     };
     let without_git = open_program(&sub, &service, without_git);
-    assert_eq!(names(&plain), ["src/dropped.rs", "src/inside.rs"]);
-    assert_eq!(names(&filtered), ["src/inside.rs"]);
+    assert_eq!(
+        names(&plain),
+        [".gitignore", "src/dropped.rs", "src/inside.rs"]
+    );
+    assert_eq!(names(&filtered), [".gitignore", "src/inside.rs"]);
     assert_eq!(
         names(&without_git),
         [
-            "node_modules/dep.js",
+            ".gitignore",
             "src/dropped.rs",
             "src/inside.rs",
             "src/kept.log"

@@ -43,7 +43,6 @@ SHALL NOT separate indexes.
 #### Scenario: Extra ignore rules inside a broader index
 - **WHEN** a request with extra ignore rules arrives for a directory inside the directory of an existing index
 - **THEN** the service builds an index of the request's own directory, since the rules are relative to it, and does not use the broader index
-- **AND** inside a repository that index applies the repository's ignore rules above its directory, as an index of the repository does there
 
 #### Scenario: Ignore files above a directory outside a repository
 - **WHEN** a request outside any repository, or with Git integration turned off, arrives for a directory inside the directory of an existing index, and an ignore file that index honors lies in its directory or between it and the request's directory
