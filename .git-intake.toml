@@ -1,5 +1,5 @@
 integration = "main"
-publish = { remote = "origin", via = "merge-request" }
+publish = { remote = "origin", via = "merge-request", queue = "sakiori-merge" }
 install = "cargo fetch --locked"
 checks = [
   { name = "fmt", run = "cargo fmt --all -- --check" },

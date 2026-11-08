@@ -53,8 +53,8 @@ variables:
   TOOLS: $CI_PROJECT_DIR/.tools
   # The git-intake release the release jobs install, with its x86_64-unknown-linux-musl
   # archive's SHA-256.
-  GIT_INTAKE_VERSION: "0.4.1"
-  GIT_INTAKE_SHA256_X86_64_LINUX: bf1aa4048172d435155e2389c45c0b57f685121df6db628ba8172f2e1684306b
+  GIT_INTAKE_VERSION: "0.5.1"
+  GIT_INTAKE_SHA256_X86_64_LINUX: b243b3051e11b6d859ca3b5ab87a91c3f734e7f46f69e7c5ba88411f8a8e5291
 
 default:
   image: $RUST_IMAGE

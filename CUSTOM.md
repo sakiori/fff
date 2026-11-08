@@ -28,21 +28,20 @@ default.
   merge request back to a new pipeline. When the bot cannot merge one, it
   assigns it back with a comment that says why; after a conflict, rebase it onto
   `main`, the only rewrite allowed, and assign it again.
-- Two kinds stay out of the queue, and a Maintainer merges them with the queue
-  held: unassign the queued merge requests first, and assign them again once the
-  merge has landed.
-  - A merge request from a fork outside the group, since GitLab runs its
-    pipeline in this project only when a Maintainer starts it: the Maintainer
-    runs it on the merge request rebased onto the current `main` and merges it
-    once it passes.
-  - The upstream update's merge request, from `git-intake/update`, merged
-    **without squashing and without rebasing**: its merge commit carries
-    upstream's history and the sync record git intake reads. git intake opens it
-    with squashing off; leave it unticked. Hold the queue from the moment it is
-    ready. If `main` has moved since its last pipeline, catch it up with
-    `git intake sync` and `git intake finish` in a clone, as
-    [Upstream updates](#upstream-updates) shows, instead of a rebase, and let
-    that pipeline pass.
+- A merge request from a fork outside the group stays out of the queue, since
+  GitLab runs its pipeline in this project only when a Maintainer starts it. The
+  Maintainer holds the queue by unassigning the queued merge requests, runs the
+  pipeline on the merge request rebased onto the current `main`, merges it
+  once it passes, and assigns the held ones again once the merge has landed.
+- The upstream update's merge request, from `git-intake/update`, stays out of
+  the queue too and lands **without squashing and without rebasing**: its merge
+  commit carries upstream's history and the sync record git intake reads. git
+  intake opens it with squashing off; leave it unticked. `git intake land`, with
+  `GITLAB_TOKEN` holding a Maintainer's token with the `api` scope, brings it to
+  `main`: it waits for its pipeline, and when `main` moved meanwhile it pauses
+  the merge queue `.git-intake.toml` names, catches the update up and waits for
+  the new pipeline; then it merges it and returns the paused merge requests in
+  their order. `git intake land --resume` returns them after an interruption.
 
 Verify a change against the current `main` before queuing it, and update
 [Downstream changes](#downstream-changes) when it adds or removes one. The macOS
