@@ -2744,8 +2744,14 @@ mod tests {
         );
         handle(&WatcherOptions::default(), inner.join(".git/index"));
         assert_eq!(heard.try_recv().unwrap(), inner);
+        // Only the zlob walker builds an index without Git integration.
+        #[cfg(feature = "zlob")]
+        walk_records_no_git_dir(&base, &inner, without_git.ignore_options);
+    }
 
-        poll_watcher_for(&base);
+    #[cfg(feature = "zlob")]
+    fn walk_records_no_git_dir(base: &Path, inner: &Path, ignore: FilePickerIgnoreOptions) {
+        poll_watcher_for(base);
         let shared_picker = SharedFilePicker::default();
         FilePicker::new_with_shared_state_and_ignore_options(
             shared_picker.clone(),
@@ -2756,7 +2762,7 @@ mod tests {
                 watch: true,
                 ..Default::default()
             },
-            without_git.ignore_options.clone(),
+            ignore,
         )
         .unwrap();
         assert!(shared_picker.wait_for_scan(Duration::from_secs(30)));

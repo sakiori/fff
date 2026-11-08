@@ -266,9 +266,8 @@ impl Index {
         SearchScope::new(&self.root, scope).is_ok_and(|scope| self.keeps_exclusions(&scope))
     }
 
-    // A repository index applies the repository's own ignore rules at every depth, and an
-    // index without Git integration has no root-dependent exclusions. Extra rules are
-    // relative to the directory the session named, so they hold at the root only.
+    // Repository rules hold at every depth and an index without Git has no root-dependent
+    // exclusions; extra rules are relative to the session's directory, so hold at the root only.
     fn keeps_exclusions(&self, scope: &SearchScope) -> bool {
         scope.is_root()
             || self.options.extra_ignore.is_empty()
