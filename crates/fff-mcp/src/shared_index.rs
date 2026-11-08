@@ -266,14 +266,45 @@ impl Index {
         SearchScope::new(&self.root, scope).is_ok_and(|scope| self.keeps_exclusions(&scope))
     }
 
-    // Repository rules hold at every depth and an index without Git has no root-dependent
-    // exclusions; extra rules are relative to the session's directory, so hold at the root only.
+    // Whether the index holds below `scope` the files an index of `scope` would. Extra rules
+    // are relative to the session's directory, so they hold at the root only.
     fn keeps_exclusions(&self, scope: &SearchScope) -> bool {
-        scope.is_root()
-            || self.options.extra_ignore.is_empty()
-                && (self.repository.is_some()
-                    || self.options.disable_git
-                    || fff::ignore::subtree_keeps_ignored_dirs(Path::new(scope.dir())))
+        if scope.is_root() {
+            return true;
+        }
+        if !self.options.extra_ignore.is_empty() {
+            return false;
+        }
+        // A walk below its work tree's root inherits the rules above it.
+        if self.repository.is_some() {
+            return true;
+        }
+        let dir = Path::new(scope.dir());
+        (self.options.disable_git || fff::ignore::subtree_keeps_ignored_dirs(dir))
+            && !self.ignore_files_above(dir)
+    }
+
+    // Outside a repository a walk reads no ignore file above its root, so one in this index's
+    // root or between it and `dir` excludes files an index of `dir` would hold.
+    fn ignore_files_above(&self, dir: &Path) -> bool {
+        let names = [
+            (!self.options.disable_git).then_some(".gitignore"),
+            (!self.options.disable_ignore_files).then_some(".ignore"),
+        ];
+        let honored = |at: &Path| {
+            (names.iter().flatten()).any(|name| at.join(name).symlink_metadata().is_ok())
+        };
+        let mut current = self.root.clone();
+        let mut parts = dir.components().peekable();
+        loop {
+            if honored(&current) {
+                return true;
+            }
+            match parts.next() {
+                Some(part) if parts.peek().is_some() => current.push(part),
+                _ => return false,
+            }
+        }
     }
 
     pub fn search_scope(&self, scope: &Path) -> Result<SearchScope, ServiceError> {

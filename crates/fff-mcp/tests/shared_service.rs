@@ -1871,6 +1871,60 @@ fn ignore_options_separate_indexes() {
     assert_eq!(index(false, true)["repository"], Value::Null, "{stats}");
 }
 
+// Outside a repository a walk reads no ignore file above its root, so a broader index whose
+// root holds one does not take over a session below it, which keeps the files it lists.
+#[test]
+fn ignore_files_above_a_scope_keep_its_own_index() {
+    let tmp = Sandbox::new();
+    let service = tmp.service();
+    let (project, sub) = fixture(tmp.path());
+    std::fs::write(project.join(".ignore"), "*.tmp\n").unwrap();
+    std::fs::write(sub.join("src/scratch.tmp"), "x\n").unwrap();
+    let _daemon = start_daemon(&service, "0");
+    let child = open_program(&sub, &service, program_options());
+    let listed = |session: &ProgramSession| {
+        (session.search_files(search("", 0, 0)).unwrap().items)
+            .into_iter()
+            .map(|item| item.relative_path)
+            .collect::<Vec<_>>()
+    };
+    let before = listed(&child);
+    let _parent = open_program(&project, &service, program_options());
+    let project = project.canonicalize().unwrap();
+    let sub = sub.canonicalize().unwrap();
+    // Two indexes, the child's still rooted at its own directory.
+    wait_status(&service, "the parent index never became ready", |stats| {
+        stats["indexes"].as_array().is_some_and(|indexes| {
+            indexes.len() == 2 && indexes.iter().all(|index| index["state"] == "ready")
+        })
+    });
+    std::thread::sleep(Duration::from_millis(300));
+    let stats = status(&service);
+    let child_root: Vec<_> = (stats["sessions"].as_array().unwrap().iter())
+        .filter(|session| session["scope"] == json!(sub))
+        .map(|session| session["root"].clone())
+        .collect();
+    assert_eq!(child_root, [json!(sub)], "{stats}");
+    assert_eq!(listed(&child), before);
+    #[cfg(feature = "zlob")]
+    assert!(
+        before.iter().any(|name| name == "src/scratch.tmp"),
+        "{before:?}"
+    );
+
+    // Without the ignore file the broader index covers the child's directory alike.
+    std::fs::remove_file(project.join(".ignore")).unwrap();
+    wait_status(
+        &service,
+        "the child never moved to the broader index",
+        |stats| {
+            (stats["sessions"].as_array().unwrap().iter())
+                .filter(|session| session["scope"] == json!(sub))
+                .all(|session| session["root"] == json!(project))
+        },
+    );
+}
+
 // The ripgrep walker cannot apply ignore options, so the service refuses to build such an index.
 #[cfg(not(feature = "zlob"))]
 #[test]

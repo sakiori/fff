@@ -45,6 +45,10 @@ SHALL NOT separate indexes.
 - **THEN** the service builds an index of the request's own directory, since the rules are relative to it, and does not use the broader index
 - **AND** inside a repository that index applies the repository's ignore rules above its directory, as an index of the repository does there
 
+#### Scenario: Ignore files above a directory outside a repository
+- **WHEN** a request outside any repository, or with Git integration turned off, arrives for a directory inside the directory of an existing index, and an ignore file that index honors lies in its directory or between it and the request's directory
+- **THEN** the request uses an index of its own directory, which lists the files an index of that directory lists, and moves to the broader index only once no such ignore file remains
+
 #### Scenario: Index without Git integration
 - **WHEN** a request turns off Git integration
 - **THEN** its session reports no repository, and its watch subscriptions receive no repository or refs events
