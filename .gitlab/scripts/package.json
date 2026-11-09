@@ -1,0 +1,8 @@
+{
+  "private": true,
+  "description": "Tools of the pipeline's scripts",
+  "devDependencies": {
+    "@commitlint/cli": "21.2.4",
+    "@commitlint/config-conventional": "21.2.4"
+  }
+}

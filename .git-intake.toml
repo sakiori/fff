@@ -22,9 +22,11 @@ url = "https://github.com/dmtrKovalenko/fff.git"
 branch = "main"
 mode = "follow"
 
-# Releases are v<base>-sakiori.<YYYYMMDD>.<n>, the base being the newest upstream release
-# main contains with its patch raised; see git-intake's README, "Downstream releases".
+# Releases are v<x.y.z>, computed from the Conventional Commits since the previous release and the
+# upstream releases they carry; the dated releases v<base>-sakiori.<YYYYMMDD>.<n> before them stay
+# releases. See git-intake's README, "Semver releases".
 [release]
 upstream = "fff"
 tags = "v*"
 labels = ["sakiori"]
+versioning = "semver"

@@ -16,7 +16,7 @@ SHELL := bash
 # string rather than the literal `-o` / `pipefail` tokens.
 .SHELLFLAGS := -o pipefail -euc
 
-.PHONY: build build-c-lib install uninstall test test-rust test-rescan test-rescan-known-defects rescan-probe test-c-smoke test-c-api test-lua test-lua-snap test-version test-bun test-node prepare-bun prepare-bun-packaged prepare-node build-node-native stage-node-platform set-npm-version header test-stress test-stress-seeded test-stress-random test-stress-regressions test-stress-repos test-node-stress sync-js-api sync-js-api-check bump-homebrew-formula bump-install-mcp-sh test-bun-compile bench-search bench-grep bench-definition
+.PHONY: build build-c-lib install uninstall test test-rust test-rescan test-rescan-known-defects rescan-probe test-c-smoke test-c-api test-lua test-lua-snap test-version test-bun test-node prepare-bun prepare-bun-packaged prepare-node build-node-native stage-node-platform set-npm-version header test-stress test-stress-seeded test-stress-random test-stress-regressions test-stress-repos test-node-stress node-api node-api-check node-contract-check mr-title-check test-ci-scripts sync-js-api sync-js-api-check bump-homebrew-formula bump-install-mcp-sh test-bun-compile bench-search bench-grep bench-definition
 
 all: format test lint
 
@@ -264,6 +264,26 @@ test-node: prepare-node
 	cd packages/fff-node && npm run build && npm test
 
 test-js: test-bun test-node
+
+# The public API report of @sakiori/fff-node, part of its contract (CUSTOM.md, Releases).
+node-api:
+	cd packages/fff-node && npm run api:update
+
+node-api-check:
+	cd packages/fff-node && npm run api:check || \
+		{ echo "packages/fff-node/etc/fff-node.api.md is out of date: run make node-api and commit it" >&2; exit 1; }
+
+# The contract against the previous release's, for the commit a merge request lands; needs git intake.
+node-contract-check:
+	node .gitlab/scripts/contract-check.mjs
+
+# A squashed merge request's title: make mr-title-check TITLE='feat: …'
+mr-title-check:
+	(cd .gitlab/scripts && npm ci --no-audit --no-fund --ignore-scripts >/dev/null)
+	node .gitlab/scripts/mr-title.mjs "$${TITLE:?TITLE names the title}" | .gitlab/scripts/node_modules/.bin/commitlint --config .gitlab/scripts/commitlint.config.mjs
+
+test-ci-scripts:
+	node --test '.gitlab/scripts/test/*.test.mjs'
 
 # Bug pinning stress test script over fff-node for issue #515
 # Just keep it untouched because it's good enough + some stress for SDK

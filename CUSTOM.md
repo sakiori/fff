@@ -15,8 +15,10 @@ default.
 - A downstream change is one merge request from a branch off `main`, carrying
   one logical change. It lands squashed, as the project ticks by default, as one
   commit on `main`, with the merge request's title as its subject and its
-  description as its body, so the description says what changed and why. Do not
-  squash or rewrite the branch by hand first. A merged branch is not reused.
+  description as its body, so the description says what changed and why. The
+  title is a Conventional Commit, which versions the next release
+  ([Merge request titles](#merge-request-titles)). Do not squash or rewrite the
+  branch by hand first. A merged branch is not reused.
 - A downstream merge request lands through the merge queue: once it is ready, a
   Maintainer assigns it to the `sakiori-merge` service account
   (`glab mr update <id> --ready --assignee sakiori-merge`), keeping the
@@ -69,27 +71,134 @@ upstream pins in its workflows and `flake.nix`; the `ci-scripts` job checks it.
 When an update changes upstream's pin, change `mise.toml` and the Zig version
 and checksums in `.gitlab/scripts/install-tools.sh` in the same update.
 
+`.git-intake.toml` sets `versioning = "semver"`, which git intake before 0.5.2
+refuses as an unknown key, and the contract check needs 0.5.3: run git intake
+0.5.3 or later in a clone.
+
 ## Releases
 
-A release is the pipeline of a protected tag `v<base>-sakiori.<YYYYMMDD>.<n>` on
-a commit of `main`; git-intake's README, under "Downstream releases", describes
-the scheme. The schedule's `release-tag` job cuts the tag; nobody picks a version or pushes a release tag
-by hand, and running the schedule by hand cuts an off-cycle release once `main`
-has a commit the last release lacks; a tip that already carries a release gets
-no new tag. Nor does a schedule while the group's compute minutes cannot run
-`publish-npm`: its `compute-quota` job fails and says how many remain, and once
-minutes are bought or the monthly quota resets, running the schedule by hand
-cuts the release. Rollback is
-forward: a revert on `main` and an off-cycle release. A pipeline started by hand
-on `main` is a rehearsal that publishes nothing; run one after changing the
-build.
+A release is the pipeline of a protected tag `v<x.y.z>` on a commit of `main`.
+git intake versions it under `semver`, as git-intake's README describes under
+"Semver releases": the next version follows the previous release by the largest
+change among the commits since it, the fork's own and upstream's. A breaking
+change, `!` before the colon or a `BREAKING CHANGE:` footer, raises the major
+version, `feat` the minor, `fix`, `perf` and `revert` the patch, and other
+types ask for no release; an upstream commit whose subject is no Conventional
+Commit counts as a patch, and an update to an upstream release outside the
+caret range of the one the previous release carries raises the major. The first
+semver release is `v1.0.0`; the dated releases
+`v<base>-sakiori.<YYYYMMDD>.<n>` before it stay releases. A release's tag
+records the upstream release it carries, its notes name it, and `fff-mcp
+--version` reports it as build metadata, `1.3.0+fff-0.11.0`.
+
+The schedule's `release-tag` job cuts the tag when the commits since the
+previous release ask for a release, and otherwise passes without one; nobody
+picks a version or pushes a release tag by hand. Running the schedule by hand
+cuts an off-cycle release once `main` has such a commit. Nor does a schedule
+cut one while the group's compute minutes cannot run `publish-npm`: its
+`compute-quota` job fails and says how many remain, and once minutes are bought
+or the monthly quota resets, running the schedule by hand cuts the release. Rollback is forward: a
+revert on `main` and an off-cycle release. A pipeline started by hand on `main`
+is a rehearsal at the version `<x.y.z>-rehearsal.<YYYYMMDD>` that publishes
+nothing; run one after changing the build.
 
 A failed release is finished by retrying its failed jobs, never cut again.
 Retry only the failed npm job: npm never replaces a version, so packages
 published from builds that then run again cannot be completed. If that
 happens, leave the version and cut an off-cycle release once `main` moves on.
 A failure the tagged commit itself causes cannot be retried: fix it on `main`;
-the next tag is the release and the failed tag stays.
+the next tag is the release and the failed tag stays. A dated release whose
+pipeline failed is not finished once the first semver release is published:
+its scripts publish to npm's `latest` unconditionally and would move it back.
+
+### Merge request titles
+
+A downstream merge request lands squashed with its title as the subject, so the
+title decides the change it asks for. It is a Conventional Commit,
+`<type>[(<scope>)][!]: <description>`, of the types of commitlint's
+conventional configuration: `build`, `chore`, `ci`, `docs`, `feat`, `fix`,
+`perf`, `refactor`, `revert`, `style` and `test`. A breaking change takes `!`
+before the colon or a `BREAKING CHANGE: <what breaks>` footer at the end of the
+description, which becomes the commit's body. GitLab's _Revert_ button titles a
+merge request `Revert "…"`: retitle it `revert: …`. The configuration's other
+rules hold too, among them `subject-case`, which refuses a description in
+sentence case, start case, Pascal case or upper case (`fix: Update …`), and
+`header-max-length`, which limits the title to 100 characters.
+
+The `mr-title` job checks the title in every merge request that lands squashed;
+`make mr-title-check TITLE='…'` runs the same check locally. A failure names the
+rules the title breaks in commitlint's lines above it. Both checks read the
+title without GitLab's draft prefixes, `Draft:`, `[Draft]` and `(Draft)`, which
+GitLab drops when the merge request is marked ready. A pipeline checks the title
+and description it started with, and marking a merge request ready starts no
+pipeline, while the queue merges one already on top of `main` on its last
+pipeline: once the title and description are final, run the merge request's
+pipeline before it is queued. git intake's update
+merge requests land without squashing and are not checked: git intake reads
+their upstream commits, and a subject that is no Conventional Commit counts as
+a patch.
+
+### npm versions
+
+`@sakiori/fff-node` and its platform packages are published at the release's
+version; the platform packages take it at pack time, and the Node package pins
+them exactly. npm drops build metadata, so the packages carry no upstream
+release. A version above the one npm's `latest` names is published to `latest`,
+a lower one, as when an earlier failed release is finished after a later one,
+to `superseded`.
+
+The package's contract is its public API, which API Extractor reports into the
+committed `packages/fff-node/etc/fff-node.api.md`, and the manifest's `exports`,
+`engines`, `os` and `cpu`. An unexported type the API reaches fails the report.
+After changing the package's public types, run `make node-api` and commit the
+report; `make node-api-check` fails while it is out of date. API Extractor and
+TypeScript are pinned exactly, since they write the report: an update of either
+lands in a merge request of its own, whose report diff is reviewed, since a
+report they format differently reads as removed declarations.
+
+The contract check guards the version against the contract. It builds the
+commit the merge request lands: for a squashed one, the head's tree with the
+title and description on the merge base with `main`; for one that lands
+unsquashed, the head. `git intake release version --json` on that commit gives
+its previous release and the change of the next one, and the check compares the
+commit's contract with the previous release's. A declaration of the previous
+report that the new report lacks, removed or changed, needs a major change; any
+other difference, an added declaration or a changed manifest field, needs at
+least a minor one. Members count together with the declaration that contains
+them, so a member moved to another interface counts as removed. Whether a
+change of `engines`, `os` or `cpu` breaks consumers is the author's call: mark
+it breaking when it does. A previous release without a report compares nothing.
+
+The check names the change it needs. To fix a failure:
+
+- In a squashed merge request, retitle it `feat: …` for an addition, or mark the
+  breaking change with `!` in the title or a `BREAKING CHANGE:` footer in the
+  description, and run the pipeline again.
+- In an upstream update, check out its branch `git-intake/update`, run `make
+  node-api` when the report is out of date, and push a commit on top of the
+  update's merges that marks the change, such as `feat(node): …` or `feat(node)!:
+  …`. git intake keeps such a commit through catch-ups.
+- In another merge request that lands unsquashed, push a commit that marks the
+  change, or tick _Squash commits_ and mark it in the title or description.
+
+A merge request's pipeline compares with the release before it; when the
+schedule cuts a release between that pipeline and the merge, the merge lands
+against an older comparison. So the schedule's `release-tag` job runs the check
+on the tip of `main`, as for an unsquashed merge request, before it cuts a tag,
+and cuts none when it fails: land a merge request that marks the change it
+names, then run the schedule by hand. The tag pipeline does not run the check,
+since a release tag is never moved or deleted.
+
+`make node-contract-check` runs the check on `HEAD`, as for an unsquashed merge
+request; set `CI_MERGE_REQUEST_SQUASH_ON_MERGE=true`, `CI_MERGE_REQUEST_TITLE`
+and `CI_MERGE_REQUEST_DESCRIPTION` to check a squashed one. It needs git intake
+on the `PATH`, the full history, `origin/main` and the release tags (`git fetch
+origin '+refs/tags/v*:refs/tags/v*'`).
+
+The `node-contract` job runs in every merge request: `make sync-js-api-check`,
+which checks the packages' copies of the shared TypeScript API, `make
+node-api-check`, the tests of the release scripts (`make test-ci-scripts`) and
+the contract check.
 
 ### New npm packages
 
@@ -100,8 +209,8 @@ version of a new package is published with a token:
    authentication_ checked, _Read and write_ access to the `@sakiori` scope
    (publish and stage, not stage only), expiring within days.
 2. Store it as `NPM_TOKEN`: protected, masked and hidden, environment `npm`.
-3. Release: when the tip of `main` already carries a release, land a change
-   first, then run the schedule by hand.
+3. Release: when the commits since the last release ask for none, land a
+   change that does first, then run the schedule by hand.
 4. In each new package's settings, add a GitLab CI/CD trusted publisher:
    namespace `sakiori-oss`, project `fff`, CI file `.gitlab-ci.yml`,
    environment `npm`, _Allowed actions_ `npm publish`. Under _Publishing
@@ -122,8 +231,8 @@ version of a new package is published with a token:
 - `main` protected: push No one, merge Maintainers. No rule matches
   `git-intake/update`, and merge request pipelines get no protected variables
   or runners.
-- Tags `v*-sakiori.*` protected, created by Maintainers; a release tag is never
-  moved or deleted.
+- Tags `v*` protected, created by Maintainers; a release tag is never moved or
+  deleted.
 - Package registry visible to everyone; pipeline variables allowed to no one;
   the group refuses duplicate generic packages.
 - `GITLAB_TOKEN`: the group release bot's personal access token (`api`,

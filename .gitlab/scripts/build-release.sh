@@ -5,7 +5,8 @@
 # .sha256. libfff_c and fff-mcp take separate cargo invocations, so libfff_c has the same
 # features everywhere, and both must report one build identity, which native/<target>.build-id
 # records for pack-npm.sh. Linux targets are cross-built with cargo-zigbuild, darwin targets
-# natively on macOS. The version is crates/fff-mcp/Cargo.toml's, which stamp-version.sh sets.
+# natively on macOS. The version is crates/fff-mcp/Cargo.toml's, which stamp-version.sh sets;
+# the archive's name leaves out its build metadata, as the release tag does.
 #
 #   .gitlab/scripts/build-release.sh <target>
 set -euo pipefail
@@ -104,7 +105,7 @@ build_crates "$lib_flags" "$lib_dir" fff-c
 [[ -f "$lib" ]] || fail "the build left no $lib"
 echo "build identity $identity"
 
-name="fff-mcp-v$version-$target"
+name="fff-mcp-v${version%%+*}-$target"
 stage="target/stage/$name"
 rm -rf "$stage"
 mkdir -p "$stage"

@@ -1,10 +1,32 @@
-# fff - Fast File Finder
+# @sakiori/fff-node
 
-High-performance fuzzy file finder for Node.js, powered by Rust. Extremely fast live file, content, and directory search with a typo-resistant algorithm. As well as regex, plain-text, multi-occurrence and typo-resistant content search.
+Fast, typo-resistant file, directory and content search for Node.js, from the
+[sakiori-oss fork of fff](https://gitlab.com/sakiori-oss/fff). The search itself is upstream
+fff's: fuzzy path matching, globs, plain-text, regex and multi-pattern grep, git status and
+frecency ranking.
 
-Comes with built-in git status support, frecency ranking, content indexing and many more! Designed for LLM agent tools that search through codebases or agentic RAG document search.
+The difference is where the index lives. Upstream's `@ff-labs/fff-node` keeps it in your
+process. This package keeps it in the shared fff service of the current OS user, which the
+`fff-mcp` agents of the same fork release use too, so an application and its agents index a
+directory once.
 
-This is the Node package of the fork of fff at <https://gitlab.com/sakiori-oss/fff>. Its indexes live in the shared fff service of the current OS user, which `fff-mcp` agents of the same release use too, so a directory that an application and its agents search is indexed once.
+Compared with `@ff-labs/fff-node`, this package:
+
+- returns a Promise from `FileFinder.create` and from every instance method except
+  `getBasePath`, `isDestroyed` and the methods listed as unavailable below, and runs each
+  call off the event loop; upstream's `destroy`, `isScanning`, searches and greps are
+  synchronous. Results keep upstream's `Result` shape;
+- fails a call after a bound when the service does not answer (`timeoutMs` in
+  `FileFinder.create`, see [Timeouts](#timeouts));
+- adds `notifyChanged` for files your program changes, `excludeFrecency` for rankings
+  without the shared frecency, `serviceDir` for a separate service namespace, and repository
+  and ref events in `watch`;
+- shares a service only with the `fff-mcp` of the same fork release, which has the
+  package's version;
+- has no `waitForScanBlocking`; `trackQuery`, `getHistoricalQuery` and `refreshGitStatus`
+  return an error, `reindex` rescans only the instance's own directory, `historyDbPath` is
+  not supported, and `cacheBudgetMaxBytes` and `cacheBudgetMaxFileSize` are ignored
+  ([Unavailable methods](#unavailable-methods)).
 
 ## Installation
 
@@ -25,9 +47,15 @@ The native library and the `fff-mcp` service executable come in platform package
 
 The package installs on macOS, Linux and FreeBSD, on x64 and ARM64; npm and pnpm refuse it on any other platform (`EBADPLATFORM`). FreeBSD has no platform package: build the native files from source (see [Platforms without a prebuilt package](#platforms-without-a-prebuilt-package)), or `FileFinder.create` fails with `unsupportedPlatform`. An install that omits optional dependencies has no native files, and `FileFinder.create` fails with `libraryUnavailable`. The glibc packages need glibc 2.28 or later.
 
-A project that imports the upstream name `@ff-labs/fff-node` keeps its imports with a package-manager alias: `npm install @ff-labs/fff-node@npm:@sakiori/fff-node@<version>`.
+A project that imports the upstream name `@ff-labs/fff-node` can keep its imports with a package-manager alias, `npm install @ff-labs/fff-node@npm:@sakiori/fff-node@^1.0.0`, but its calls still need the changes listed at the top.
 
 Requires Node.js 20.19 or later in the 20 line, or 22.12 and later. The package is an ES module; CommonJS `require` loads the same module, which relies on `require` of ES modules in those Node.js versions. In Electron, that takes a release whose bundled Node.js is one of them.
+
+### Versions
+
+The package is published at the version of the fork release that builds it, a semantic version of the fork's own: a breaking change of the package's API or its `exports` raises the major version, an addition the minor, and a fix the patch. A change of the platforms or Node.js versions it supports raises at least the minor version, and the maintainers mark one that drops support as breaking; a release that changes only the native code is a new version too. Depend on a range of one major, such as the `^1.0.0` that `npm install` writes, to take every later release of it. The platform packages come at exactly the Node package's version. The package shares its service with the `fff-mcp` archives of the same version; the release's notes name the upstream fff release it carries.
+
+Versions before 1.0.0, `0.11.1-sakiori.<date>.<n>`, were prereleases, which a range does not follow past their own `major.minor.patch`; replace an exact pin of one with `^1.0.0`.
 
 ### Electron
 
@@ -147,7 +175,7 @@ A service that does not answer makes `FileFinder.create` fail after 90 seconds a
 
 ## Unavailable methods
 
-`trackQuery`, `getHistoricalQuery` and `refreshGitStatus` have no shared service equivalent and return an error naming them as unavailable over the shared service; the service keeps the index and git status current itself. `reindex` rescans the instance's own directory; create a new instance for another directory. `historyDbPath` is not supported.
+`waitForScanBlocking` does not exist; await `waitForScan` or `waitForIndexReady`. `trackQuery`, `getHistoricalQuery` and `refreshGitStatus` have no shared service equivalent and return an error naming them as unavailable over the shared service; the service keeps the index and git status current itself. `reindex` rescans the instance's own directory; create a new instance for another directory. `historyDbPath` is not supported.
 
 ## API Reference
 

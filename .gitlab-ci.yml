@@ -1,15 +1,16 @@
 # Pipelines of sakiori-oss/fff on GitLab.com. CUSTOM.md describes the release process and the
 # project settings it relies on.
 #
-# - Merge request: fmt, clippy, lint-mcp, ci-scripts, native-tests and node-tests on Linux, and
-#   check-build-linux, the Linux release builds, when a change can affect the build.
+# - Merge request: fmt, clippy, lint-mcp, ci-scripts, native-tests, node-tests and node-contract
+#   on Linux, mr-title when the merge request lands squashed, and check-build-linux, the Linux
+#   release builds, when a change can affect the build.
 # - Push to main: macos-tests, the native suite on the macOS runner.
 # - Schedule on main: git-intake-sync takes upstream through a merge request, and release-tag
-#   cuts v<base>-sakiori.<YYYYMMDD>.<n> on the tip unless a release points at it, once
+#   checks the tip's contract and cuts the next v<x.y.z> on it when its commits ask for one, once
 #   compute-quota finds the group's compute minutes enough for publish-npm.
 # - Release tag: release-check, release-version, build-linux, build-darwin and macos-tests,
 #   pack-npm, sign, publish-npm, publish, and release last: the GitLab Release.
-# - Started by hand on main: a rehearsal of a release with the version <base>-sakiori.<day>.0,
+# - Started by hand on main: a rehearsal of a release with the version <x.y.z>-rehearsal.<day>,
 #   whose rehearse-npm only reads the registry; nothing is signed or published.
 #
 # Linux jobs run on the group's x86_64 Linux runner, tagged sakiori-oss-linux, except
@@ -24,7 +25,7 @@ workflow:
   rules:
     - if: $CI_PIPELINE_SOURCE == "merge_request_event"
     # The Linux runner keeps a working copy that merge request jobs also use, so a release clones.
-    - if: $CI_COMMIT_TAG =~ /^v\d+\.\d+\.\d+-sakiori\.\d{8}\.[1-9]\d?$/
+    - if: $CI_COMMIT_TAG =~ /^v(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)$/
       variables:
         GIT_STRATEGY: clone
     - if: $CI_COMMIT_TAG
@@ -53,8 +54,8 @@ variables:
   TOOLS: $CI_PROJECT_DIR/.tools
   # The git-intake release the release jobs install, with its x86_64-unknown-linux-musl
   # archive's SHA-256.
-  GIT_INTAKE_VERSION: "0.5.1"
-  GIT_INTAKE_SHA256_X86_64_LINUX: b243b3051e11b6d859ca3b5ab87a91c3f734e7f46f69e7c5ba88411f8a8e5291
+  GIT_INTAKE_VERSION: "0.5.3"
+  GIT_INTAKE_SHA256_X86_64_LINUX: c9cbd2c32e2651454648f163f438865351a28fe395aab773b380d47bc204f90d
 
 default:
   image: $RUST_IMAGE
@@ -140,6 +141,47 @@ native-tests:
     - make test-rust
     - make test-mcp
 
+# The Node package's contract: its API report is current, and the change the commits of the
+# commit the merge request lands ask for covers the contract's change since the previous release.
+# The contract check runs git intake, which reads the full history; it compares with the release
+# tags, which the job fetches with the target branch. Also the tests of the release scripts.
+node-contract:
+  extends: .check
+  variables:
+    GIT_DEPTH: "0"
+  before_script:
+    - .gitlab/scripts/install-tools.sh "$TOOLS" node git-intake
+    - export PATH="$TOOLS/bin:$PATH"
+  cache: []
+  script:
+    - (cd packages && npm ci --workspace fff-node --ignore-scripts --no-audit --no-fund)
+    - git fetch --quiet --no-tags --prune origin '+refs/tags/v*:refs/tags/v*'
+      "+refs/heads/$CI_MERGE_REQUEST_TARGET_BRANCH_NAME:refs/remotes/origin/$CI_MERGE_REQUEST_TARGET_BRANCH_NAME"
+    - make sync-js-api-check
+    - make node-api-check
+    - make test-ci-scripts
+    - make node-contract-check
+
+# A merge request that lands squashed lands its title as the subject git intake versions the next
+# release by, so the title is a Conventional Commit. The update's merge requests land unsquashed.
+mr-title:
+  extends: .check
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event" && $CI_MERGE_REQUEST_SQUASH_ON_MERGE == "true"
+  before_script:
+    - .gitlab/scripts/install-tools.sh "$TOOLS" node
+    - export PATH="$TOOLS/bin:$PATH"
+  cache: []
+  script:
+    - (cd .gitlab/scripts && npm ci --ignore-scripts --no-audit --no-fund)
+    # The title without GitLab's draft prefix, which it drops when the merge request is ready.
+    - |
+      node .gitlab/scripts/mr-title.mjs "$CI_MERGE_REQUEST_TITLE" |
+        .gitlab/scripts/node_modules/.bin/commitlint --config .gitlab/scripts/commitlint.config.mjs || {
+        echo "commitlint's lines above name the rules the title breaks. It must be a Conventional Commit, <type>[(<scope>)][!]: <description>, such as fix(watch): …; CUSTOM.md, Merge request titles, lists the rules." >&2
+        exit 1
+      }
+
 # The Node package's tests against a release build of libfff_c and fff-mcp.
 node-tests:
   extends: .check
@@ -222,12 +264,19 @@ compute-quota:
     - export PATH="$TOOLS/bin:$PATH"
     - .gitlab/scripts/check-compute-quota.sh "$PUBLISH_NPM_MINUTES"
 
+# The contract check runs on the tip first: a release cut after a merge request's pipeline can
+# change the release that pipeline compared with, so release-tag cuts nothing the tip does not mark.
 release-tag:
   extends: .git-intake-bot
   needs:
     - job: compute-quota
   resource_group: release-tag
   script:
+    - .gitlab/scripts/install-tools.sh "$TOOLS" node
+    - git fetch --quiet --no-tags --prune origin '+refs/tags/v*:refs/tags/v*'
+      "+refs/heads/$CI_DEFAULT_BRANCH:refs/remotes/origin/$CI_DEFAULT_BRANCH"
+    - git checkout --quiet --detach "origin/$CI_DEFAULT_BRANCH"
+    - node .gitlab/scripts/contract-check.mjs
     - git intake release tag
 
 # A release builds nothing before its tag passes the check; the notes are written with it.
@@ -246,7 +295,8 @@ release-check:
       - release-notes.md
     expire_in: 30 days
 
-# The version every build stamps: the tag's, or a rehearsal's <base>-sakiori.<YYYYMMDD>.0.
+# The version of every build and package: RELEASE_VERSION, the tag's x.y.z or a rehearsal's
+# <x.y.z>-rehearsal.<YYYYMMDD>, and RELEASE_UPSTREAM, the upstream release it carries.
 release-version:
   extends: .git-intake
   stage: check
@@ -278,7 +328,7 @@ release-version:
           - aarch64-unknown-linux-gnu
   script:
     - .gitlab/scripts/install-tools.sh "$TOOLS" cargo-zigbuild
-    - if [ -n "${RELEASE_VERSION:-}" ]; then .gitlab/scripts/stamp-version.sh "$RELEASE_VERSION"; fi
+    - if [ -n "${RELEASE_VERSION:-}" ]; then .gitlab/scripts/stamp-version.sh "$RELEASE_VERSION+$RELEASE_UPSTREAM"; fi
     - .gitlab/scripts/build-release.sh "$TARGET"
   artifacts:
     paths:
@@ -362,7 +412,7 @@ build-darwin:
           - aarch64-apple-darwin
           - x86_64-apple-darwin
   script:
-    - .gitlab/scripts/stamp-version.sh "$RELEASE_VERSION"
+    - .gitlab/scripts/stamp-version.sh "$RELEASE_VERSION+$RELEASE_UPSTREAM"
     - .gitlab/scripts/build-release.sh "$TARGET"
   artifacts:
     paths:

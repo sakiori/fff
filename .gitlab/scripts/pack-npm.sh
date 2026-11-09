@@ -27,6 +27,9 @@ fail() {
 }
 
 : "${RELEASE_VERSION:?RELEASE_VERSION names the version to pack}"
+# A release's x.y.z or a rehearsal's x.y.z-rehearsal.<YYYYMMDD>; npm drops build metadata.
+[[ "$RELEASE_VERSION" =~ ^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-rehearsal\.[0-9]{8})?$ ]] ||
+  fail "RELEASE_VERSION $RELEASE_VERSION is not a release or rehearsal version"
 
 # The platforms to pack: all, or those of the targets named.
 selected=()

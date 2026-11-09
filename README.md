@@ -36,7 +36,7 @@ packages in the rest of this README install upstream, without the shared service
 ### Installing the MCP server
 
 Install a release with [mise](https://mise.jdx.dev), where `<version>` is the release tag
-without its leading `v`, or `latest` for the newest release:
+without its leading `v`, such as `1.0.0`, or `latest` for the newest release:
 
 ```sh
 mise use -g gitlab:sakiori-oss/fff@<version>
@@ -59,8 +59,9 @@ every client's registration together.
 npm install @sakiori/fff-node
 ```
 
-The package shares a service only with the `fff-mcp` of the same fork release, so install
-the package version that matches your `fff-mcp`. The
+`npm install` records a range such as `^1.0.0`, which takes every later release of the
+same major version. The package shares a service only with the `fff-mcp` of the same fork
+release, so install the package version that matches your `fff-mcp`. The
 [package README](./packages/fff-node/README.md) covers the API and the supported platforms.
 
 ### Installing the C library
@@ -84,11 +85,16 @@ cosign verify-blob --bundle <file>.sigstore.json \
 
 ## Release versions
 
-A release is tagged `v<base>-sakiori.<YYYYMMDD>.<n>`. `<base>` is the version after the
-newest upstream release the fork contains, so `0.11.1-sakiori.*` carries upstream `0.11.0`
-and the upstream commits after it. The date and the day's number order the releases.
-The npm packages are published at the release's version. Each release's notes list the
-fork's own changes and the upstream updates it took.
+A release is tagged `v<x.y.z>`, a semantic version of the fork's own, starting at `1.0.0`:
+a breaking change of the fork, its Node package's API among it, or an update to an
+incompatible upstream release raises the major version, a feature the minor, a fix the
+patch. The `fff-mcp` archives and the npm packages carry the release's version, so a range
+such as `^1.0.0` takes every later release of the major version. Each release's notes name
+the upstream release it carries, with the number of upstream commits after it, and list
+the fork's own changes and the upstream updates it took; `fff-mcp --version` reports the
+upstream release as build metadata, `1.3.0+fff-0.11.0`. The releases before `1.0.0`,
+`0.11.1-sakiori.<YYYYMMDD>.<n>`, were prereleases, which a range does not follow; replace
+an exact pin of one with `^1.0.0`.
 
 ## Issues and maintenance
 

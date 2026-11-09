@@ -57,6 +57,7 @@ export type {
   DirSearchOptions,
   DirSearchResult,
   FileItem,
+  GlobOptions,
   GrepCursor,
   GrepMatch,
   GrepMode,
