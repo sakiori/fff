@@ -270,6 +270,8 @@ impl Target {
                     .map(std::path::absolute)
                     .transpose()?,
                 log_level: config.log_level.clone(),
+                // Programs set it through FFF_FULL_PARALLEL_INDEXING, which the service inherits.
+                full_parallel_indexing: false,
             },
             connect_timeout: config.connect_timeout,
             response_timeout: config.response_timeout,

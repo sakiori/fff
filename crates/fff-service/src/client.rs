@@ -85,6 +85,7 @@ pub struct Launcher {
     pub idle_timeout_secs: u64,
     pub log_file: Option<PathBuf>,
     pub log_level: Option<String>,
+    pub full_parallel_indexing: bool,
 }
 
 enum Attempt {
@@ -297,6 +298,9 @@ fn spawn_service(launcher: &Launcher, namespace: &Namespace, build: &Build) -> i
     }
     if let Some(log) = &launcher.log_file {
         command.arg("--log-file").arg(std::path::absolute(log)?);
+    }
+    if launcher.full_parallel_indexing {
+        command.arg("--full-parallel-indexing");
     }
     detach(&mut command, namespace)
 }

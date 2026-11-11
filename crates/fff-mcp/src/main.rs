@@ -111,6 +111,19 @@ pub(crate) struct Args {
     #[arg(long = "no-watch")]
     no_watch: bool,
 
+    /// Index with all cores (performance cores on macOS) instead of half of them.
+    /// Faster startup on very large repos, but uses more CPU and searches made
+    /// while indexing wait for it. Also settable via FFF_FULL_PARALLEL_INDEXING=1.
+    #[arg(
+        long = "full-parallel-indexing",
+        env = "FFF_FULL_PARALLEL_INDEXING",
+        num_args = 0..=1,
+        default_missing_value = "true",
+        default_value_t = false,
+        value_parser = clap::builder::BoolishValueParser::new()
+    )]
+    full_parallel_indexing: bool,
+
     /// Maximum number of files whose content is kept persistently in memory.
     /// Files beyond this limit are still searchable via temporary mmaps that
     /// are released after each grep. `0` disables persistent caching entirely.
@@ -238,6 +251,7 @@ async fn run(mut args: Args) -> Result<(), Box<dyn std::error::Error>> {
         if !args.no_update_check {
             update_check::spawn_update_check();
         }
+        fff::set_full_parallel_indexing(args.full_parallel_indexing);
         service::run(&args, &build).await?;
     } else {
         client::run(&args, &build).await?;

@@ -871,7 +871,7 @@ fn apply_debounced_events(
         (ref_signals.as_ref()).is_some_and(|signals| signals.ref_only(path, base_path))
     };
     let ignore_options = &options.ignore_options;
-    let filter = IgnoreFilter::new(
+    let mut filter = IgnoreFilter::new(
         base_path,
         walker_rules,
         repo.as_ref(),
@@ -945,7 +945,7 @@ fn apply_debounced_events(
         if let Some(signals) = &ref_signals
             && signals.may_hold(path, base_path)
         {
-            let ignored = |work_tree: &Path| filter.is_ignored(work_tree);
+            let ignored = |work_tree: &Path| filter.is_ignored(work_tree, true);
             signals.classify(path, kind, ignored, &mut ref_changes);
         }
         // A repository whose work tree or git dir went, or a directory above them, is
@@ -962,14 +962,15 @@ fn apply_debounced_events(
             && let Some(root) = git_state_root(shared_picker, path)
             && git_workdir.as_deref() != Some(root.as_path())
             && root.starts_with(base_path)
-            && !filter.is_ignored(&root)
+            && !filter.is_ignored(&root, true)
         {
             // A repository nested in the index, which the walk and its watches reach.
             git.roots.insert(root);
         }
     }
     if let Some(signals) = &ref_signals {
-        let told = |work_tree: &Path| signals.is_own(work_tree) || !filter.is_ignored(work_tree);
+        let mut told =
+            |work_tree: &Path| signals.is_own(work_tree) || !filter.is_ignored(work_tree, true);
         git.ref_roots
             .extend((ref_changes.work_trees.into_iter()).filter(|work_tree| told(work_tree)));
         git.heads_beside
@@ -1000,7 +1001,7 @@ fn apply_debounced_events(
                     .paths
                     .iter()
                     // but we are smart enough and not falling into the paths
-                    .all(|p| !p.is_dir() && !filter.is_ignored(p));
+                    .all(|p| !p.is_dir() && !filter.is_ignored(p, false));
 
             if !small_and_known && try_trigger_full_rescan(RescanReason::KernelEventLoss) {
                 return Vec::new();
@@ -1029,7 +1030,7 @@ fn apply_debounced_events(
             if ignore_file_changed {
                 if path
                     .parent()
-                    .is_some_and(|parent| filter.is_ignored(parent))
+                    .is_some_and(|parent| filter.is_ignored(parent, true))
                 {
                     continue;
                 }
@@ -1066,7 +1067,7 @@ fn apply_debounced_events(
                     && !outside
                     && path.file_name().is_some_and(|name| name == ".git")
                     && path.parent().is_some_and(|parent| {
-                        git_workdir.as_deref() != Some(parent) && !filter.is_ignored(parent)
+                        git_workdir.as_deref() != Some(parent) && !filter.is_ignored(parent, true)
                     })
                     && path.symlink_metadata().is_ok()
                     && let Some(work_tree) = path.parent()
@@ -1121,13 +1122,13 @@ fn apply_debounced_events(
                         if known_file {
                             paths_to_remove.push((path.as_path(), false));
                         }
-                        if !filter.is_ignored(path) {
+                        if !filter.is_ignored(path, true) {
                             new_dirs_to_watch.push(path.to_path_buf());
                         }
                     }
                 }
                 PathState::Dir { .. } if !is_removal => {
-                    if !filter.is_ignored(path) {
+                    if !filter.is_ignored(path, true) {
                         new_dirs_to_watch.push(path.to_path_buf());
                     }
                 }
@@ -1148,7 +1149,7 @@ fn apply_debounced_events(
                 }
                 PathState::File => {
                     // For additions/modifications, still filter gitignored files.
-                    if !filter.is_ignored(path) {
+                    if !filter.is_ignored(path, false) {
                         paths_to_add_or_modify.push(path.as_path());
                     }
                 }
@@ -1818,7 +1819,7 @@ impl Drop for DirSubscriptions {
 
 struct IgnoreFilter<'a> {
     base_path: &'a Path,
-    /// Reusable ignore rules from the last walk (zlob backend only).
+    // Ignore rules from the last walk.
     rules: Option<Arc<crate::walk::WalkIgnoreRules>>,
     /// libgit2 repo, consulted only when `rules` is `None`. Borrowed from the
     /// caller's repo (also used for git-status queries) to avoid re-opening.
@@ -1841,16 +1842,15 @@ impl<'a> IgnoreFilter<'a> {
         }
     }
 
-    /// Whether `path` (absolute) is ignored.
-    fn is_ignored(&self, path: &Path) -> bool {
-        if let Some(rules) = self.rules.as_ref() {
+    fn is_ignored(&mut self, path: &Path, is_dir: bool) -> bool {
+        if let Some(rules) = self.rules.as_mut() {
             let Ok(relative) = path.strip_prefix(self.base_path) else {
                 return false;
             };
-            // `IgnoreRules::is_ignored` enumerates every ancestor .gitignore
-            // layer internally, so a leaf under an ignored directory (rule
-            // `build/`, path `build/out.rs`) is caught in one call.
-            return rules.is_ignored(relative);
+            // Ripgrep caches directory rules. Start each batch with the unloaded matcher.
+            #[cfg(not(feature = "zlob"))]
+            let rules = Arc::make_mut(rules);
+            return rules.is_ignored(relative, is_dir);
         }
         match self.repo {
             Some(repo) => repo.is_path_ignored(path) == Ok(true),

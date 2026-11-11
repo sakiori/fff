@@ -1,6 +1,6 @@
 use crate::ignore::non_git_repo_overrides;
 use crate::types::FileItem;
-use crate::walk::{DirHook, WalkOutput, WalkPolicy};
+use crate::walk::{DirHook, WalkIgnoreRules, WalkOutput, WalkPolicy};
 use crate::watch::is_git_file;
 use ignore::WalkBuilder;
 use std::path::Path;
@@ -119,6 +119,9 @@ pub(crate) fn walk_collect_files(
     Ok(WalkOutput {
         pairs,
         dirs,
-        ignore_rules: None,
+        // Ripgrep lets .ignore re-include hidden entries in a non-Git root.
+        ignore_rules: (!is_git_repo).then(|| WalkIgnoreRules {
+            inner: walk_builder.build_matchers().pop().expect("one walk root"),
+        }),
     })
 }

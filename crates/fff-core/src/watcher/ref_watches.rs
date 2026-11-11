@@ -322,7 +322,7 @@ impl RefSignals {
         &self,
         path: &Path,
         kind: EventKind,
-        ignored: impl Fn(&Path) -> bool,
+        mut ignored: impl FnMut(&Path) -> bool,
         changes: &mut RefChanges,
     ) {
         if path
@@ -358,7 +358,7 @@ impl RefSignals {
                     changes.work_trees.insert(followed.work_tree.clone());
                 }
                 if below_admin_dir.is_some_and(|below| moves_head(followed.storage, below)) {
-                    match self.named_holder(path, &ignored) {
+                    match self.named_holder(path, &mut ignored) {
                         Some(holder) if holder.git_dir == followed.git_dir => {}
                         Some(holder) => {
                             let beside = (holder.work_tree.clone(), followed.work_tree.clone());
@@ -441,7 +441,11 @@ impl RefSignals {
     }
 
     // The followed worktree whose admin dir holds `path`, if the index tells of it by name.
-    fn named_holder(&self, path: &Path, ignored: &impl Fn(&Path) -> bool) -> Option<&Followed> {
+    fn named_holder(
+        &self,
+        path: &Path,
+        ignored: &mut impl FnMut(&Path) -> bool,
+    ) -> Option<&Followed> {
         self.followed.iter().find(|followed| {
             followed.linked_holds(path)
                 && (self.is_own(&followed.work_tree) || !ignored(&followed.work_tree))

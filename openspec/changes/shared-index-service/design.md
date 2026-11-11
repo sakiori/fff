@@ -62,7 +62,9 @@ Inputs below a per-path threshold stay on the caller. Literal, regex,
 multi-pattern and fuzzy grep, constraint filtering, fuzzy file and directory
 matching, scoring and frecency ranking use this dispatch; candidate selection,
 sorting, pagination and per-file line matching run serially on the caller.
-Scanning and content-index builds run on the separate background pool.
+Scanning and content-index builds run on the separate background pool. A
+service started with full-parallel indexing runs them on the search pool
+instead, so searches made during a scan queue behind it.
 
 Dedicated pools per session would isolate requests but multiply threads, and
 serializing searches would remove useful concurrency; the scoped Rayon API
