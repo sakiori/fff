@@ -281,4 +281,13 @@ mod tests {
         assert_eq!(path.file_name().unwrap(), "fff_mcp.log");
         assert_eq!(path.parent().unwrap().file_name().unwrap(), "fff");
     }
+
+    // The launcher passes the client's value in this form; clap prefers it over the inherited env.
+    #[test]
+    fn full_parallel_indexing_takes_an_explicit_value() {
+        let parse = |flag: &str| Args::try_parse_from(["fff-mcp", flag]).unwrap();
+        assert!(!parse("--full-parallel-indexing=false").full_parallel_indexing);
+        assert!(parse("--full-parallel-indexing=true").full_parallel_indexing);
+        assert!(parse("--full-parallel-indexing").full_parallel_indexing);
+    }
 }

@@ -64,7 +64,8 @@ matching, scoring and frecency ranking use this dispatch; candidate selection,
 sorting, pagination and per-file line matching run serially on the caller.
 Scanning and content-index builds run on the separate background pool. A
 service started with full-parallel indexing runs them on the search pool
-instead, so searches made during a scan queue behind it.
+instead, so searches made during a scan queue behind it. The client that starts
+the service decides it; a client that joins a running service does not change it.
 
 Dedicated pools per session would isolate requests but multiply threads, and
 serializing searches would remove useful concurrency; the scoped Rayon API

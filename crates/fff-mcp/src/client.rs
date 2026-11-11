@@ -47,7 +47,7 @@ pub(crate) async fn run(args: &crate::Args, build: &Build) -> Result<(), ClientE
         idle_timeout_secs: args.idle_timeout_secs,
         log_file: args.log_file.clone(),
         log_level: args.log_level.clone(),
-        full_parallel_indexing: args.full_parallel_indexing,
+        full_parallel_indexing: Some(args.full_parallel_indexing),
     };
     let (connection, warnings) =
         open_session(&namespace, build, &hello, &launcher, CONNECT_TIMEOUT).await?;
