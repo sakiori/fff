@@ -13,24 +13,36 @@
 # - Started by hand on main: a rehearsal of a release with the version <x.y.z>-rehearsal.<day>,
 #   whose rehearse-npm only reads the registry; nothing is signed or published.
 #
-# Linux jobs run on the group's x86_64 Linux runner, tagged sakiori-oss-linux, except
-# publish-npm, which npm's trusted publishing keeps on GitLab.com's shared runners. Apple's SDK
-# may be used only on Apple hardware, so darwin targets build natively on the forks' Apple
-# silicon runner, which takes this project's jobs tagged sakiori-oss-macos only from protected
-# refs and runs each in a disposable macOS virtual machine. Release
-# jobs run only in this project. Tools are pinned by version and SHA-256 in
-# .gitlab/scripts/install-tools.sh, images by digest.
+# Linux jobs run on one of the group's two x86_64 Linux runners, except publish-npm, which npm's
+# trusted publishing keeps on GitLab.com's shared runners. A pipeline that GitLab runs for a
+# protected ref, the release tags' and the default branch's, uses the runner tagged
+# sakiori-oss-linux-protected, which takes protected refs only; every other pipeline, merge
+# request pipelines among them, uses the one tagged sakiori-oss-linux. Apple's SDK may be used
+# only on Apple hardware, so darwin targets build natively on the forks' Apple silicon runner,
+# which takes this project's jobs tagged sakiori-oss-macos only from protected refs and runs
+# each in a disposable macOS virtual machine. Release jobs run only in this project. Tools are
+# pinned by version and SHA-256 in .gitlab/scripts/install-tools.sh, images by digest.
 
 workflow:
   rules:
-    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
-    # The Linux runner keeps a working copy that merge request jobs also use, so a release clones.
-    - if: $CI_COMMIT_TAG =~ /^v(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)$/
-      variables:
-        GIT_STRATEGY: clone
-    - if: $CI_COMMIT_TAG
+    # Merge request pipelines, release tags and the default branch's pushes, schedules and
+    # pipelines started by hand or by the API run; no other pipeline does.
+    - if: $CI_COMMIT_TAG && $CI_COMMIT_TAG !~ /^v(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)$/
       when: never
-    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH && $CI_PIPELINE_SOURCE =~ /^(push|schedule|web|api)$/
+    - if: $CI_COMMIT_BRANCH && $CI_COMMIT_BRANCH != $CI_DEFAULT_BRANCH
+      when: never
+    - if: $CI_COMMIT_BRANCH && $CI_PIPELINE_SOURCE !~ /^(push|schedule|web|api)$/
+      when: never
+    # GitLab gives a pipeline protected runners exactly when CI_COMMIT_REF_PROTECTED is true. The
+    # protected runner runs build code, dependencies' build scripts included, beside the jobs that
+    # hold credentials, so each of its jobs clones a fresh working copy.
+    - if: $CI_COMMIT_REF_PROTECTED == "true"
+      variables:
+        LINUX_RUNNER: sakiori-oss-linux-protected
+        GIT_STRATEGY: clone
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event" || $CI_COMMIT_TAG || $CI_COMMIT_BRANCH
+      variables:
+        LINUX_RUNNER: sakiori-oss-linux
   auto_cancel:
     on_new_commit: none
 
@@ -60,7 +72,7 @@ variables:
 default:
   image: $RUST_IMAGE
   tags:
-    - sakiori-oss-linux
+    - $LINUX_RUNNER
   interruptible: false
   retry:
     max: 1
@@ -213,7 +225,6 @@ node-tests:
     action: prepare
   variables:
     GIT_DEPTH: "0"
-    GIT_STRATEGY: clone
   before_script:
     - '[ -n "${GITLAB_TOKEN:-}" ] || { echo "GITLAB_TOKEN is not set; CUSTOM.md, Project settings, describes it" >&2; exit 1; }'
     - .gitlab/scripts/install-tools.sh "$TOOLS" git-intake
@@ -256,7 +267,6 @@ compute-quota:
     action: prepare
   cache: []
   variables:
-    GIT_STRATEGY: clone
     # publish-npm takes under two minutes; the rest covers a retry.
     PUBLISH_NPM_MINUTES: "10"
   script:
