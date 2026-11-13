@@ -3,8 +3,8 @@
 `sakiori-oss/fff` is a downstream fork of
 [fff](https://github.com/dmtrKovalenko/fff) that follows upstream `main`. This
 file holds the rules for maintaining it that the repository itself does not
-show. What a change does and why is in its commit; requirements are in
-`openspec/`, and the Node package is documented in `packages/fff-node/README.md`.
+show. What a change does and why is in its commit, and the Node package is
+documented in `packages/fff-node/README.md`.
 
 ## Merging into `main`
 
