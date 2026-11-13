@@ -1356,6 +1356,32 @@ fn different_builds_run_side_by_side() {
     wait_stopped(&service, &pids);
 }
 
+// A test that forks while this one writes an executable hands its child the open file, and
+// running the executable then fails with ETXTBSY; a child that writes it keeps it out of every fork.
+fn write_executable(to: &Path, appended: &[u8]) {
+    #[cfg(unix)]
+    {
+        let mut writer = Command::new("sh")
+            .args(["-c", r#"cp -- "$1" "$2" && cat >> "$2""#, "sh", BIN])
+            .arg(to)
+            .stdin(Stdio::piped())
+            .spawn()
+            .unwrap();
+        writer.stdin.take().unwrap().write_all(appended).unwrap();
+        assert!(writer.wait().unwrap().success());
+    }
+    #[cfg(windows)]
+    {
+        std::fs::copy(BIN, to).unwrap();
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(to)
+            .unwrap()
+            .write_all(appended)
+            .unwrap();
+    }
+}
+
 // The identity is compiled in, so a copy that was moved, re-signed or otherwise
 // changed after the build joins the original's service.
 #[test]
@@ -1368,13 +1394,7 @@ fn copied_executable_joins_the_same_service() {
         .join("copy")
         .join(Path::new(BIN).file_name().unwrap());
     std::fs::create_dir_all(copy.parent().unwrap()).unwrap();
-    std::fs::copy(BIN, &copy).unwrap();
-    std::fs::OpenOptions::new()
-        .append(true)
-        .open(&copy)
-        .unwrap()
-        .write_all(b"appended after the build")
-        .unwrap();
+    write_executable(&copy, b"appended after the build");
     let copy = copy.to_str().unwrap();
     let mut original = Client::start(&project, &service);
     let mut copied = Client::start_configured(copy, &project, &service, "1", &[], &[]);
@@ -2929,7 +2949,7 @@ fn a_started_service_holds_nothing_of_the_program_that_started_it() {
     let appdir = tmp.path().join("mount");
     std::fs::create_dir(&appdir).unwrap();
     let binary = appdir.join("fff-mcp");
-    std::fs::copy(BIN, &binary).unwrap();
+    write_executable(&binary, b"");
     // A pipe without close-on-exec, as an application runtime keeps to hold its mount, at a
     // free descriptor number high enough that the service has no reason to use it itself.
     let (keep_read, _keep_write) = rustix::pipe::pipe().unwrap();
