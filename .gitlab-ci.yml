@@ -13,15 +13,17 @@
 # - Started by hand on main: a rehearsal of a release with the version <x.y.z>-rehearsal.<day>,
 #   whose rehearse-npm only reads the registry; nothing is signed or published.
 #
-# Linux jobs run on one of the group's two x86_64 Linux runners, except publish-npm, which npm's
+# Linux jobs run on one of the group's x86_64 Linux runners, except publish-npm, which npm's
 # trusted publishing keeps on GitLab.com's shared runners. A pipeline that GitLab runs for a
 # protected ref, the release tags' and the default branch's, uses the runner tagged
-# sakiori-oss-linux-protected, which takes protected refs only; every other pipeline, merge
-# request pipelines among them, uses the one tagged sakiori-oss-linux. Apple's SDK may be used
-# only on Apple hardware, so darwin targets build natively on the forks' Apple silicon runner,
-# which takes this project's jobs tagged sakiori-oss-macos only from protected refs and runs
-# each in a disposable macOS virtual machine. Release jobs run only in this project. Tools are
-# pinned by version and SHA-256 in .gitlab/scripts/install-tools.sh, images by digest.
+# sakiori-oss-linux-protected, which takes protected refs only; the merge queue's pipelines,
+# which sakiori-merge starts for a head it rebased, use the unprotected one tagged
+# sakiori-oss-queue; every other pipeline, the other merge request pipelines among them, uses the
+# one tagged sakiori-oss-linux. Apple's SDK may be used only on Apple hardware, so darwin targets
+# build natively on the forks' Apple silicon runner, which takes this project's jobs tagged
+# sakiori-oss-macos only from protected refs and runs each in a disposable macOS virtual machine.
+# Release jobs run only in this project. Tools are pinned by version and SHA-256 in
+# .gitlab/scripts/install-tools.sh, images by digest.
 
 workflow:
   rules:
@@ -40,6 +42,11 @@ workflow:
       variables:
         LINUX_RUNNER: sakiori-oss-linux-protected
         GIT_STRATEGY: clone
+    # The merge queue's pipeline, of a head the queue rebased and lands on success, runs on slots
+    # no other pipeline takes, so a landing never waits behind other merge requests' checks.
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event" && $GITLAB_USER_LOGIN == "sakiori-merge"
+      variables:
+        LINUX_RUNNER: sakiori-oss-queue
     - if: $CI_PIPELINE_SOURCE == "merge_request_event" || $CI_COMMIT_TAG || $CI_COMMIT_BRANCH
       variables:
         LINUX_RUNNER: sakiori-oss-linux

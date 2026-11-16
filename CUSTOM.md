@@ -238,7 +238,7 @@ version of a new package is published with a token:
 - No project or group CI/CD variable named `LINUX_RUNNER` or `GIT_STRATEGY`:
   the workflow rules choose the runner and the Git strategy by them, and a
   variable of either name would override them: `LINUX_RUNNER` would send a
-  protected pipeline to the unprotected runner, `GIT_STRATEGY` would let its
+  protected pipeline to an unprotected runner, `GIT_STRATEGY` would let its
   jobs reuse a working copy.
 - `GITLAB_TOKEN`: the group release bot's personal access token (`api`,
   `write_repository`), protected, masked and hidden, environment `git-intake`.
@@ -257,16 +257,19 @@ version of a new package is published with a token:
 
 ## Runners
 
-Linux jobs run on one of the group's two Linux runners, both unprivileged. The
+Linux jobs run on one of the group's Linux runners, all unprivileged. The
 pipelines of protected refs, the release tags' and those of `main`, the
 schedule's among them, run on `sakiori-oss-linux-protected`, which takes jobs
 of protected refs only; each of its jobs clones a fresh working copy, since it
-runs build code beside the jobs that hold the release's credentials. Every other
-pipeline, the merge request pipelines with the update's upstream code and those
-run for a fork among them, runs on `sakiori-oss-linux`, which
-holds no credentials. A merge request pipeline gets the protected runner only
-between two protected branches with _Allow merge request pipelines to access
-protected variables and runners_ on, and `main` is the only protected branch.
+runs build code beside the jobs that hold the release's credentials. The merge
+queue's pipelines, which `sakiori-merge` starts for a head it rebased, run on
+`sakiori-oss-queue`, unprotected like `sakiori-oss-linux`, on slots no other
+pipeline takes. Every other pipeline, the merge request pipelines with the
+update's upstream code and those run for a fork among them, runs on
+`sakiori-oss-linux`, which holds no credentials. A merge request pipeline gets
+the protected runner only between two protected branches with _Allow merge
+request pipelines to access protected variables and runners_ on, and `main` is
+the only protected branch.
 The darwin builds and the macOS tests run on the forks' macOS runner
 (`sakiori-oss-macos`), set up as the _macOS runner_ section of git-intake's
 `RELEASING.md` describes, except for its two-hour maximum job timeout, which
