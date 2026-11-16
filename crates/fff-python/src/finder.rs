@@ -141,9 +141,7 @@ fn clear_shared_state(
     frecency: &SharedFrecency,
     query_tracker: &SharedQueryTracker,
 ) {
-    if let Ok(mut guard) = picker.write() {
-        guard.take();
-    }
+    picker.remove_index();
     if let Ok(mut guard) = frecency.write() {
         *guard = None;
     }

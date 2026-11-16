@@ -21,10 +21,10 @@ pub const MMAP_THRESHOLD: u64 = 4 * 1024;
 /// Watcher overflow capacity reserved after the initial scan
 pub const MAX_OVERFLOW_FILES: usize = 1024;
 
-/// Minimum delay between watcher-initiated rescans.
+/// Least time from the end of a full scan to a full rescan the watcher requests.
 pub const RESCAN_MIN_INTERVAL: std::time::Duration = std::time::Duration::from_secs(30);
 
-/// Rescan delay for large indexes.
+/// [`RESCAN_MIN_INTERVAL`] for a large index outside a git repository.
 pub const RESCAN_MIN_INTERVAL_LARGE_INDEX: std::time::Duration =
     std::time::Duration::from_secs(5 * 60);
 

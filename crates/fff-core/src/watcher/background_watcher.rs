@@ -1,17 +1,15 @@
-use super::dir_walk::{DirWalk, ReplacedDirs};
-use super::ref_watches::{RefChanges, RefWatches};
+use super::git_changes::{GitStateChange, announce_git_state};
+use super::ref_watches::RefWatches;
+use super::rescan_tap::{RescanLog, Tapped};
 use crate::constants::MAX_OVERFLOW_FILES;
 use crate::error::Error;
-use crate::file_picker::{FFFMode, FilePicker, FilePickerIgnoreOptions, IndexUpdateError};
+use crate::file_picker::{FFFMode, FilePicker, FilePickerIgnoreOptions};
 use crate::git::GitDiscovery;
 use crate::git_status_worker::GitStatusWorker;
-use crate::rescan_stats::RescanReason;
-use crate::shared::{RescanRequest, SharedFilePicker, SharedFrecency};
-use crate::sort_buffer::sort_with_buffer;
-use crate::walk::{DirHook, WalkPolicy};
-use crate::watch::{RawWatchEvent, WatchEventKind};
+use crate::shared::{SharedFilePicker, SharedFrecency};
+use crate::walk::DirHook;
 use git2::Repository;
-use notify::event::{AccessKind, AccessMode, ModifyKind, RemoveKind, RenameMode};
+use notify::event::ModifyKind;
 use notify::{Config, EventKind, EventKindMask, PathOp, RecursiveMode, Watcher, WatcherKind};
 use notify_debouncer_full::{DebounceEventResult, DebouncedEvent, NoCache, new_debouncer_opt};
 use parking_lot::Mutex;
@@ -19,17 +17,19 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::mpsc;
-use std::time::{Duration, Instant};
-use tracing::{Level, debug, error, info, warn};
+use std::time::Duration;
+use tracing::{debug, error, info, warn};
 
 // The OS-native backend; test and debug builds can poll instead (see `test_poll_interval`).
 enum Debouncer {
-    Native(notify_debouncer_full::Debouncer<notify::RecommendedWatcher, NoCache>),
-    Poll(notify_debouncer_full::Debouncer<notify::PollWatcher, NoCache>),
+    Native(notify_debouncer_full::Debouncer<Tapped<notify::RecommendedWatcher>, NoCache>),
+    Poll(notify_debouncer_full::Debouncer<Tapped<notify::PollWatcher>, NoCache>),
 }
 
 impl Debouncer {
     fn watch(&mut self, path: &Path, mode: RecursiveMode) -> notify::Result<()> {
+        #[cfg(test)]
+        let _starting = StartGuard::begin(self);
         match self {
             Debouncer::Native(debouncer) => debouncer.watch(path, mode),
             Debouncer::Poll(debouncer) => debouncer.watch(path, mode),
@@ -50,6 +50,8 @@ impl Debouncer {
             });
         }
         let restarted = restarts && !ops.is_empty();
+        #[cfg(test)]
+        let _starting = restarted.then(|| StartGuard::begin(self));
         while !ops.is_empty() {
             let result = match self {
                 Debouncer::Native(debouncer) => debouncer.update_paths(ops),
@@ -94,81 +96,306 @@ impl Debouncer {
     }
 }
 
-/// Owns the file-system watcher and guarantees that all background threads
-/// are fully joined before `stop()` / `Drop` returns.
+/// The index's file-system watcher: its owner thread alone starts, changes and stops its streams,
+/// walks subscribing only their directories inline. Stopping it never waits.
 pub struct BackgroundWatcher {
     watches: Arc<Watches>,
-    owner_thread: Option<std::thread::JoinHandle<()>>,
-    recursive: bool,
-    picker: crate::shared::WeakFilePicker,
-    base_path: PathBuf,
 }
 
-// What the watcher's threads share to change the watched paths.
+// What the watcher's threads share: the way to the owner thread and what it watches for.
 pub(crate) struct Watches {
-    streams: Mutex<Option<Streams>>,
-    // Closed when the watcher stops, so the owner thread ends.
+    // Closed when the watcher stops, so the owner thread ends and stops the streams.
     tasks: Mutex<Option<mpsc::Sender<WatchTask>>>,
-    refs: RefWatches,
+    // Set when the watcher stops: its streams deliver nothing more, its queued tasks are dropped,
+    // and no directory is subscribed any more.
+    stopped: Arc<AtomicBool>,
+    // The tree's stream where it watches each directory, which walks subscribe inline, as
+    // Watchman's crawler adds its inotify watches; held for one subscription at a time.
+    directories: Mutex<Option<Debouncer>>,
+    recursive: bool,
+    // FSEvents restarts a stream for every change, so nothing waits for one there.
+    restarts: bool,
+    pub(super) refs: RefWatches,
+    // The git dirs this watcher watches, which its walks register: a new watcher starts with
+    // none but the own one, so it watches every repository its walk meets.
+    pub(crate) git_dirs: Arc<crate::git_dirs::GitDirs>,
     git_status: Arc<GitStatusWorker>,
     base_path: PathBuf,
     // Set when the index's first walk begins; what a stream misses before, the walk reads.
     walking: AtomicBool,
+    // A rebuild's new watcher tells listeners of no repository until the rebuild announces
+    // every one, so each is heard once.
+    quiet: AtomicBool,
     // False for an index without Git integration, which follows no repository's state.
     follows_git: bool,
-}
-
-// The tree's stream, and on FSEvents one for the paths outside the tree. FSEvents restarts a
-// stream from "now" whenever its paths change, so every change after the setup goes to the
-// outside one, whose restart can lose only git state, never a file of the tree.
-struct Streams {
-    tree: Debouncer,
-    outside: Option<Debouncer>,
-}
-
-impl Streams {
-    fn stop_nonblocking(self) {
-        self.tree.stop_nonblocking();
-        if let Some(outside) = self.outside {
-            outside.stop_nonblocking();
-        }
-    }
+    // Test seam: tasks sent and not yet handled.
+    #[cfg(test)]
+    queued: AtomicUsize,
 }
 
 impl Watches {
-    fn send(&self, task: WatchTask) -> bool {
-        (self.tasks.lock().as_ref()).is_some_and(|tasks| tasks.send(task).is_ok())
+    pub(super) fn send(&self, task: WatchTask) -> bool {
+        #[cfg(test)]
+        self.queued.fetch_add(1, Ordering::SeqCst);
+        let sent = (self.tasks.lock().as_ref()).is_some_and(|tasks| tasks.send(task).is_ok());
+        #[cfg(test)]
+        if !sent {
+            self.queued.fetch_sub(1, Ordering::SeqCst);
+        }
+        sent
+    }
+
+    // `announced`: the work trees the batch that saw the change announced.
+    pub(super) fn request_git_state(&self, change: GitStateChange, announced: &[PathBuf]) -> bool {
+        self.send(match change {
+            GitStateChange::Repository(work_tree) => WatchTask::NewRepository(work_tree),
+            GitStateChange::Log(git_dir) => WatchTask::NewGitLog(git_dir, announced.to_vec()),
+            GitStateChange::Info(git_dir) => WatchTask::NewGitInfo(git_dir),
+        })
+    }
+
+    // Whether the owner thread has a task to handle, as a stream restart it runs.
+    #[cfg(test)]
+    fn busy(&self) -> bool {
+        self.queued.load(Ordering::SeqCst) > 0
+    }
+
+    // The tasks a leaving owner thread drops count as handled, and none is queued after.
+    #[cfg(test)]
+    fn drop_queued(&self, tasks: &mpsc::Receiver<WatchTask>) {
+        self.tasks.lock().take();
+        let dropped = tasks.try_iter().count();
+        self.queued.fetch_sub(dropped, Ordering::SeqCst);
+    }
+
+    // Sends a task with a reply and waits for it; `None` once the watcher stopped.
+    fn ask<R>(&self, task: impl FnOnce(mpsc::Sender<R>) -> WatchTask) -> Option<R> {
+        let (reply, answer) = mpsc::channel();
+        self.send(task(reply)).then(|| answer.recv().ok()).flatten()
+    }
+
+    // The paths a stream watches, as its owner thread reads them within a minute.
+    #[cfg(all(test, target_os = "macos"))]
+    fn watched_paths(&self, outside: bool) -> Vec<(PathBuf, RecursiveMode)> {
+        let (reply, answer) = mpsc::channel();
+        let sent = self.send(WatchTask::Watched { outside, reply });
+        let answer = sent.then(|| answer.recv_timeout(Duration::from_secs(60)));
+        answer.and_then(Result::ok).unwrap_or_default()
+    }
+}
+
+// The tree's recursive stream, and on FSEvents one for paths outside it: a stream restarts from
+// "now" on each change of its paths, so later changes go outside, where a restart loses no file.
+struct Streams {
+    // `None` where the tree is watched per directory: `Watches::directories` holds that stream.
+    tree: Option<Debouncer>,
+    outside: Option<Debouncer>,
+}
+
+// The owner thread, the one actor that holds the streams: every change of what they watch
+// reaches it as a task, in order.
+struct Owner {
+    watches: Arc<Watches>,
+    streams: Streams,
+    picker: crate::shared::WeakFilePicker,
+    own_work_tree: Option<PathBuf>,
+    lost: Lost,
+    // The work trees the task in hand found for listeners, each told once when it ends.
+    told: Told,
+}
+
+#[derive(Default)]
+struct Told {
+    repositories: Vec<PathBuf>,
+    refs: Vec<PathBuf>,
+}
+
+impl Owner {
+    // Until the watcher stops: the tasks still queued then are dropped, and the streams stop.
+    fn run(mut self, tasks: mpsc::Receiver<WatchTask>) {
+        while let Ok(task) = tasks.recv() {
+            // Once the watcher stopped or its picker was dropped, the thread leaves.
+            let Some(picker) = self.live().then(|| self.picker.upgrade()).flatten() else {
+                #[cfg(test)]
+                self.watches.queued.fetch_sub(1, Ordering::SeqCst);
+                break;
+            };
+            #[cfg(test)]
+            let number = handled(&self.watches, &task);
+            #[cfg(test)]
+            TASK.with(|task| task.set(number));
+            // A task that panics leaves what the streams watch unknown, as the index's loop
+            // treats a turn: the watcher stops, and the index is rebuilt with a new one.
+            let handled = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                #[cfg(test)]
+                panicking_task(&self.watches.base_path);
+                self.handle(&picker, task);
+                self.tell(&picker);
+            }));
+            #[cfg(test)]
+            TASK.with(|task| task.set(0));
+            #[cfg(test)]
+            self.watches.queued.fetch_sub(1, Ordering::SeqCst);
+            if handled.is_err() {
+                error!("A task of the watcher's thread panicked; rebuilding with a new watcher");
+                self.watches.stopped.store(true, Ordering::Release);
+                (self.lost)();
+                break;
+            }
+        }
+        #[cfg(test)]
+        self.watches.drop_queued(&tasks);
+        let directories = self.watches.directories.lock().take();
+        let streams = [
+            self.streams.tree.take(),
+            self.streams.outside.take(),
+            directories,
+        ];
+        streams
+            .into_iter()
+            .flatten()
+            .for_each(Debouncer::stop_nonblocking);
+    }
+
+    // Whether the watcher still runs: a task in flight when it stops tells nobody of it.
+    fn live(&self) -> bool {
+        !self.watches.stopped.load(Ordering::Acquire)
+    }
+
+    // Whether listeners hear of the git state this task found.
+    fn tells(&self) -> bool {
+        self.live() && !self.watches.quiet.load(Ordering::Acquire)
+    }
+
+    // Watches a directory of the tree on its own where the tree is watched per directory.
+    fn watch_directory(&mut self, dir: &Path) {
+        if let Some(stream) = self.watches.directories.lock().as_mut() {
+            let _ = stream.watch(dir, RecursiveMode::NonRecursive);
+        }
+    }
+
+    fn handle(&mut self, picker: &SharedFilePicker, task: WatchTask) {
+        let covered =
+            |dir: &Path| self.watches.recursive && dir.starts_with(&self.watches.base_path);
+        match task {
+            WatchTask::NewRepository(work_tree) => {
+                self.watch_directory(&work_tree);
+                if self.watches.follows_git
+                    && let Some(git_dir) = git_dir_of(&work_tree)
+                    && self.watches.git_dirs.register(&git_dir, &work_tree)
+                {
+                    self.watch_repository(picker, &work_tree, &git_dir);
+                }
+            }
+            WatchTask::WatchRepository {
+                work_tree,
+                git_dir,
+                done,
+            } => {
+                self.watch_repository(picker, &work_tree, &git_dir);
+                if let Some(done) = done {
+                    let _ = done.send(());
+                }
+            }
+            WatchTask::NewGitLog(git_dir, announced) => {
+                let covered = covered(&git_dir);
+                self.watch_new_log(picker, &git_dir, covered, &announced);
+            }
+            WatchTask::NewGitInfo(git_dir) => {
+                let covered = covered(&git_dir);
+                self.watch_new_info(picker, &git_dir, covered);
+            }
+            WatchTask::SyncRefs(told) => {
+                self.watches.refs.reread_storages();
+                self.sync_refs(picker, told);
+            }
+            WatchTask::FollowRefs(done) => {
+                self.sync_refs(picker, Vec::new());
+                if let Some(done) = done {
+                    let _ = done.send(());
+                }
+            }
+            // After every repository the rebuild's walk met, which went before it.
+            WatchTask::Announce => {
+                self.watches.quiet.store(false, Ordering::Release);
+                if let Some(options) =
+                    (picker.read().ok()).and_then(|guard| Some(WatcherOptions::of(guard.as_ref()?)))
+                {
+                    let workdir = (picker.read().ok())
+                        .and_then(|guard| Some(guard.as_ref()?.git_root()?.to_path_buf()));
+                    let (base_path, git_status) =
+                        (&self.watches.base_path, &self.watches.git_status);
+                    announce_git_state(picker, base_path, &workdir, &options, git_status, None);
+                }
+            }
+            #[cfg(all(test, target_os = "macos"))]
+            WatchTask::Watched { outside, reply } => {
+                let directories = self.watches.directories.lock();
+                let stream = match outside {
+                    true => self.streams.outside.as_ref(),
+                    false => self.streams.tree.as_ref().or(directories.as_ref()),
+                };
+                let mut paths =
+                    (stream.and_then(|stream| stream.watched_paths().ok())).unwrap_or_default();
+                paths.sort();
+                let _ = reply.send(paths);
+            }
+        }
     }
 
     // Applies `ops` in one update and returns whether the git state of the repositories
     // outside the tree must be announced again, as a stream restarted after the walk began.
-    fn update(&self, streams: &mut Streams, ops: Vec<PathOp>) -> bool {
-        match streams.outside.as_mut() {
-            Some(outside) => outside.update(ops) && self.walking.load(Ordering::Acquire),
-            None => streams.tree.update(ops) && self.walking.load(Ordering::Acquire),
+    fn update(&mut self, ops: Vec<PathOp>) -> bool {
+        let restarted = match (self.streams.outside.as_mut(), self.streams.tree.as_mut()) {
+            (Some(outside), _) => outside.update(ops),
+            (None, Some(tree)) => tree.update(ops),
+            (None, None) => (self.watches.directories.lock().as_mut())
+                .is_some_and(|directories| directories.update(ops)),
+        };
+        #[cfg(test)]
+        if restarted {
+            started_stream(&self.watches.base_path);
         }
+        restarted && self.watches.walking.load(Ordering::Acquire)
+    }
+
+    // Watches a walked repository's git state unless covered, its followed refs in the same update,
+    // and announces it, as `git init` to `git add` outrun a walk; a first scan has none to hear it.
+    fn watch_repository(&mut self, picker: &SharedFilePicker, work_tree: &Path, git_dir: &Path) {
+        let watches = Arc::clone(&self.watches);
+        let mut ops = Vec::new();
+        if !watches.recursive || !git_dir.starts_with(&watches.base_path) {
+            ops.extend(git_dir_watches(git_dir));
+        }
+        // A repository created again lost the watches of its refs; a linked worktree shares
+        // its main repository's.
+        let renew = (super::common_dir_of(git_dir) == git_dir).then_some(git_dir);
+        let refs = watches.refs.plan(picker, renew);
+        ops.extend(refs.ops);
+        if self.update(ops) {
+            self.recover_outside(picker);
+        }
+        self.told.refs.extend(refs.appeared);
+        self.told.repositories.push(work_tree.to_path_buf());
     }
 
     // What changed outside the tree while its stream restarted is lost: the own git status is
     // read again, ref stores and logs that appeared get their watches, and the repositories
     // whose git dir or common dir lies outside the tree are announced as changed.
-    fn recover_outside(&self, picker: &SharedFilePicker) {
-        let outside = |path: &Path| !path.starts_with(&self.base_path);
-        let registered = picker.registered_git_dirs();
+    fn recover_outside(&mut self, picker: &SharedFilePicker) {
+        let watches = Arc::clone(&self.watches);
+        let outside = |path: &Path| !path.starts_with(&watches.base_path);
+        let registered = watches.git_dirs.all();
         let mut appeared = Vec::new();
         // Each update adds only paths not watched yet, so the candidates bound the rounds.
         let mut rounds = 0;
         let mut bound = None;
         loop {
-            let mut guard = self.streams.lock();
-            let Some(streams) = guard.as_mut() else {
-                return;
-            };
-            let plan = self.refs.plan(picker, None);
+            let plan = watches.refs.plan(picker, None);
             let git_dirs = (registered.iter())
-                .filter(|known| known.work_tree.starts_with(&self.base_path))
+                .filter(|known| known.work_tree.starts_with(&watches.base_path))
                 .map(|known| known.git_dir.clone())
-                .chain(self.refs.own_git_dir());
+                .chain(watches.refs.own_git_dir());
             let logs: Vec<_> = (git_dirs.filter(|git_dir| outside(git_dir)))
                 .map(|git_dir| git_dir.join("logs"))
                 .collect();
@@ -179,7 +406,7 @@ impl Watches {
             let ops = plan.ops.into_iter().chain(logs).collect();
             appeared.extend(plan.appeared);
             rounds += 1;
-            if !self.update(streams, ops) {
+            if !self.update(ops) {
                 break;
             }
             if rounds >= bound {
@@ -191,45 +418,94 @@ impl Watches {
             }
         }
         // Read after the last restart, so the status cannot predate what it missed.
-        if self.refs.own_git_dir_outside() {
-            self.git_status.request_full_rescan();
+        if watches.refs.own_git_dir_outside() {
+            watches.git_status.request_full_rescan();
         }
         let mut work_trees: Vec<PathBuf> = (registered.into_iter())
             .filter(|known| {
-                known.work_tree.starts_with(&self.base_path)
+                known.work_tree.starts_with(&watches.base_path)
                     && (outside(&known.git_dir) || outside(&known.common_dir))
             })
             .map(|known| known.work_tree.components().collect())
             .collect();
-        work_trees.extend(self.refs.own_work_tree_outside());
-        work_trees.sort_unstable();
-        work_trees.dedup();
-        for work_tree in &work_trees {
-            picker.notify_repository_change(work_tree);
+        work_trees.extend(watches.refs.own_work_tree_outside());
+        self.told.repositories.extend(work_trees.iter().cloned());
+        self.told
+            .refs
+            .extend(appeared.into_iter().chain(work_trees));
+    }
+
+    // Brings the ref watches in line with the ref listeners, which hear of each work tree whose
+    // refs appeared or that `told` names.
+    fn sync_refs(&mut self, picker: &SharedFilePicker, told: Vec<PathBuf>) {
+        let plan = self.watches.refs.plan(picker, None);
+        if self.update(plan.ops) {
+            self.recover_outside(picker);
         }
-        appeared.extend(work_trees);
-        appeared.sort_unstable();
-        appeared.dedup();
-        for work_tree in appeared {
+        self.told.refs.extend(told.into_iter().chain(plan.appeared));
+    }
+
+    // Tells listeners once of each work tree the task found, unless the watcher stopped or is
+    // quiet: a stream restart within the task finds some of them again.
+    fn tell(&mut self, picker: &SharedFilePicker) {
+        let Told { repositories, refs } = std::mem::take(&mut self.told);
+        if !self.tells() {
+            return;
+        }
+        for work_tree in once_each(repositories) {
+            picker.notify_repository_change(&work_tree);
+        }
+        for work_tree in once_each(refs) {
             picker.notify_ref_change(&work_tree);
         }
     }
 
-    // Brings the ref watches in line with the ref listeners.
-    pub(crate) fn sync_refs(&self, picker: &SharedFilePicker) {
-        let (appeared, restarted) = {
-            let mut guard = self.streams.lock();
-            let Some(streams) = guard.as_mut() else {
-                return;
-            };
-            let plan = self.refs.plan(picker, None);
-            (plan.appeared, self.update(streams, plan.ops))
+    // Watches the log a git dir gained unless the tree's watch covers it, and announces its
+    // repository, whose HEAD moved unwatched, unless covered and its batch announced it already.
+    fn watch_new_log(
+        &mut self,
+        picker: &SharedFilePicker,
+        git_dir: &Path,
+        covered: bool,
+        announced: &[PathBuf],
+    ) {
+        let own = (self.own_work_tree.as_ref())
+            .filter(|work_tree| {
+                Repository::open(work_tree).is_ok_and(|repo| {
+                    let canonical = crate::path_utils::canonicalize;
+                    canonical(repo.path()).ok() == canonical(git_dir).ok()
+                })
+            })
+            .cloned();
+        let work_tree = own.or_else(|| {
+            (self.watches.git_dirs.holding(&git_dir.join("logs")))
+                .filter(|(registered, _)| registered == git_dir)
+                .map(|(_, work_tree)| work_tree)
+        });
+        let Some(work_tree) = work_tree else {
+            return;
         };
-        if restarted {
+        let logs = PathOp::watch_non_recursive(git_dir.join("logs"));
+        if !covered && self.update(vec![logs]) {
             self.recover_outside(picker);
         }
-        for work_tree in appeared {
-            picker.notify_ref_change(&work_tree);
+        if !(covered && announced.contains(&work_tree)) {
+            self.told.repositories.push(work_tree);
+        }
+    }
+
+    // Watches a git dir's `info` that appeared after the git dir was watched; its exclude file,
+    // maybe written before the watch, is checked as if changed, which applies its rules.
+    fn watch_new_info(&mut self, picker: &SharedFilePicker, git_dir: &Path, covered: bool) {
+        let info = git_dir.join("info");
+        if !covered && self.update(vec![PathOp::watch_non_recursive(info.clone())]) {
+            self.recover_outside(picker);
+        }
+        let exclude = info.join("exclude");
+        if self.live() && exclude.is_file() {
+            let event = notify::Event::new(EventKind::Modify(ModifyKind::Any)).add_path(exclude);
+            let event = DebouncedEvent::new(event, std::time::Instant::now());
+            let _ = picker.submit_events(None, vec![event]);
         }
     }
 }
@@ -255,40 +531,125 @@ impl WatcherOptions {
     }
 }
 
-enum WatchTask {
-    /// This is requires a separate walk of the new directory copies or created within a scan
-    /// window because it might contain subdirectories we have to walk, prune, and add to index
-    IndexNewDir(PathBuf),
+pub(super) enum WatchTask {
     /// A `.git` appeared in this directory, which the walk had already reached.
     NewRepository(PathBuf),
-    /// This git dir gained its `logs`.
-    NewGitLog(PathBuf),
-    /// A throttled rescan was deferred; wake up to run it when due.
-    RescanDeferred,
-    /// A ref store or its format may have changed: the ref watches follow.
-    SyncRefs,
+    /// A walk met the repository of this work tree and registered this git dir.
+    WatchRepository {
+        work_tree: PathBuf,
+        git_dir: PathBuf,
+        done: Option<mpsc::Sender<()>>,
+    },
+    /// This git dir gained its `logs`, in a batch that announced these work trees.
+    NewGitLog(PathBuf, Vec<PathBuf>),
+    /// This git dir gained its `info`, which holds its exclude file.
+    NewGitInfo(PathBuf),
+    /// A ref store or its format may have changed: the ref watches follow, and ref listeners
+    /// hear of these work trees with those whose refs appeared.
+    SyncRefs(Vec<PathBuf>),
+    /// The ref listeners or the git dirs they may follow changed: the ref watches follow, then
+    /// `done` hears.
+    FollowRefs(Option<mpsc::Sender<()>>),
+    /// The rebuild that installed this watcher is published: listeners hear of every repository.
+    Announce,
+    #[cfg(all(test, target_os = "macos"))]
+    Watched {
+        outside: bool,
+        reply: mpsc::Sender<Vec<(PathBuf, RecursiveMode)>>,
+    },
 }
 
 const DEBOUNCE_TIMEOUT: Duration = Duration::from_millis(50);
-/// More affected paths than this in one batch are recovered by a full rescan.
+/// More affected paths than this in one batch aggregate into the directories they changed.
 pub(crate) const MAX_BATCH_PATHS: usize = MAX_OVERFLOW_FILES * 4;
 // Per-directory subscriptions stop after this many failures in a row.
 const MAX_CONSECUTIVE_WATCH_FAILURES: usize = 16;
-/// Minimum seconds between frecency tracks of the same file in AI mode.
-/// Prevents score inflation from rapid burst edits by AI agents.
-const AI_MODE_COOLDOWN_SECS: u64 = 5 * 60;
+
+// The loop hears from the owner thread once the watcher is installed, or could not be, and
+// once it was lost to a task that panicked.
+pub(crate) type Installed = Box<dyn FnOnce(Result<BackgroundWatcher, Error>) + Send>;
+pub(crate) type Lost = Box<dyn Fn() + Send>;
 
 impl BackgroundWatcher {
-    pub(crate) fn new(
+    // Starts the owner thread, which creates the streams and hands the watcher to `installed`;
+    // false when the thread cannot start.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn start(
         base_path: PathBuf,
         git: Option<GitDiscovery>,
-        shared_picker: SharedFilePicker,
-        shared_frecency: SharedFrecency,
+        shared_picker: &SharedFilePicker,
         options: WatcherOptions,
         git_status_worker: Arc<GitStatusWorker>,
         trace_span: tracing::Span,
-    ) -> Result<Self, Error> {
-        let git_workdir = git.map(|git| git.workdir);
+        quiet: bool,
+        installed: Installed,
+        lost: Lost,
+    ) -> bool {
+        let picker = shared_picker.weaken();
+        let spawned = std::thread::Builder::new()
+            .name("fff-watcher-own".into())
+            .spawn(move || {
+                #[cfg(test)]
+                OWNER_ROOT.with(|root| *root.borrow_mut() = Some(base_path.clone()));
+                // The run loops of its streams take its priority, the scans' pool's.
+                crate::parallelism::pin_user_initiated();
+                let _g = trace_span.enter();
+                let Some(shared_picker) = picker.upgrade() else {
+                    return;
+                };
+                let git_workdir = git.map(|git| git.workdir);
+                let (tasks, task_receiver) = mpsc::channel::<WatchTask>();
+                // A setup that panics fails as any other, so the initial scan goes on without it.
+                let created = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    Self::create(
+                        &base_path,
+                        git_workdir.as_deref(),
+                        &shared_picker,
+                        &options,
+                        git_status_worker,
+                        tasks,
+                        quiet,
+                    )
+                }))
+                .unwrap_or_else(|_| {
+                    error!("Setting up the watcher panicked");
+                    Err(Error::ThreadPanic)
+                });
+                match created {
+                    Ok((watcher, streams)) => {
+                        let owner = Owner {
+                            watches: watcher.watches(),
+                            streams,
+                            picker: shared_picker.weaken(),
+                            own_work_tree: git_workdir,
+                            lost,
+                            told: Told::default(),
+                        };
+                        drop(shared_picker);
+                        installed(Ok(watcher));
+                        owner.run(task_receiver);
+                    }
+                    Err(e) => {
+                        drop(shared_picker);
+                        installed(Err(e));
+                    }
+                }
+                info!("Background watcher is stopped");
+            });
+        spawned
+            .inspect_err(|e| error!(?e, "Failed to start the watcher's thread"))
+            .is_ok()
+    }
+
+    fn create(
+        base_path: &Path,
+        git_workdir: Option<&Path>,
+        shared_picker: &SharedFilePicker,
+        options: &WatcherOptions,
+        git_status_worker: Arc<GitStatusWorker>,
+        tasks: mpsc::Sender<WatchTask>,
+        quiet: bool,
+    ) -> Result<(Self, Streams), Error> {
         info!(
             "Initializing background watcher for path: {}, mode: {:?}",
             base_path.display(),
@@ -297,7 +658,7 @@ impl BackgroundWatcher {
 
         // Root and home watching are error prone; consumers must opt in explicitly.
         crate::path_utils::validate_base_path(
-            &base_path,
+            base_path,
             options.enable_fs_root_scanning,
             options.enable_home_dir_scanning,
         )?;
@@ -316,90 +677,53 @@ impl BackgroundWatcher {
         // kernel-level watcher recursion, so we have to manually watch every single interested
         // directory for watch events which is in practice stable and fast if system has enough
         // spare watcher (configurable by the user, usually 100k - 1m)
-        let use_recursive = cfg!(any(target_os = "macos", target_os = "windows"));
+        let use_recursive = recursive_watch(base_path);
 
-        let (watch_tx, watch_rx) = mpsc::channel::<WatchTask>();
-        let watch_tx_for_debouncer = watch_tx.clone();
-        let poll_interval = test_poll_interval(&base_path);
+        let poll_interval = test_poll_interval(base_path);
         let fsevents = poll_interval.is_none()
             && <notify::RecommendedWatcher as Watcher>::kind() == WatcherKind::Fsevent;
         // Removing a watch restarts the FSEvents stream, so ref watches stay once added there.
         let follows_git = !options.ignore_options.disable_git;
-        let refs = RefWatches::new(
-            &base_path,
-            use_recursive,
-            git_workdir.as_deref(),
-            fsevents,
-            follows_git,
-        );
+        let refs = RefWatches::new(base_path, use_recursive, git_workdir, fsevents, follows_git);
         // The own git dir is watched from the start, so a walk reaching the work tree finds it
         // known, and watches it anew only once it was created again.
-        if let Some(workdir) = &git_workdir
+        let git_dirs = Arc::new(crate::git_dirs::GitDirs::default());
+        if let Some(workdir) = git_workdir
             && let Some(git_dir) = git_dir_of(workdir)
         {
-            shared_picker.register_git_dir(&git_dir, workdir);
+            git_dirs.register(&git_dir, workdir);
         }
 
-        let owner_weak_picker = shared_picker.weaken();
-        let hook_picker = shared_picker.weaken();
-        let hook_base_path = base_path.clone();
-        let owner_git_workdir = git_workdir.clone();
-        let owner_git_worker = Arc::clone(&git_status_worker);
-        let owner_frecency = shared_frecency.clone();
-        let owner_base_path = base_path.clone();
-
-        let handler = || {
-            (
-                base_path.clone(),
-                git_workdir.clone(),
-                shared_picker.clone(),
-                shared_frecency.clone(),
-                options.clone(),
-                watch_tx_for_debouncer.clone(),
-                Arc::clone(&git_status_worker),
-            )
-        };
+        let stopped = Arc::new(AtomicBool::new(false));
         let mut tree = match poll_interval {
-            None => {
-                let (base, workdir, picker, frecency, options, tx, worker) = handler();
-                Debouncer::Native(Self::create_debouncer(
-                    base, workdir, picker, frecency, options, tx, worker, None,
-                )?)
-            }
+            None => Debouncer::Native(Self::create_debouncer(shared_picker, &stopped, None)?),
             Some(interval) => {
                 info!(?interval, "File watcher uses the polling backend");
-                let (base, workdir, picker, frecency, options, tx, worker) = handler();
                 Debouncer::Poll(Self::create_debouncer(
-                    base,
-                    workdir,
-                    picker,
-                    frecency,
-                    options,
-                    tx,
-                    worker,
+                    shared_picker,
+                    &stopped,
                     Some(interval),
                 )?)
             }
         };
         let mut outside = match fsevents {
-            true => {
-                let (base, workdir, picker, frecency, options, tx, worker) = handler();
-                Some(Debouncer::Native(Self::create_debouncer(
-                    base, workdir, picker, frecency, options, tx, worker, None,
-                )?))
-            }
+            true => Some(Debouncer::Native(Self::create_debouncer(
+                shared_picker,
+                &stopped,
+                None,
+            )?)),
             false => None,
         };
 
         if use_recursive {
-            tree.watch(&base_path, RecursiveMode::Recursive)?;
+            tree.watch(base_path, RecursiveMode::Recursive)?;
             info!(
                 "File watcher initialized with single recursive watch on {}",
                 base_path.display(),
             );
         } else {
             // Scans subscribe every directory they walk through `dir_hook`.
-            tree.watch(&base_path, RecursiveMode::NonRecursive)?;
+            tree.watch(base_path, RecursiveMode::NonRecursive)?;
             info!(
                 "File watcher initialized with per-directory watches on {}",
                 base_path.display(),
@@ -409,143 +733,62 @@ impl BackgroundWatcher {
         // changes that affect git status (staging, committing, branch switches, merges, etc).
         // The own git dir may lie outside the tree, as a linked worktree's does.
         let own_git = git_workdir
-            .as_deref()
             .and_then(|workdir| Repository::open(workdir).ok())
-            .map(|repo| git_dir_watches(repo.path()).collect::<Vec<_>>())
+            .map(|repo| {
+                let mut watches: Vec<_> = git_dir_watches(repo.path()).collect();
+                // A linked worktree's `info`, created later in its main repository's git dir,
+                // appears there: that git dir is watched too, ref listeners or not.
+                let common_dir = super::common_dir_of(repo.path());
+                if common_dir.components().ne(repo.path().components()) {
+                    watches.push(PathOp::watch_non_recursive(common_dir));
+                }
+                watches
+            })
             .unwrap_or_default();
         match outside.as_mut() {
             Some(outside) => {
                 let (inside, mut beyond): (Vec<_>, Vec<_>) =
-                    (own_git.into_iter()).partition(|op| op.as_path().starts_with(&base_path));
+                    (own_git.into_iter()).partition(|op| op.as_path().starts_with(base_path));
                 tree.update(inside);
-                beyond.extend(refs.own_targets(&shared_picker));
+                beyond.extend(refs.own_targets(shared_picker));
                 outside.update(beyond);
             }
             None => {
                 tree.update(own_git);
             }
         }
+        #[cfg(test)]
+        started_stream(base_path);
 
         info!("Background file watcher initialized successfully");
 
+        let (tree, directories) = match use_recursive {
+            true => (Some(tree), None),
+            false => (None, Some(tree)),
+        };
+        let streams = Streams { tree, outside };
         let watches = Arc::new(Watches {
-            streams: Mutex::new(Some(Streams { tree, outside })),
-            tasks: Mutex::new(Some(watch_tx)),
-            refs,
-            git_status: Arc::clone(&owner_git_worker),
-            base_path: base_path.clone(),
-            walking: AtomicBool::new(false),
-            follows_git,
-        });
-        let owner_watches = Arc::clone(&watches);
-
-        let owner_span = trace_span.clone();
-        let owner_thread = std::thread::Builder::new()
-            .name("fff-watcher-own".into())
-            .spawn(move || {
-                let _g = owner_span.enter();
-                // Never hold the picker alive while blocked on the channel.
-                while let Some(due) = owner_weak_picker
-                    .upgrade()
-                    .map(|picker| picker.deferred_rescan_due())
-                {
-                    let task = match due {
-                        Some(due) => match watch_rx
-                            .recv_timeout(due.saturating_duration_since(Instant::now()))
-                        {
-                            Ok(task) => Some(task),
-                            Err(mpsc::RecvTimeoutError::Timeout) => None,
-                            Err(mpsc::RecvTimeoutError::Disconnected) => break,
-                        },
-                        None => match watch_rx.recv() {
-                            Ok(task) => Some(task),
-                            Err(_) => break,
-                        },
-                    };
-                    // if the picker is dropped we do need to exit the loop
-                    let Some(strong_picker) = owner_weak_picker.upgrade() else {
-                        break;
-                    };
-
-                    if let Some(reason) = strong_picker.due_deferred_rescan() {
-                        request_rescan(&strong_picker, &owner_frecency, &owner_base_path, reason);
-                    }
-                    let dir = match task {
-                        Some(WatchTask::IndexNewDir(dir)) => dir,
-                        Some(WatchTask::NewGitLog(git_dir)) => {
-                            watch_new_log(
-                                &owner_watches,
-                                &strong_picker,
-                                &git_dir,
-                                &owner_git_workdir,
-                                use_recursive && git_dir.starts_with(&owner_base_path),
-                            );
-                            continue;
-                        }
-                        Some(WatchTask::NewRepository(work_tree)) => {
-                            DirSubscriptions::hook(
-                                &owner_watches,
-                                use_recursive,
-                                &owner_weak_picker,
-                                &owner_base_path,
-                            )(&work_tree);
-                            continue;
-                        }
-                        Some(WatchTask::SyncRefs) => {
-                            owner_watches.refs.reread_storages();
-                            owner_watches.sync_refs(&strong_picker);
-                            continue;
-                        }
-                        Some(WatchTask::RescanDeferred) | None => continue,
-                    };
-                    #[cfg(debug_assertions)]
-                    hold_dir_indexing();
-                    if owner_watches.streams.lock().is_none() {
-                        break;
-                    }
-
-                    let dir_hook = DirSubscriptions::hook(
-                        &owner_watches,
-                        use_recursive,
-                        &owner_weak_picker,
-                        &owner_base_path,
-                    );
-                    // Subscribe BEFORE walking so files created mid-walk are still reported.
-                    dir_hook(&dir);
-                    index_new_directory(
-                        &dir,
-                        &strong_picker,
-                        &owner_frecency,
-                        &owner_git_workdir,
-                        &owner_git_worker,
-                        Some(&dir_hook),
-                    );
-
-                    drop(strong_picker);
-                }
-
-                tracing::info!("Background watcher is stopped");
-            })
-            .expect("failed to spawn fff-watcher-owner thread");
-
-        Ok(Self {
-            watches,
-            owner_thread: Some(owner_thread),
+            tasks: Mutex::new(Some(tasks)),
+            stopped,
+            directories: Mutex::new(directories),
             recursive: use_recursive,
-            picker: hook_picker,
-            base_path: hook_base_path,
-        })
+            restarts: fsevents,
+            refs,
+            git_dirs,
+            git_status: git_status_worker,
+            base_path: base_path.to_path_buf(),
+            walking: AtomicBool::new(false),
+            quiet: AtomicBool::new(quiet),
+            follows_git,
+            #[cfg(test)]
+            queued: AtomicUsize::new(0),
+        });
+        Ok((Self { watches }, streams))
     }
 
-    #[allow(clippy::too_many_arguments)]
     fn create_debouncer<W: notify::Watcher>(
-        base_path: PathBuf,
-        git_workdir: Option<PathBuf>,
-        shared_picker: SharedFilePicker,
-        shared_frecency: SharedFrecency,
-        options: WatcherOptions,
-        watch_tx: mpsc::Sender<WatchTask>,
-        git_status_worker: Arc<GitStatusWorker>,
+        shared_picker: &SharedFilePicker,
+        stopped: &Arc<AtomicBool>,
         poll_interval: Option<Duration>,
     ) -> Result<notify_debouncer_full::Debouncer<W, NoCache>, Error> {
         let config = poll_interval
@@ -557,54 +800,33 @@ impl BackgroundWatcher {
             // our own grep calls and preview window rendering
             .with_event_kinds(EventKindMask::CORE);
 
-        let git_workdir_for_handler = git_workdir.clone();
-        let base_path_for_handler = base_path.clone();
         let file_picker = shared_picker.weaken();
+        let stopped = Arc::clone(stopped);
+        // The debouncer keeps one pending recrawl request: the tap keeps every one.
+        let rescans = RescanLog::default();
+        let installed = rescans.install_for_next_watcher();
         let debouncer = new_debouncer_opt(
             DEBOUNCE_TIMEOUT,
             Some(DEBOUNCE_TIMEOUT / 2), // tick rate for the event span
-            {
-                let mut announced_due = None;
-                move |result: DebounceEventResult| match result {
-                    Ok(events) => {
-                        let Some(file_picker) = file_picker.upgrade() else {
-                            return;
-                        };
-                        // A scan replaying held events handles them after its commit.
-                        let Some(events) = file_picker.event_hold().defer(events) else {
-                            return;
-                        };
-
-                        let new_dirs = handle_debounced_events(
-                            &options,
-                            events,
-                            &base_path_for_handler,
-                            &git_workdir_for_handler,
-                            &file_picker,
-                            &shared_frecency,
-                            &git_status_worker,
-                        );
-
-                        // every new directory created has to be reflected in the picker state
-                        for dir in new_dirs {
-                            if let Err(e) = watch_tx.send(WatchTask::IndexNewDir(dir)) {
-                                error!(?e, "Failed to send directory update error");
-                            }
-                        }
-
-                        // The owner thread runs deferred rescans; wake it for a new deadline.
-                        let due = file_picker.deferred_rescan_due();
-                        if due.is_some()
-                            && due != announced_due
-                            && let Err(e) = watch_tx.send(WatchTask::RescanDeferred)
-                        {
-                            error!(?e, "Failed to schedule a deferred rescan");
-                        }
-                        announced_due = due;
+            move |result: DebounceEventResult| match result {
+                Ok(mut events) => {
+                    rescans.merge_into(&mut events);
+                    if stopped.load(Ordering::Acquire) {
+                        return;
                     }
-                    Err(errors) => {
-                        error!("File watcher errors: {:?}", errors);
+                    let Some(file_picker) = file_picker.upgrade() else {
+                        return;
+                    };
+                    // Held for a running scan, or applied on the index's writer. Waiting for it
+                    // is the backpressure: the debouncer merges what arrives meanwhile.
+                    let submitted = file_picker.submit_events(None, events);
+                    drop(file_picker);
+                    if let Some(done) = submitted {
+                        let _ = done.recv();
                     }
+                }
+                Err(errors) => {
+                    error!("File watcher errors: {:?}", errors);
                 }
             },
             // There is an issue with recommended cache implementation on macos
@@ -613,34 +835,56 @@ impl BackgroundWatcher {
             // ordedred index and adding it back with the new name
             NoCache::new(),
             config,
-        )?;
+        );
+        drop(installed);
 
-        Ok(debouncer)
+        Ok(debouncer?)
     }
 
     /// Signal the watcher to shut down without blocking on its worker
     /// threads. Safe to call from any context, including while holding
     /// the [`SharedFilePicker`] write lock.
     pub fn stop(&mut self) {
+        self.watches.stopped.store(true, Ordering::Release);
+        // Closing the owner thread's queue wakes it, and it stops the streams.
         self.watches.tasks.lock().take();
-        if let Some(streams) = self.watches.streams.lock().take() {
-            streams.stop_nonblocking();
-        }
-
-        self.owner_thread.take();
-
         info!("Background file watcher stop signaled");
     }
 
     /// Runs for each directory a walk reaches: subscribes it unless one recursive watch
     /// covers the tree, and watches the git state of a repository it holds.
     pub(crate) fn dir_hook(&self) -> Option<DirHook> {
-        Some(DirSubscriptions::hook(
-            &self.watches,
-            self.recursive,
-            &self.picker,
-            &self.base_path,
-        ))
+        Some(DirSubscriptions::hook(&self.watches))
+    }
+
+    // Test seam: a watcher with no thread, no stream and no git watches of its walks, which
+    // holds a registry of git dirs.
+    #[cfg(test)]
+    pub(crate) fn unstarted(base_path: &Path) -> Self {
+        let watches = Watches {
+            tasks: Mutex::new(None),
+            stopped: Arc::default(),
+            directories: Mutex::new(None),
+            recursive: false,
+            restarts: false,
+            refs: RefWatches::new(base_path, false, None, false, true),
+            git_dirs: Arc::default(),
+            git_status: GitStatusWorker::new(),
+            base_path: base_path.to_path_buf(),
+            walking: AtomicBool::new(false),
+            quiet: AtomicBool::new(false),
+            follows_git: false,
+            #[cfg(test)]
+            queued: AtomicUsize::new(0),
+        };
+        Self {
+            watches: Arc::new(watches),
+        }
+    }
+
+    // Has listeners hear of every repository the watcher follows, after what it was asked before.
+    pub(crate) fn announce(&self) {
+        self.send(WatchTask::Announce);
     }
 
     // From now on a stream that restarts misses what the walk cannot read for it.
@@ -653,24 +897,13 @@ impl BackgroundWatcher {
         Arc::clone(&self.watches)
     }
 
-    pub(crate) fn request_index_dir(&self, dir: PathBuf) -> bool {
-        self.send(WatchTask::IndexNewDir(dir))
-    }
-
-    fn request_git_state(&self, change: GitStateChange) -> bool {
-        self.send(match change {
-            GitStateChange::Repository(work_tree) => WatchTask::NewRepository(work_tree),
-            GitStateChange::Log(git_dir) => WatchTask::NewGitLog(git_dir),
-        })
-    }
-
-    // The owner thread runs deferred rescans once due.
-    pub(crate) fn wake_for_deferred_rescan(&self) -> bool {
-        self.send(WatchTask::RescanDeferred)
-    }
-
-    fn send(&self, task: WatchTask) -> bool {
+    pub(super) fn send(&self, task: WatchTask) -> bool {
         self.watches.send(task)
+    }
+
+    // Has the owner thread bring the ref watches in line with the ref listeners; `done` hears.
+    pub(crate) fn follow_refs(&self, done: mpsc::Sender<()>) -> bool {
+        self.send(WatchTask::FollowRefs(Some(done)))
     }
 }
 
@@ -680,890 +913,24 @@ impl Drop for BackgroundWatcher {
     }
 }
 
-// Applies changes to `paths` reported by a program exactly as watcher events for them: a
-// path that exists is added or updated unless the index ignores it, one that does not is
-// removed, with any indexed files below it. While a scan runs, they wait with the scan's
-// held events, as watcher events do. Returns false when they were held.
+// Applies changes to `paths` reported by a program exactly as watcher events for them, on the
+// index's loop in order with the watcher's. Returns false when a scan holds them.
 pub(crate) fn apply_reported_changes(
     shared_picker: &SharedFilePicker,
-    shared_frecency: &SharedFrecency,
+    shared_frecency: SharedFrecency,
     paths: Vec<PathBuf>,
 ) -> bool {
-    let Some((options, base_path, git_workdir, git_status_worker, follow_symlinks)) =
-        shared_picker.read().ok().and_then(|guard| {
-            guard.as_ref().map(|picker| {
-                (
-                    WatcherOptions::of(picker),
-                    picker.base_path().to_path_buf(),
-                    picker.git_root().map(Path::to_path_buf),
-                    Arc::clone(&picker.git_status_worker),
-                    picker.follows_symlinks(),
-                )
-            })
-        })
-    else {
-        return true;
-    };
     let now = std::time::Instant::now();
-    let events = paths
-        .into_iter()
+    let events = (paths.into_iter())
         .map(|path| {
-            // An index that does not follow symlinks holds none, as its scan skips them: a
-            // reported symlink, also one that replaced a file or directory, is a removal.
-            let skipped_link = !follow_symlinks
-                && std::fs::symlink_metadata(&path).is_ok_and(|meta| meta.file_type().is_symlink());
-            let kind = if skipped_link {
-                EventKind::Remove(notify::event::RemoveKind::Any)
-            } else {
-                EventKind::Modify(ModifyKind::Any)
-            };
-            DebouncedEvent::new(notify::Event::new(kind).add_path(path), now)
+            let event = notify::Event::new(EventKind::Modify(ModifyKind::Any)).add_path(path);
+            DebouncedEvent::new(event, now)
         })
         .collect();
-    let Some(events) = shared_picker.event_hold().defer(events) else {
-        return false;
-    };
-    let new_dirs = handle_debounced_events(
-        &options,
-        events,
-        &base_path,
-        &git_workdir,
-        shared_picker,
-        shared_frecency,
-        &git_status_worker,
-    );
-    if let Ok(guard) = shared_picker.read()
-        && let Some(watcher) = guard
-            .as_ref()
-            .and_then(|picker| picker.background_watcher.as_ref())
-    {
-        for dir in new_dirs {
-            watcher.request_index_dir(dir);
-        }
-    }
-    true
-}
-
-pub(crate) fn handle_debounced_events(
-    options: &WatcherOptions,
-    events: Vec<DebouncedEvent>,
-    base_path: &Path,
-    git_workdir: &Option<PathBuf>,
-    shared_picker: &SharedFilePicker,
-    shared_frecency: &SharedFrecency,
-    git_status_worker: &Arc<GitStatusWorker>,
-) -> Vec<PathBuf> {
-    let events = drop_foreign_admin_files(shared_picker, base_path, events);
-    if events.is_empty() {
-        return Vec::new();
-    }
-    let mut git = GitChanges::default();
-    let new_dirs = apply_debounced_events(
-        options,
-        events,
-        base_path,
-        git_workdir,
-        shared_picker,
-        shared_frecency,
-        git_status_worker,
-        &mut git,
-    );
-    // Subscribers hear of git state changes whatever became of the batch's index update.
-    for root in &git.roots {
-        shared_picker.notify_repository_change(root);
-    }
-    for root in &git.ref_roots {
-        shared_picker.notify_ref_change(root);
-    }
-    for (moved, work_tree) in &git.heads_beside {
-        shared_picker.notify_head_beside(moved, work_tree);
-    }
-    if (!git.watches.is_empty() || git.resync_refs)
-        && let Ok(guard) = shared_picker.read()
-        && let Some(watcher) = guard.as_ref().and_then(|p| p.background_watcher.as_ref())
-    {
-        for change in git.watches {
-            watcher.request_git_state(change);
-        }
-        if git.resync_refs {
-            watcher.watches.refs.renew(git.renewed_refs);
-            watcher.send(WatchTask::SyncRefs);
-        }
-    }
-    new_dirs
-}
-
-// Other worktrees' admin dirs reach the index only through its ref watches, and their busy
-// files mean nothing to it: a batch of them costs one lock and a prefix check per path.
-fn drop_foreign_admin_files(
-    picker: &SharedFilePicker,
-    base_path: &Path,
-    events: Vec<DebouncedEvent>,
-) -> Vec<DebouncedEvent> {
-    let signals = picker.read().ok().and_then(|guard| {
-        let watcher = guard.as_ref()?.background_watcher.as_ref()?;
-        watcher.watches.refs.signals()
-    });
-    let Some(signals) = signals else {
-        return events;
-    };
-    (events.into_iter())
-        .filter(|event| {
-            let paths = &event.event.paths;
-            paths.is_empty()
-                || !paths
-                    .iter()
-                    .all(|path| signals.foreign_admin_file(path, base_path))
-        })
-        .collect()
-}
-
-// What a batch tells of git state: the work trees whose state changed, those whose refs
-// changed, the git dirs and logs that need watches of their own, and whether the ref
-// watches need to follow a ref store.
-#[derive(Default)]
-struct GitChanges {
-    roots: ahash::AHashSet<PathBuf>,
-    ref_roots: ahash::AHashSet<PathBuf>,
-    watches: Vec<GitStateChange>,
-    resync_refs: bool,
-    renewed_refs: Vec<PathBuf>,
-    // See `RefChanges`.
-    heads_beside: ahash::AHashSet<(PathBuf, PathBuf)>,
-}
-
-enum GitStateChange {
-    // A `.git` appeared in this directory, which the walk had already reached.
-    Repository(PathBuf),
-    // This git dir gained its `logs`.
-    Log(PathBuf),
-}
-
-// Applies a batch and collects the work trees whose git state it changed.
-#[allow(clippy::too_many_arguments)]
-#[tracing::instrument(name = "fs_events", skip(options, events, shared_picker, shared_frecency, git_status_worker, git), fields(mode = ?options.mode), level = Level::DEBUG)]
-fn apply_debounced_events(
-    options: &WatcherOptions,
-    events: Vec<DebouncedEvent>,
-    base_path: &Path,
-    git_workdir: &Option<PathBuf>,
-    shared_picker: &SharedFilePicker,
-    shared_frecency: &SharedFrecency,
-    git_status_worker: &Arc<GitStatusWorker>,
-    git: &mut GitChanges,
-) -> Vec<PathBuf> {
-    // this will be called very often, we have to minimiy the lock time for file picker
-    let repo = git_workdir.as_ref().and_then(|p| Repository::open(p).ok());
-    // Prefer the walker's own ignore rules (zlob); grab a cheap Arc clone once
-    // per batch so we don't hold the picker lock during filtering.
-    let (walker_rules, follow_symlinks, ref_signals) = shared_picker
-        .read()
-        .ok()
-        .and_then(|g| {
-            g.as_ref().map(|p| {
-                let watcher = p.background_watcher.as_ref();
-                let ref_signals = watcher.and_then(|watcher| watcher.watches.refs.signals());
-                (p.ignore_rules(), p.follows_symlinks(), ref_signals)
-            })
-        })
-        .unwrap_or((None, false, None));
-    let ref_only = |path: &Path| {
-        (ref_signals.as_ref()).is_some_and(|signals| signals.ref_only(path, base_path))
-    };
-    let ignore_options = &options.ignore_options;
-    let mut filter = IgnoreFilter::new(
-        base_path,
-        walker_rules,
-        repo.as_ref(),
-        ignore_options.disable_git,
-    );
-    let mut need_full_git_rescan = false;
-    let mut batch_overflow_attempted = false;
-    let mut paths_to_remove = Vec::new();
-    let mut dirs_to_remove: Vec<PathBuf> = Vec::new();
-    let mut paths_to_add_or_modify = Vec::new();
-    let mut new_dirs_to_watch = Vec::new();
-    let mut dirs_to_reconcile: Vec<PathBuf> = Vec::new();
-    let mut affected_paths_count = 0usize;
-    let mut explicit_renames: Vec<(PathBuf, PathBuf)> = Vec::new();
-
-    let watch_registry = shared_picker.watch_registry();
-    let need_events_propagation = watch_registry.is_active();
-
-    // Whether the index holds `path` as a directory, and as a live file.
-    let indexed_as = |path: &Path| {
-        shared_picker
-            .read()
-            .ok()
-            .and_then(|guard| {
-                guard.as_ref().map(|picker| {
-                    let file = picker
-                        .get_file_by_path(path)
-                        .is_some_and(|file| !file.is_deleted());
-                    (picker.knows_dir(path), file)
-                })
-            })
-            .unwrap_or((false, false))
-    };
-
-    let try_trigger_full_rescan = |reason: RescanReason| -> bool {
-        request_rescan(shared_picker, shared_frecency, base_path, reason)
-    };
-
-    // Git state changes are collected first, so a rescan this batch starts loses none.
-    let changes = events.iter().filter(|event| {
-        !matches!(
-            event.event.kind,
-            EventKind::Access(
-                AccessKind::Read
-                    | AccessKind::Open(_)
-                    | AccessKind::Close(AccessMode::Read | AccessMode::Execute)
-            )
-        )
-    });
-    let paths = changes.flat_map(|event| {
-        // A file's removal never takes a repository with it.
-        let removed = matches!(
-            event.event.kind,
-            EventKind::Remove(
-                notify::event::RemoveKind::Folder
-                    | notify::event::RemoveKind::Any
-                    | notify::event::RemoveKind::Other
-            )
-        );
-        let kind = event.event.kind;
-        event
-            .event
-            .paths
-            .iter()
-            .map(move |path| (path, kind, removed))
-    });
-    // Refs are looked at only while a listener follows a repository.
-    let mut ref_changes = RefChanges::default();
-    let follows_git = !ignore_options.disable_git;
-    for (path, kind, removed) in paths.filter(|_| follows_git) {
-        if let Some(signals) = &ref_signals
-            && signals.may_hold(path, base_path)
-        {
-            let ignored = |work_tree: &Path| filter.is_ignored(work_tree, true);
-            signals.classify(path, kind, ignored, &mut ref_changes);
-        }
-        // A repository whose work tree or git dir went, or a directory above them, is
-        // recorded anew when it returns. Linux reports a watched git dir's own removal too.
-        if removed {
-            shared_picker.forget_git_dirs_under(path);
-        }
-        if is_dotgit_change_affecting_status(path, &repo) {
-            if let Some(workdir) = git_workdir {
-                git.roots.insert(workdir.clone());
-            }
-        } else if (is_git_file(path) || !path.starts_with(base_path))
-            && !ref_only(path)
-            && let Some(root) = git_state_root(shared_picker, path)
-            && git_workdir.as_deref() != Some(root.as_path())
-            && root.starts_with(base_path)
-            && !filter.is_ignored(&root, true)
-        {
-            // A repository nested in the index, which the walk and its watches reach.
-            git.roots.insert(root);
-        }
-    }
-    if let Some(signals) = &ref_signals {
-        let mut told =
-            |work_tree: &Path| signals.is_own(work_tree) || !filter.is_ignored(work_tree, true);
-        git.ref_roots
-            .extend((ref_changes.work_trees.into_iter()).filter(|work_tree| told(work_tree)));
-        git.heads_beside
-            .extend((ref_changes.heads_beside.into_iter()).filter(|(_, beside)| told(beside)));
-        git.resync_refs = ref_changes.resync;
-        git.renewed_refs = ref_changes.renewed;
-    }
-
-    for debounced_event in &events {
-        // It is very important to not react to the access errors because we inevitably
-        // gonna trigger the sync by our own preview or other unnecessary noise
-        if matches!(
-            debounced_event.event.kind,
-            EventKind::Access(
-                AccessKind::Read
-                    | AccessKind::Open(_)
-                    | AccessKind::Close(AccessMode::Read | AccessMode::Execute)
-            )
-        ) {
-            continue;
-        }
-
-        // When macOS FSEvents (or other backends) overflow their event buffer, the kernel
-        // drops individual events and emits a rescan flag telling us to re-scan the subtree
-        if debounced_event.event.need_rescan() {
-            let small_and_known = debounced_event.event.paths.len() < 16 // this should be usually one event
-                && debounced_event
-                    .paths
-                    .iter()
-                    // but we are smart enough and not falling into the paths
-                    .all(|p| !p.is_dir() && !filter.is_ignored(p, false));
-
-            if !small_and_known && try_trigger_full_rescan(RescanReason::KernelEventLoss) {
-                return Vec::new();
-            }
-
-            // Small batches and throttled rescans fall through: the listed
-            // paths are still applied incrementally below.
-        }
-
-        tracing::debug!(event = ?debounced_event.event, "Processing FS event");
-
-        // Backends that pair the halves for us hand over [from, to] directly.
-        // The per-path pass below still classifies both, we only note the link.
-        if let EventKind::Modify(ModifyKind::Name(RenameMode::Both)) = debounced_event.event.kind
-            && let [from, to] = debounced_event.event.paths.as_slice()
-        {
-            explicit_renames.push((from.clone(), to.clone()));
-        }
-
-        for path in &debounced_event.event.paths {
-            let ignore_file_changed = match path.file_name().and_then(|f| f.to_str()) {
-                Some(".ignore") => !ignore_options.disable_ignore_files,
-                Some(".gitignore") => !ignore_options.disable_git,
-                _ => false,
-            };
-            if ignore_file_changed {
-                if path
-                    .parent()
-                    .is_some_and(|parent| filter.is_ignored(parent, true))
-                {
-                    continue;
-                }
-
-                info!(
-                    "Detected change in ignore definition file: {}",
-                    path.display()
-                );
-
-                if try_trigger_full_rescan(RescanReason::IgnoreFileChanged) {
-                    return Vec::new();
-                }
-
-                // Throttled: fall through so the ignore file itself stays
-                // indexed; the stale rules heal on the next admitted rescan.
-            }
-
-            if is_dotgit_change_affecting_status(path, &repo) {
-                need_full_git_rescan = true;
-            }
-
-            let outside = !path.starts_with(base_path);
-            if outside && ref_only(path) {
-                continue;
-            }
-            // Bare repositories keep worktree git dirs outside of any `.git` component.
-            let in_own_git_dir = repo
-                .as_ref()
-                .is_some_and(|repo| path.starts_with(repo.path()));
-            if is_git_file(path) || outside || in_own_git_dir {
-                // A repository created in a directory the walk already reached: its git
-                // state gets watches of its own, as a walked one's does.
-                if follows_git
-                    && !outside
-                    && path.file_name().is_some_and(|name| name == ".git")
-                    && path.parent().is_some_and(|parent| {
-                        git_workdir.as_deref() != Some(parent) && !filter.is_ignored(parent, true)
-                    })
-                    && path.symlink_metadata().is_ok()
-                    && let Some(work_tree) = path.parent()
-                {
-                    git.watches
-                        .push(GitStateChange::Repository(work_tree.to_path_buf()));
-                }
-                // A git dir's log appears with the first update of HEAD after `git init`,
-                // after its git dir was watched: it needs a watch of its own.
-                if follows_git
-                    && path.file_name().is_some_and(|name| name == "logs")
-                    && let Some(git_dir) = path.parent()
-                    && is_git_dir(git_dir)
-                    && path.is_dir()
-                {
-                    git.watches.push(GitStateChange::Log(git_dir.to_path_buf()));
-                }
-                continue;
-            }
-
-            // The event kind says which path changed, the filesystem what it is now.
-            //
-            // We cannot rely on the filesystem alone because a freshly created file might
-            // not be visible yet, and not on the kind alone because macOS often sends
-            // Modify(Name(Any)) instead of Remove and for both sides of a rename.
-            let kind = debounced_event.event.kind;
-            let is_removal = matches!(kind, EventKind::Remove(_));
-            // A file removal drops at most that entry, so it needs no stat; on `rm -rf`
-            // those are nearly all of the batch.
-            let state = if matches!(kind, EventKind::Remove(RemoveKind::File)) {
-                PathState::Gone
-            } else {
-                PathState::of(path, follow_symlinks)
-            };
-
-            match state {
-                // A known directory removed, created or renamed may have been replaced: a
-                // walk below reconciles its subtree with the disk.
-                PathState::Dir { walkable: true }
-                    if matches!(
-                        kind,
-                        EventKind::Remove(_)
-                            | EventKind::Create(_)
-                            | EventKind::Modify(ModifyKind::Name(_))
-                    ) =>
-                {
-                    let (known_dir, known_file) = indexed_as(path);
-                    if known_dir {
-                        dirs_to_reconcile.push(path.to_path_buf());
-                    } else {
-                        // A file the directory replaced leaves with its entry.
-                        if known_file {
-                            paths_to_remove.push((path.as_path(), false));
-                        }
-                        if !filter.is_ignored(path, true) {
-                            new_dirs_to_watch.push(path.to_path_buf());
-                        }
-                    }
-                }
-                PathState::Dir { .. } if !is_removal => {
-                    if !filter.is_ignored(path, true) {
-                        new_dirs_to_watch.push(path.to_path_buf());
-                    }
-                }
-                // Directory-level remove: both fsevents and inotify deliver a single
-                // `Remove(Folder)` for a whole tree (e.g. `git reset --hard` wiping a dir).
-                _ if matches!(kind, EventKind::Remove(RemoveKind::Folder)) => {
-                    dirs_to_remove.push(path.to_path_buf());
-                }
-                PathState::Gone | PathState::Dir { .. } => {
-                    // best effort but doesn't require a stat and generally correct
-                    let maybe_directory = !matches!(kind, EventKind::Remove(RemoveKind::File));
-                    paths_to_remove.push((path.as_path(), maybe_directory));
-                }
-                // A directory a file replaced is not a file entry: it expands to its subtree.
-                PathState::File if is_removal => {
-                    let maybe_directory = !matches!(kind, EventKind::Remove(RemoveKind::File));
-                    paths_to_remove.push((path.as_path(), maybe_directory));
-                }
-                PathState::File => {
-                    // For additions/modifications, still filter gitignored files.
-                    if !filter.is_ignored(path, false) {
-                        paths_to_add_or_modify.push(path.as_path());
-                    }
-                }
-            }
-        }
-
-        affected_paths_count += debounced_event.event.paths.len();
-        if !batch_overflow_attempted && affected_paths_count > MAX_BATCH_PATHS {
-            batch_overflow_attempted = true;
-            warn!(
-                ?affected_paths_count,
-                max = MAX_BATCH_PATHS,
-                "Too many affected paths in a single batch, triggering full rescan",
-            );
-
-            if try_trigger_full_rescan(RescanReason::EventBatchOverflow) {
-                return Vec::new();
-            }
-        }
-    }
-
-    let replaced = ReplacedDirs::walk(
-        dirs_to_reconcile,
-        base_path,
-        repo.is_some(),
-        WalkPolicy {
-            follow_symlinks,
-            ignore: ignore_options,
-        },
-        shared_picker,
-    );
-    // The walks supersede the batch's other changes inside them; those still name
-    // rename candidates.
-    let mut covered_removals = Vec::new();
-    let mut covered_additions = Vec::new();
-    if !replaced.is_empty() {
-        paths_to_remove.retain(|&(path, may_be_dir)| {
-            let covered = replaced.covers(path);
-            if covered && replaced.drops(path, base_path) {
-                covered_removals.push((path, may_be_dir));
-            }
-            !covered
-        });
-        paths_to_add_or_modify.retain(|path| {
-            let covered = replaced.covers(path);
-            if covered {
-                covered_additions.push(*path);
-            }
-            !covered
-        });
-        dirs_to_remove.retain(|dir| !replaced.covers(dir));
-        new_dirs_to_watch.retain(|dir| !replaced.covers(dir));
-    }
-
-    // Backends repeat a path within a batch; each new directory is walked once.
-    new_dirs_to_watch.sort_unstable();
-    new_dirs_to_watch.dedup();
-
-    // It's important to get the allocated sort
-    sort_with_buffer(paths_to_add_or_modify.as_mut_slice(), |a, b| {
-        a.as_os_str().cmp(b.as_os_str())
-    });
-    paths_to_add_or_modify.dedup_by(|a, b| a.as_os_str().eq(b.as_os_str()));
-
-    info!(
-        "Event processing summary: {} to remove, {} dirs to remove, {} to add/modify, {} new dirs, {} dirs to reconcile",
-        paths_to_remove.len(),
-        dirs_to_remove.len(),
-        paths_to_add_or_modify.len(),
-        new_dirs_to_watch.len(),
-        replaced.len(),
-    );
-
-    if paths_to_remove.is_empty()
-        && dirs_to_remove.is_empty()
-        && paths_to_add_or_modify.is_empty()
-        && replaced.is_empty()
-        && !need_full_git_rescan
-    {
-        debug!("No file index changes to apply");
-        return new_dirs_to_watch;
-    }
-
-    let mut files_to_update_git_status = Vec::new();
-    let mut index_update_rejected = false;
-    let mut overflow_count = 0;
-    let mut removed_from_dirs = Vec::new();
-    // Destination path -> (kind, rename source). One entry per path, so a
-    // remove+add pair recognised as a rename collapses into a single event.
-    let mut watch_events: ahash::AHashMap<PathBuf, (WatchEventKind, Option<PathBuf>)> =
-        ahash::AHashMap::new();
-    // Destination -> source for every rename recognised in this batch.
-    let mut renames: ahash::AHashMap<PathBuf, PathBuf> = ahash::AHashMap::new();
-
-    if !paths_to_remove.is_empty()
-        || !dirs_to_remove.is_empty()
-        || !paths_to_add_or_modify.is_empty()
-        || !replaced.is_empty()
-    {
-        debug!(
-            "Applying file index changes: {} to remove, {} dirs to remove, {} to add/modify, {} dirs to reconcile",
-            paths_to_remove.len(),
-            dirs_to_remove.len(),
-            paths_to_add_or_modify.len(),
-            replaced.len(),
-        );
-
-        let Ok(mut guard) = shared_picker.write() else {
-            error!("Failed to acquire file picker write lock");
-            return new_dirs_to_watch;
-        };
-        let Some(ref mut picker) = *guard else {
-            error!("File picker not initialized");
-            return new_dirs_to_watch;
-        };
-
-        // Must run before the removals below, while the vanished files still
-        // carry their indexed size/mtime.
-        // Files a reconciliation removes or adds are rename candidates too.
-        let rename_removals: Vec<(&Path, bool)> = paths_to_remove
-            .iter()
-            .chain(&covered_removals)
-            .copied()
-            .collect();
-        let rename_additions: Vec<&Path> = paths_to_add_or_modify
-            .iter()
-            .chain(&covered_additions)
-            .copied()
-            .collect();
-        renames.extend(detect_renames(
-            picker,
-            base_path,
-            &rename_removals,
-            &rename_additions,
-            &explicit_renames,
-        ));
-
-        // Presence before this batch: a tombstoned path was removed by an earlier batch.
-        let is_live = |picker: &FilePicker, path: &Path| {
-            picker
-                .get_file_by_path(path)
-                .is_some_and(|file| !file.is_deleted())
-        };
-        let lives = |paths: &[&Path]| -> Vec<bool> {
-            if need_events_propagation {
-                paths.iter().map(|path| is_live(picker, path)).collect()
-            } else {
-                Vec::new()
-            }
-        };
-        let live_before = lives(&paths_to_add_or_modify);
-        let covered_live_before = lives(&covered_additions);
-
-        for (path, may_be_dir) in &paths_to_remove {
-            let was_live = need_events_propagation && is_live(picker, path);
-            let removed = picker.remove_file_by_path(path);
-
-            if removed {
-                if was_live {
-                    watch_events.insert(path.to_path_buf(), (WatchEventKind::Removed, None));
-                }
-            } else if *may_be_dir {
-                // Not an indexed file: likely a dir renamed out of the tree
-                // (no Remove(Folder) is emitted), expand it per indexed file.
-                dirs_to_remove.push(path.to_path_buf());
-            }
-        }
-
-        // Single index scan for all dirs; misses (never-indexed paths) are free.
-        dirs_to_remove.sort_unstable();
-        dirs_to_remove.dedup();
-        if !dirs_to_remove.is_empty() {
-            let dirs = dirs_to_remove.iter().map(PathBuf::as_path);
-            if need_events_propagation {
-                picker.remove_all_files_in_dirs_with_callback(dirs, |path| {
-                    removed_from_dirs.push(path.to_path_buf());
-                })
-            } else {
-                picker.remove_all_files_in_dirs(dirs)
-            };
-        }
-
-        if need_events_propagation {
-            for path in removed_from_dirs.drain(..) {
-                watch_events.insert(path, (WatchEventKind::Removed, None));
-            }
-        }
-
-        // In the same update as the batch's removals, so files kept by a replaced
-        // directory never leave the index.
-        let mut reconciled_events = Vec::new();
-        if replaced
-            .apply(
-                picker,
-                base_path,
-                |path| {
-                    if need_events_propagation {
-                        watch_events.insert(path.to_path_buf(), (WatchEventKind::Removed, None));
-                    }
-                },
-                &mut reconciled_events,
-                &mut files_to_update_git_status,
-            )
-            .is_err()
-        {
-            index_update_rejected = true;
-        }
-        if need_events_propagation {
-            for (path, kind) in reconciled_events {
-                watch_events.insert(path, (kind, None));
-            }
-            // A file the batch names is a change even when the walk found it as indexed,
-            // as when a scan read the directory after it was replaced.
-            for (position, path) in covered_additions.iter().enumerate() {
-                if index_update_rejected
-                    || watch_events.contains_key(*path)
-                    || !is_live(picker, path)
-                {
-                    continue;
-                }
-                let kind = if covered_live_before[position] {
-                    WatchEventKind::Modified
-                } else {
-                    WatchEventKind::Created
-                };
-                watch_events.insert(path.to_path_buf(), (kind, None));
-            }
-        }
-
-        files_to_update_git_status.reserve(paths_to_add_or_modify.len());
-        for (position, path) in paths_to_add_or_modify.iter().enumerate() {
-            if index_update_rejected {
-                // The rescan picks up this path and every later one.
-                break;
-            }
-            let existed = live_before.get(position).copied().unwrap_or(false);
-
-            let applied = picker.apply_create_or_modify(path);
-            if applied.is_ok() {
-                files_to_update_git_status.push(path.to_path_buf());
-                if need_events_propagation {
-                    let kind = if existed {
-                        WatchEventKind::Modified
-                    } else {
-                        WatchEventKind::Created
-                    };
-                    watch_events.insert(path.to_path_buf(), (kind, None));
-                }
-            } else if matches!(applied, Err(IndexUpdateError::CapacityExhausted)) {
-                index_update_rejected = true;
-            }
-        }
-
-        // A destination the picker rejected is not a rename: its source stays
-        // Removed and no history is carried. For the rest, the move is one event.
-        renames.retain(|to, _| is_live(picker, to));
-        if need_events_propagation {
-            for (to, from) in &renames {
-                watch_events.remove(from);
-                watch_events.insert(to.clone(), (WatchEventKind::Renamed, Some(from.clone())));
-            }
-        }
-
-        overflow_count = picker.get_overflow_files().len();
-    }
-
-    info!(
-        files_updated = files_to_update_git_status.len(),
-        overflow_count, "File index changes applied",
-    );
-
-    let rescan_started = if index_update_rejected || overflow_count > MAX_OVERFLOW_FILES {
-        let reason = if index_update_rejected {
-            RescanReason::IndexUpdateRejected
-        } else {
-            RescanReason::OverflowCapacity
-        };
-
-        info!(%reason, "Watcher faced limit of index overflow. Triggering rescan");
-        try_trigger_full_rescan(reason)
-    } else {
-        false
-    };
-
-    // When the rescan is throttled the incrementally applied changes are
-    // still the freshest state we have — propagate them to subscribers.
-    if !rescan_started && need_events_propagation {
-        watch_registry.dispatch(
-            base_path,
-            watch_events
-                .into_iter()
-                .map(|(path, (kind, from))| RawWatchEvent {
-                    path,
-                    kind,
-                    is_ignored: false,
-                    from,
-                })
-                .collect(),
-        );
-    }
-
-    // Carry the access history onto the new path. Copied, not moved: checking
-    // out a revision where the old path exists again must still rank it.
-    if !renames.is_empty() {
-        let mut carried = Vec::new();
-        if let Ok(frecency_guard) = shared_frecency.read()
-            && let Some(ref frecency) = *frecency_guard
-        {
-            for (to, from) in &renames {
-                match frecency.copy_history(from, to) {
-                    Ok(true) => carried.push(to.clone()),
-                    Ok(false) => {}
-                    Err(e) => error!(
-                        ?from,
-                        ?to,
-                        "Failed to carry frecency over a rename: {:?}",
-                        e
-                    ),
-                }
-            }
-        }
-
-        if !carried.is_empty() {
-            info!(count = carried.len(), "Carried frecency across renames");
-            if let Ok(mut picker_guard) = shared_picker.write()
-                && let Some(ref mut picker) = *picker_guard
-                && let Ok(frecency_guard) = shared_frecency.read()
-                && let Some(ref frecency) = *frecency_guard
-            {
-                for path in &carried {
-                    let _ = picker.update_single_file_frecency(path, frecency);
-                }
-            }
-        }
-    }
-
-    // AI mode: auto-track frecency for all modified/created files.
-    // Uses a 5-minute cooldown per file to prevent score inflation from rapid
-    // burst edits (AI agents often edit the same file many times in minutes).
-    // This runs after apply_changes so the picker write lock is released.
-    if options.mode.is_ai() && !paths_to_add_or_modify.is_empty() {
-        let mut tracked_count = 0usize;
-        let shared_base = shared_picker.read().ok().and_then(|guard| {
-            guard
-                .as_ref()?
-                .worktree_shared_base()
-                .map(Path::to_path_buf)
-        });
-        if let Ok(frecency_guard) = shared_frecency.read()
-            && let Some(ref frecency) = *frecency_guard
-        {
-            for path in &paths_to_add_or_modify {
-                // Skip if this file was tracked less than 5 minutes ago
-                let should_track = match frecency.seconds_since_last_access(path) {
-                    Ok(Some(secs)) => secs >= AI_MODE_COOLDOWN_SECS,
-                    Ok(None) => true, // Never tracked before
-                    Err(_) => true,   // DB error, track anyway
-                };
-                if !should_track {
-                    continue;
-                }
-
-                let shared = shared_base
-                    .as_deref()
-                    .and_then(|shared_base| crate::git::shared_twin(path, base_path, shared_base));
-                if let Err(e) = frecency.track_access_shared(path, shared.as_deref()) {
-                    error!("Failed to track frecency for {:?}: {:?}", path, e);
-                } else {
-                    tracked_count += 1;
-                }
-            }
-            if tracked_count > 0 {
-                info!("AI mode: tracked frecency for {} files", tracked_count);
-            }
-        }
-
-        // Update in-memory frecency scores for tracked files
-        if tracked_count > 0
-            && let Ok(mut picker_guard) = shared_picker.write()
-            && let Some(ref mut picker) = *picker_guard
-            && let Ok(frecency_guard) = shared_frecency.read()
-            && let Some(ref frecency) = *frecency_guard
-        {
-            for path in &paths_to_add_or_modify {
-                let _ = picker.update_single_file_frecency(path, frecency);
-            }
-        }
-    }
-
-    // do not try to update the paths if we anyway going to rescan everything from scratch
-    // no repo => no consumer thread, so don't accumulate paths nobody will drain
-    if !index_update_rejected && repo.is_some() {
-        if need_full_git_rescan {
-            // A full git rescan re-reads every tracked path (including ones that just
-            // went clean after a commit), so it already subsumes the per-path update.
-            git_status_worker.request_full_rescan();
-        } else if !files_to_update_git_status.is_empty() {
-            git_status_worker.enqueue_paths(files_to_update_git_status);
-        }
-    }
-
-    new_dirs_to_watch
-}
-
-// Test seam for out-of-process tests: while the file named by this variable exists,
-// watchers of debug builds hold directories created after the scan unindexed. Events
-// keep arriving; the held directories are indexed once the file is removed.
-#[cfg(debug_assertions)]
-fn hold_dir_indexing() {
-    let Some(gate) = std::env::var_os("FFF_TEST_HOLD_DIR_INDEXING") else {
-        return;
-    };
-    while Path::new(&gate).exists() {
-        std::thread::sleep(Duration::from_millis(10));
+    match shared_picker.submit_events(Some(shared_frecency), events) {
+        None => true,
+        // Dropped unapplied when the index was replaced meanwhile.
+        Some(done) => done.recv().unwrap_or(false),
     }
 }
 
@@ -1603,6 +970,550 @@ static POLLED_ROOTS: Mutex<Vec<PathBuf>> = Mutex::new(Vec::new());
 #[cfg(test)]
 static NATIVE_ROOTS: Mutex<Vec<PathBuf>> = Mutex::new(Vec::new());
 
+// Test seam: streams of a root start this much later, as FSEvents' when its daemon is slow.
+#[cfg(test)]
+static SLOW_STARTS: Mutex<Vec<(PathBuf, Duration)>> = Mutex::new(Vec::new());
+
+#[cfg(test)]
+pub(crate) fn slow_stream_starts_for(root: &Path, delay: Duration) {
+    SLOW_STARTS.lock().push((root.to_path_buf(), delay));
+}
+
+// Test seam: when each start of a root's native streams by its owner thread began and ended. The
+// time inside is the backend's: FSEvents' daemon registers concurrent streams one at a time.
+#[cfg(test)]
+static STARTS: Mutex<Vec<Starting>> = Mutex::new(Vec::new());
+
+#[cfg(test)]
+struct Starting {
+    root: PathBuf,
+    began: std::time::Instant,
+    ended: Option<std::time::Instant>,
+}
+
+#[cfg(test)]
+thread_local! {
+    // The root whose streams this thread, an owner thread, starts.
+    static OWNER_ROOT: std::cell::RefCell<Option<PathBuf>> = const { std::cell::RefCell::new(None) };
+}
+
+// Ends the start it names when dropped, also on a way out by an error.
+#[cfg(test)]
+struct StartGuard(Option<usize>);
+
+#[cfg(test)]
+impl StartGuard {
+    // Times a start or restart of a native stream on an owner thread, and nothing elsewhere.
+    fn begin(debouncer: &Debouncer) -> Self {
+        let root = OWNER_ROOT.with(|root| root.borrow().clone());
+        let Some(root) = root.filter(|_| matches!(debouncer, Debouncer::Native(_))) else {
+            return Self(None);
+        };
+        let mut starts = STARTS.lock();
+        starts.push(Starting {
+            root,
+            began: std::time::Instant::now(),
+            ended: None,
+        });
+        Self(Some(starts.len() - 1))
+    }
+}
+
+#[cfg(test)]
+impl Drop for StartGuard {
+    fn drop(&mut self) {
+        if let Some(at) = self.0 {
+            STARTS.lock()[at].ended = Some(std::time::Instant::now());
+        }
+    }
+}
+
+// How many starts of a root's native streams began.
+#[cfg(test)]
+pub(crate) fn stream_starts(root: &Path) -> usize {
+    (STARTS.lock().iter())
+        .filter(|start| start.root == root)
+        .count()
+}
+
+// How many starts of a root's native streams began at or after `from`.
+#[cfg(all(test, target_os = "macos"))]
+pub(crate) fn stream_starts_since(root: &Path, from: std::time::Instant) -> usize {
+    (STARTS.lock().iter())
+        .filter(|start| start.root == root && start.began >= from)
+        .count()
+}
+
+// Whether `done` holds within `limit` of the product's time past `from`. The backend's time, up to
+// 300 s, is that of a start under way at `from` and of the first `starts` the product needs after.
+#[cfg(test)]
+pub(crate) fn within_product_time(
+    root: &Path,
+    from: std::time::Instant,
+    limit: Duration,
+    starts: usize,
+    mut done: impl FnMut() -> bool,
+) -> bool {
+    let backend_limit = Duration::from_secs(300);
+    loop {
+        if done() {
+            return true;
+        }
+        let now = std::time::Instant::now();
+        let backend: Duration = {
+            let all = STARTS.lock();
+            let running = |start: &&Starting| start.ended.is_none_or(|ended| ended > from);
+            let mine = (all.iter())
+                .filter(|start| start.root == root)
+                .filter(running);
+            let (under_way, begun): (Vec<_>, Vec<_>) = mine.partition(|start| start.began < from);
+            (under_way.into_iter().chain(begun.into_iter().take(starts)))
+                .map(|start| {
+                    let (began, ended) = (start.began.max(from), start.ended.unwrap_or(now));
+                    ended.saturating_duration_since(began)
+                })
+                .sum()
+        };
+        assert!(
+            backend < backend_limit,
+            "the backend spent {backend:?} starting the streams of {}",
+            root.display()
+        );
+        if now.saturating_duration_since(from) >= limit + backend {
+            return done();
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+// Test seam: each path the native streams delivered, when the backend called back with it.
+#[cfg(all(test, target_os = "macos"))]
+static DELIVERED: Mutex<Vec<Delivered>> = Mutex::new(Vec::new());
+
+#[cfg(all(test, target_os = "macos"))]
+struct Delivered {
+    path: PathBuf,
+    at: std::time::Instant,
+    rescan: bool,
+}
+
+#[cfg(all(test, target_os = "macos"))]
+pub(super) fn record_delivery(event: &notify::Event) {
+    let (at, rescan) = (std::time::Instant::now(), event.need_rescan());
+    let paths = (event.paths.iter()).map(|path| Delivered {
+        path: path.clone(),
+        at,
+        rescan,
+    });
+    DELIVERED.lock().extend(paths);
+}
+
+// Test seam: paths at or below these never reach the index from a stream, as when FSEvents loses
+// their events; whether anything is left of an event.
+#[cfg(test)]
+static UNDELIVERED: Mutex<Vec<PathBuf>> = Mutex::new(Vec::new());
+
+#[cfg(test)]
+pub(super) fn deliverable(event: &mut notify::Event) -> bool {
+    let undelivered = UNDELIVERED.lock();
+    let had = !event.paths.is_empty();
+    (event.paths).retain(|path| !undelivered.iter().any(|hidden| path.starts_with(hidden)));
+    !had || !event.paths.is_empty()
+}
+
+// Test seam: a stream of the test's own on a root, in a child process of the test binary, started
+// before the change and never restarted: it tells a loss by FSEvents from one by this process.
+#[cfg(all(test, target_os = "macos"))]
+pub(crate) struct Control {
+    child: std::process::Child,
+    seen: PathBuf,
+    _dir: tempfile::TempDir,
+}
+
+#[cfg(all(test, target_os = "macos"))]
+const CONTROL_ROOT: &str = "FFF_TEST_CONTROL_ROOT";
+#[cfg(all(test, target_os = "macos"))]
+const CONTROL_SEEN: &str = "FFF_TEST_CONTROL_SEEN";
+#[cfg(all(test, target_os = "macos"))]
+const CONTROL_READY: &str = "\0ready";
+
+#[cfg(all(test, target_os = "macos"))]
+impl Control {
+    // Starts the child and waits until its stream runs, as long as a stream of ours may take.
+    fn on(root: &Path) -> Self {
+        let dir = tempfile::tempdir().unwrap();
+        let seen = dir.path().join("seen");
+        std::fs::write(&seen, "").unwrap();
+        let module = module_path!()
+            .split_once("::")
+            .map_or(module_path!(), |(_, path)| path);
+        let child = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                &format!("{module}::tests::fsevents_control"),
+                "--nocapture",
+            ])
+            .env(CONTROL_ROOT, root)
+            .env(CONTROL_SEEN, &seen)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .unwrap();
+        let control = Self {
+            child,
+            seen,
+            _dir: dir,
+        };
+        let (limit, begun) = (Duration::from_secs(300), std::time::Instant::now());
+        while !control.lines().iter().any(|line| line == CONTROL_READY) {
+            assert!(
+                begun.elapsed() < limit,
+                "the control's stream did not start within {limit:?}"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        control
+    }
+
+    fn lines(&self) -> Vec<String> {
+        let read = std::fs::read_to_string(&self.seen).unwrap_or_default();
+        read.lines().map(str::to_owned).collect()
+    }
+
+    fn missed(&self, matches: impl Fn(&Path) -> bool, what: String) -> Missed {
+        let lines = self.lines();
+        let seen: Vec<_> = (lines.iter())
+            .filter(|line| *line != CONTROL_READY)
+            .map(Path::new)
+            .collect();
+        let by_all = !seen.iter().any(|path| matches(path));
+        let whose = match by_all {
+            false => "received it: the product's streams did not",
+            true => "received none of it either: FSEvents lost or withheld it",
+        };
+        let said = format!(
+            "{what}; a stream of the test's own on the root {whose} ({} paths in all)",
+            seen.len()
+        );
+        Missed { by_all, said }
+    }
+}
+
+#[cfg(all(test, target_os = "macos"))]
+impl Drop for Control {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+// The child's side of `Control`: lists each path its stream receives until the test ends it, or
+// its parent is gone.
+#[cfg(all(test, target_os = "macos"))]
+fn run_control(root: &Path, seen: &Path) {
+    use std::io::Write;
+    let parent = std::os::unix::process::parent_id();
+    let file = Mutex::new(std::fs::OpenOptions::new().append(true).open(seen).unwrap());
+    let into = Arc::new(file);
+    let out = Arc::clone(&into);
+    let handler = move |event: notify::Result<notify::Event>| {
+        if let Ok(event) = event {
+            let mut file = out.lock();
+            for path in event.paths {
+                let _ = writeln!(file, "{}", path.display());
+            }
+        }
+    };
+    let mut watcher = notify::RecommendedWatcher::new(handler, Config::default()).unwrap();
+    watcher.watch(root, RecursiveMode::Recursive).unwrap();
+    writeln!(into.lock(), "{CONTROL_READY}").unwrap();
+    while std::os::unix::process::parent_id() == parent {
+        std::thread::sleep(Duration::from_millis(100));
+    }
+}
+
+// A live delivery the product's streams did not get, and whether the control did not either.
+#[cfg(all(test, target_os = "macos"))]
+pub(crate) struct Missed {
+    by_all: bool,
+    said: String,
+}
+
+// Test seam: when a native stream first delivered a path `matches` takes, waited for long, as
+// FSEvents can withhold deliveries for minutes; a failure names what it delivered below `root`.
+#[cfg(all(test, target_os = "macos"))]
+pub(crate) fn delivered(
+    root: &Path,
+    what: &str,
+    matches: impl Fn(&Path) -> bool,
+    control: &Control,
+) -> Result<std::time::Instant, Missed> {
+    let limit = Duration::from_secs(300);
+    let begun = std::time::Instant::now();
+    loop {
+        let delivered = DELIVERED.lock();
+        let first = (delivered.iter()).find(|delivered| matches(&delivered.path));
+        if let Some(first) = first {
+            return Ok(first.at);
+        }
+        if begun.elapsed() >= limit {
+            let meanwhile: Vec<_> = (delivered.iter())
+                .filter(|delivered| delivered.at >= begun && delivered.path.starts_with(root))
+                .map(|delivered| (&delivered.path, delivered.rescan))
+                .collect();
+            let elsewhere = (delivered.iter()).filter(|delivered| delivered.at >= begun);
+            let what = format!("FSEvents delivered nothing of {what} within {limit:?}");
+            let mut missed = control.missed(&matches, what);
+            let below = format!(
+                "; below the root {meanwhile:?}, {} paths in all",
+                elsewhere.count()
+            );
+            missed.said.push_str(&below);
+            return Err(missed);
+        }
+        drop(delivered);
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+// Test seam: waits until a native stream of `root` delivers, writing a new file into it each second,
+// as FSEvents can withhold or lose deliveries for minutes; the control then watches what follows.
+#[cfg(all(test, target_os = "macos"))]
+pub(crate) fn until_delivering(root: &Path) -> Control {
+    let control = Control::on(root);
+    let limit = Duration::from_secs(300);
+    let canary = |path: &Path| {
+        path.parent() == Some(root)
+            && (path.file_name()).is_some_and(|name| name.to_string_lossy().starts_with(".canary-"))
+    };
+    let mut written = 0;
+    retried_while_lost(|_| {
+        let begun = std::time::Instant::now();
+        while begun.elapsed() < limit {
+            std::fs::write(root.join(format!(".canary-{written}")), "").unwrap();
+            written += 1;
+            let at = std::time::Instant::now();
+            while at.elapsed() < Duration::from_secs(1) {
+                if DELIVERED
+                    .lock()
+                    .iter()
+                    .any(|delivered| canary(&delivered.path))
+                {
+                    return Ok(());
+                }
+                std::thread::sleep(Duration::from_millis(20));
+            }
+        }
+        let what = format!(
+            "FSEvents delivered nothing to the streams of {}",
+            root.display()
+        );
+        Err(control.missed(canary, format!("{what} within {limit:?}")))
+    });
+    control
+}
+
+// Runs `attempt` again, up to three times in all, while FSEvents lost its delivery for every
+// client, as it does under load; a delivery only the product's streams missed fails at once.
+#[cfg(all(test, target_os = "macos"))]
+pub(crate) fn retried_while_lost<T>(mut attempt: impl FnMut(usize) -> Result<T, Missed>) -> T {
+    let mut lost = Vec::new();
+    for count in 1..=3 {
+        match attempt(count) {
+            Ok(done) => return done,
+            Err(missed) if missed.by_all => {
+                eprintln!("attempt {count} of 3 lost: {}", missed.said);
+                lost.push(format!("attempt {count}: {}", missed.said));
+            }
+            Err(missed) => panic!("{}", missed.said),
+        }
+    }
+    panic!("{} attempts, each lost: {}", lost.len(), lost.join(" | "))
+}
+
+// Test seam: each task of the owner threads, in order.
+#[cfg(test)]
+static HANDLED: Mutex<Vec<Handled>> = Mutex::new(Vec::new());
+
+#[cfg(test)]
+struct Handled {
+    task: usize,
+    watcher: usize,
+    root: PathBuf,
+    kind: &'static str,
+}
+
+#[cfg(all(test, target_os = "macos"))]
+fn tasks_handled(root: &Path) -> usize {
+    (HANDLED.lock().iter())
+        .filter(|handled| handled.root == root)
+        .count()
+}
+
+// Test seam: a task of an owner thread, the watcher it served and the work trees it told
+// repository and ref listeners of.
+#[cfg(test)]
+pub(crate) struct TaskTold {
+    pub(crate) task: usize,
+    pub(crate) watcher: usize,
+    pub(crate) kind: &'static str,
+    pub(crate) repositories: Vec<PathBuf>,
+    pub(crate) refs: Vec<PathBuf>,
+}
+
+// The tasks of `root`'s owner threads numbered above `since`, in order.
+#[cfg(test)]
+pub(crate) fn tasks_told(root: &Path, since: usize) -> Vec<TaskTold> {
+    let handled: Vec<_> = (HANDLED.lock().iter())
+        .filter(|handled| handled.root == root && handled.task > since)
+        .map(|handled| (handled.task, handled.watcher, handled.kind))
+        .collect();
+    let told = |told: &Mutex<Vec<(usize, PathBuf)>>, task: usize| -> Vec<PathBuf> {
+        (told.lock().iter())
+            .filter(|(known, _)| *known == task)
+            .map(|(_, work_tree)| work_tree.clone())
+            .collect()
+    };
+    (handled.into_iter())
+        .map(|(task, watcher, kind)| TaskTold {
+            task,
+            watcher,
+            kind,
+            repositories: told(&REPOSITORIES_TOLD, task),
+            refs: told(&REFS_TOLD, task),
+        })
+        .collect()
+}
+
+#[cfg(test)]
+pub(crate) fn tasks_started() -> usize {
+    TASKS.load(Ordering::SeqCst)
+}
+
+#[cfg(test)]
+fn handled(watches: &Arc<Watches>, task: &WatchTask) -> usize {
+    let number = TASKS.fetch_add(1, Ordering::SeqCst) + 1;
+    let kind = match task {
+        WatchTask::NewRepository(_) => "NewRepository",
+        WatchTask::WatchRepository { .. } => "WatchRepository",
+        WatchTask::NewGitLog(..) => "NewGitLog",
+        WatchTask::NewGitInfo(_) => "NewGitInfo",
+        // An announcement's, which names the work trees it announced.
+        WatchTask::SyncRefs(told) if !told.is_empty() => "SyncRefs naming",
+        WatchTask::SyncRefs(_) => "SyncRefs",
+        WatchTask::FollowRefs(_) => "FollowRefs",
+        WatchTask::Announce => "Announce",
+        #[cfg(target_os = "macos")]
+        WatchTask::Watched { .. } => "Watched",
+    };
+    HANDLED.lock().push(Handled {
+        task: number,
+        watcher: Arc::as_ptr(watches) as usize,
+        root: watches.base_path.clone(),
+        kind,
+    });
+    number
+}
+
+// Test seam: the repository and ref notifications each task of an owner thread made, by task.
+#[cfg(test)]
+static TASKS: AtomicUsize = AtomicUsize::new(0);
+
+#[cfg(test)]
+static REPOSITORIES_TOLD: Mutex<Vec<(usize, PathBuf)>> = Mutex::new(Vec::new());
+
+#[cfg(test)]
+static REFS_TOLD: Mutex<Vec<(usize, PathBuf)>> = Mutex::new(Vec::new());
+
+#[cfg(test)]
+thread_local! {
+    static TASK: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+pub(crate) fn repository_told(work_tree: &Path) {
+    told_in_task(&REPOSITORIES_TOLD, work_tree);
+}
+
+#[cfg(test)]
+pub(crate) fn ref_told(work_tree: &Path) {
+    told_in_task(&REFS_TOLD, work_tree);
+}
+
+#[cfg(test)]
+fn told_in_task(told: &Mutex<Vec<(usize, PathBuf)>>, work_tree: &Path) {
+    let task = TASK.with(std::cell::Cell::get);
+    if task != 0 {
+        told.lock().push((task, work_tree.to_path_buf()));
+    }
+}
+
+// Test seam: the next task of a root's owner thread panics.
+#[cfg(test)]
+static PANICKING_TASKS: Mutex<Vec<PathBuf>> = Mutex::new(Vec::new());
+
+#[cfg(test)]
+pub(crate) fn panicking_task_for(root: &Path) {
+    PANICKING_TASKS.lock().push(root.to_path_buf());
+}
+
+#[cfg(test)]
+fn panicking_task(base_path: &Path) {
+    let mut panicking = PANICKING_TASKS.lock();
+    if let Some(at) = panicking.iter().position(|root| root == base_path) {
+        panicking.remove(at);
+        drop(panicking);
+        panic!("a task of the watcher's thread failed halfway");
+    }
+}
+
+// Test seam: setting up a root's streams panics.
+#[cfg(test)]
+static PANICKING_STARTS: Mutex<Vec<PathBuf>> = Mutex::new(Vec::new());
+
+#[cfg(test)]
+pub(crate) fn panicking_stream_starts_for(root: &Path) {
+    PANICKING_STARTS.lock().push(root.to_path_buf());
+}
+
+#[cfg(test)]
+fn started_stream(base_path: &Path) {
+    if PANICKING_STARTS.lock().iter().any(|root| root == base_path) {
+        panic!("starting the streams failed halfway");
+    }
+    let delay =
+        (SLOW_STARTS.lock().iter()).find_map(|(root, delay)| (root == base_path).then_some(*delay));
+    if let Some(delay) = delay {
+        std::thread::sleep(delay);
+    }
+}
+
+// Roots whose watchers tests start with a watch per directory, as on Linux, on any platform.
+#[cfg(test)]
+static PER_DIRECTORY_ROOTS: Mutex<Vec<PathBuf>> = Mutex::new(Vec::new());
+
+#[cfg(all(test, target_os = "macos"))]
+pub(crate) fn native_watcher_for(root: &Path) {
+    NATIVE_ROOTS.lock().push(root.to_path_buf());
+}
+
+#[cfg(test)]
+pub(crate) fn watch_per_directory_for(root: &Path) {
+    PER_DIRECTORY_ROOTS.lock().push(root.to_path_buf());
+}
+
+fn recursive_watch(_base_path: &Path) -> bool {
+    #[cfg(test)]
+    if PER_DIRECTORY_ROOTS
+        .lock()
+        .iter()
+        .any(|root| root == _base_path)
+    {
+        return false;
+    }
+    cfg!(any(target_os = "macos", target_os = "windows"))
+}
+
 /// Test seam: watchers started later for `root` in this process poll instead of
 /// using OS events. Debug and test builds only.
 #[cfg(any(test, debug_assertions))]
@@ -1612,136 +1523,47 @@ pub fn poll_watcher_for(root: &Path) {
     POLLED_ROOTS.lock().push(root);
 }
 
-/// Indexes a directory created after the scan.
-pub(super) fn index_new_directory(
-    dir: &Path,
-    shared_picker: &SharedFilePicker,
-    shared_frecency: &SharedFrecency,
-    git_workdir: &Option<PathBuf>,
-    git_status_worker: &Arc<GitStatusWorker>,
-    dir_hook: Option<&DirHook>,
-) {
-    let repo = git_workdir.as_ref().and_then(|p| Repository::open(p).ok());
-    let Some((base_path, options)) = shared_picker.read().ok().and_then(|g| {
-        g.as_ref()
-            .map(|p| (p.base_path().to_path_buf(), WatcherOptions::of(p)))
-    }) else {
-        return;
-    };
-    let base_path = base_path.as_path();
-
-    if !dir.is_dir() {
-        return;
-    }
-
-    let policy = WalkPolicy {
-        follow_symlinks: options.follow_symlinks,
-        ignore: &options.ignore_options,
-    };
-    let Some(walk) = DirWalk::new(dir, base_path, repo.is_some(), policy, dir_hook) else {
-        return;
-    };
-
-    let mut indexed_files = Vec::new();
-    // A directory already known can be walked again: its indexed files are
-    // reported only when the walk changed them.
-    let mut file_events = Vec::new();
-    let update_rejected = {
-        let Ok(mut guard) = shared_picker.write() else {
-            return;
-        };
-
-        let Some(ref mut picker) = *guard else {
-            return;
-        };
-
-        // Once capacity runs out the rescan covers the rest of the subtree.
-        walk.apply(picker, base_path, &mut file_events, &mut indexed_files)
-            .is_err()
-    };
-    // The lock is released before the rescan is requested. A started rescan
-    // replaces the accepted prefix, so its events are not replayed; a deferred
-    // one leaves them to be reported now.
-    let rescan_started = update_rejected
-        && request_rescan(
-            shared_picker,
-            shared_frecency,
-            base_path,
-            RescanReason::IndexUpdateRejected,
-        );
-    let added = indexed_files.len();
-
-    let watch_registry = shared_picker.watch_registry();
-    if !rescan_started && watch_registry.is_active() {
-        let events = file_events
-            .into_iter()
-            .map(|(path, kind)| RawWatchEvent {
-                path,
-                kind,
-                is_ignored: false,
-                from: None,
-            })
-            .collect();
-
-        watch_registry.dispatch(base_path, events);
-    }
-
-    if !rescan_started && repo.is_some() {
-        git_status_worker.enqueue_paths(indexed_files);
-    }
-
-    debug!(
-        "Indexed new {} files from new directory {}",
-        added,
-        dir.display(),
-    );
-}
-
-// Subscribes directories one at a time as a walk reaches them, and the git state of the
-// repositories among them, which walks skip.
+// Subscribes directories one at a time as a walk reaches them, inline, and has the owner thread
+// watch the git state of the repositories among them, which walks skip.
 struct DirSubscriptions {
     watches: Arc<Watches>,
-    recursive: bool,
-    picker: crate::shared::WeakFilePicker,
-    base_path: PathBuf,
     watched: AtomicUsize,
     consecutive_failures: AtomicUsize,
 }
 
 impl DirSubscriptions {
-    fn hook(
-        watches: &Arc<Watches>,
-        recursive: bool,
-        picker: &crate::shared::WeakFilePicker,
-        base_path: &Path,
-    ) -> DirHook {
+    fn hook(watches: &Arc<Watches>) -> DirHook {
         let subscriptions = Self {
             watches: Arc::clone(watches),
-            recursive,
-            picker: picker.clone(),
-            base_path: base_path.to_path_buf(),
             watched: AtomicUsize::new(0),
             consecutive_failures: AtomicUsize::new(0),
         };
-        Arc::new(move |dir: &Path| {
-            if !subscriptions.recursive {
-                subscriptions.subscribe(dir);
-            }
-            if subscriptions.watches.follows_git {
-                subscriptions.watch_git_state(dir);
-            }
-        })
+        Arc::new(move |dir: &Path| subscriptions.reach(dir))
     }
 
+    fn reach(&self, dir: &Path) {
+        if !self.watches.recursive {
+            self.subscribe(dir);
+        }
+        if self.watches.follows_git {
+            self.watch_git_state(dir);
+        }
+    }
+
+    // A directory is subscribed before it is read, as Watchman's crawler does. Once the watcher
+    // stopped, nothing is.
     fn subscribe(&self, dir: &Path) {
         if self.consecutive_failures.load(Ordering::Relaxed) >= MAX_CONSECUTIVE_WATCH_FAILURES {
             return;
         }
-        let mut guard = self.watches.streams.lock();
-        let Some(streams) = guard.as_mut() else {
+        let mut directories = self.watches.directories.lock();
+        if self.watches.stopped.load(Ordering::Acquire) {
+            return;
+        }
+        let Some(stream) = directories.as_mut() else {
             return;
         };
-        match streams.tree.watch(dir, RecursiveMode::NonRecursive) {
+        match stream.watch(dir, RecursiveMode::NonRecursive) {
             Ok(()) => {
                 self.watched.fetch_add(1, Ordering::Relaxed);
                 self.consecutive_failures.store(0, Ordering::Relaxed);
@@ -1762,49 +1584,30 @@ impl DirSubscriptions {
         }
     }
 
-    // Records the git dir of a repository whose work tree is `dir`, a `.git` directory or
-    // the one a `.git` file names, as submodules and linked worktrees have, and watches it
-    // unless the recursive watch of the tree already covers it. A git dir is watched when
-    // it is new or another directory than the recorded one, as after a repository was
-    // removed and created again, also within one batch: watching a path again is not free
-    // everywhere, as the polling backend takes a new snapshot and loses what changed since
-    // its last poll. Such a repository is announced once its watches are in place, since
-    // `git init`, a clone or a worktree add and a first `git add` are quicker than a walk.
-    // The first scan of an index has no subscribers to hear it. Its ref watches, while a ref
-    // listener follows it, go in the same update.
+    // Records work tree `dir`'s git dir and watches it if new or replaced, never again, as a
+    // polling snapshot loses what changed since; the walk waits unless a stream restarts for it.
     fn watch_git_state(&self, dir: &Path) {
         let Some(git_dir) = git_dir_of(dir) else {
             return;
         };
-        let Some(picker) = self.picker.upgrade() else {
-            return;
-        };
-        if !picker.register_git_dir(&git_dir, dir) {
+        if !self.watches.git_dirs.register(&git_dir, dir) {
             return;
         }
-        let (appeared, restarted) = {
-            let mut guard = self.watches.streams.lock();
-            let Some(streams) = guard.as_mut() else {
-                return;
-            };
-            let mut ops = Vec::new();
-            if !self.recursive || !git_dir.starts_with(&self.base_path) {
-                ops.extend(git_dir_watches(&git_dir));
-            }
-            // A repository created again lost the watches of its refs; a linked worktree
-            // shares its main repository's.
-            let renew = (super::common_dir_of(&git_dir) == git_dir).then_some(git_dir.as_path());
-            let refs = self.watches.refs.plan(&picker, renew);
-            ops.extend(refs.ops);
-            (refs.appeared, self.watches.update(streams, ops))
-        };
-        if restarted {
-            self.watches.recover_outside(&picker);
+        let work_tree = dir.to_path_buf();
+        if self.watches.restarts {
+            let done = None;
+            self.watches.send(WatchTask::WatchRepository {
+                work_tree,
+                git_dir,
+                done,
+            });
+        } else {
+            self.watches.ask(|done| WatchTask::WatchRepository {
+                work_tree,
+                git_dir,
+                done: Some(done),
+            });
         }
-        for work_tree in appeared {
-            picker.notify_ref_change(&work_tree);
-        }
-        picker.notify_repository_change(dir);
     }
 }
 
@@ -1817,177 +1620,14 @@ impl Drop for DirSubscriptions {
     }
 }
 
-struct IgnoreFilter<'a> {
-    base_path: &'a Path,
-    // Ignore rules from the last walk.
-    rules: Option<Arc<crate::walk::WalkIgnoreRules>>,
-    /// libgit2 repo, consulted only when `rules` is `None`. Borrowed from the
-    /// caller's repo (also used for git-status queries) to avoid re-opening.
-    repo: Option<&'a Repository>,
-    disable_git: bool,
-}
-
-impl<'a> IgnoreFilter<'a> {
-    fn new(
-        base_path: &'a Path,
-        rules: Option<Arc<crate::walk::WalkIgnoreRules>>,
-        repo: Option<&'a Repository>,
-        disable_git: bool,
-    ) -> Self {
-        Self {
-            base_path,
-            rules,
-            repo,
-            disable_git,
-        }
-    }
-
-    fn is_ignored(&mut self, path: &Path, is_dir: bool) -> bool {
-        if let Some(rules) = self.rules.as_mut() {
-            let Ok(relative) = path.strip_prefix(self.base_path) else {
-                return false;
-            };
-            // Ripgrep caches directory rules. Start each batch with the unloaded matcher.
-            #[cfg(not(feature = "zlob"))]
-            let rules = Arc::make_mut(rules);
-            return rules.is_ignored(relative, is_dir);
-        }
-        match self.repo {
-            Some(repo) => repo.is_path_ignored(path) == Ok(true),
-            None if self.disable_git => false,
-            // No repo and no rules: the non-code-dir heuristic, applied to the
-            // base-relative path so ancestors of the base (e.g. a temp dir
-            // under AppData/Local on Windows) never match.
-            None => crate::ignore::is_non_code_directory(
-                path.strip_prefix(self.base_path).unwrap_or(path),
-            ),
-        }
-    }
-}
-
-#[inline]
-pub(crate) fn is_git_file(path: &Path) -> bool {
-    // it could be in submodule
-    path.components()
-        .any(|component| component.as_os_str() == ".git")
-}
-
-fn is_dotgit_change_affecting_status(changed: &Path, repo: &Option<Repository>) -> bool {
-    let Some(repo) = repo.as_ref() else {
-        return false;
-    };
-    changed
-        .strip_prefix(repo.path())
-        .is_ok_and(affects_worktree_state)
-}
-
-// The work tree whose git state the change of `changed` affects, as `affects_worktree_state`
-// decides: of a git dir the walk registered, or of the nearest git dir by its shape inside a
-// `.git` directory, which is how the git dirs of linked worktrees and submodules sit in
-// their main repository.
-fn git_state_root(picker: &SharedFilePicker, changed: &Path) -> Option<PathBuf> {
-    let name = changed.file_name()?.to_str()?;
-    if !matches!(
-        name,
-        "index" | "index.lock" | "HEAD" | "MERGE_HEAD" | "CHERRY_PICK_HEAD" | "REVERT_HEAD"
-    ) {
-        return None;
-    }
-    let affects = |git_dir: &Path| {
-        changed
-            .strip_prefix(git_dir)
-            .is_ok_and(affects_worktree_state)
-    };
-    // A git dir nested in a registered one, as a linked worktree's is, is found by shape.
-    if let Some((git_dir, work_tree)) = picker.registered_git_dir(changed)
-        && affects(&git_dir)
-    {
-        return Some(work_tree);
-    }
-    let dot_git = changed
-        .ancestors()
-        .find(|dir| dir.file_name().is_some_and(|name| name == ".git"))?;
-    let git_dir = changed
-        .ancestors()
-        .skip(1)
-        .take_while(|dir| dir.starts_with(dot_git))
-        .find(|dir| is_git_dir(dir))?;
-    if !affects(git_dir) {
-        return None;
-    }
-    let work_tree = if git_dir == dot_git {
-        git_dir.parent()?.to_path_buf()
-    } else {
-        let repo = Repository::open(git_dir).ok()?;
-        crate::path_utils::canonicalize(repo.workdir()?).ok()?
-    };
-    picker.register_git_dir(git_dir, &work_tree);
-    Some(work_tree)
-}
-
-fn affects_worktree_state(path_in_git_dir: &Path) -> bool {
-    // Only react to changes that rewrite the worktree state: commits,
-    // staging, checkouts, merges, conflict resolution. Ref-only updates
-    // under refs/ (fetch, push, tag writes, pack-refs) do not change
-    // which files are modified/untracked, so we deliberately skip them
-    // watching refs/ recursively would cost one inotify watch per ref
-    // namespace on repos with many branches/remotes.
-    if path_in_git_dir == Path::new("index") || path_in_git_dir == Path::new("index.lock") {
-        return true;
-    }
-
-    if path_in_git_dir == Path::new("HEAD") {
-        return true;
-    }
-
-    // some of the git ops are not involving nethier index nor HEAD change, or sometimes
-    // index updates can arrive too late after the change - that's why we track the log
-    // the actual user action, once user
-    if path_in_git_dir == Path::new("logs/HEAD") {
-        return true;
-    }
-
-    // At the git dir's root only: a linked worktree's admin dir below it has its own.
-    ["MERGE_HEAD", "CHERRY_PICK_HEAD", "REVERT_HEAD"]
-        .iter()
-        .any(|name| path_in_git_dir == Path::new(name))
-}
-
-// Watches the log a git dir gained, unless the tree's watch covers it, and announces its
-// repository, whose HEAD moved before the log was watched.
-fn watch_new_log(
-    watches: &Watches,
-    picker: &SharedFilePicker,
-    git_dir: &Path,
-    own_work_tree: &Option<PathBuf>,
-    covered: bool,
-) {
-    let own = own_work_tree
-        .as_ref()
-        .filter(|work_tree| {
-            Repository::open(work_tree).is_ok_and(|repo| {
-                let canonical = crate::path_utils::canonicalize;
-                canonical(repo.path()).ok() == canonical(git_dir).ok()
-            })
-        })
-        .cloned();
-    let work_tree = own.or_else(|| {
-        picker
-            .registered_git_dir(&git_dir.join("logs"))
-            .filter(|(registered, _)| registered == git_dir)
-            .map(|(_, work_tree)| work_tree)
-    });
-    let Some(work_tree) = work_tree else {
-        return;
-    };
-    let logs = PathOp::watch_non_recursive(git_dir.join("logs"));
-    let restarted = !covered
-        && (watches.streams.lock().as_mut())
-            .is_some_and(|streams| watches.update(streams, vec![logs]));
-    if restarted {
-        watches.recover_outside(picker);
-    }
-    picker.notify_repository_change(&work_tree);
+// The work trees in path order, each once.
+fn once_each(work_trees: Vec<PathBuf>) -> Vec<PathBuf> {
+    let mut work_trees: Vec<PathBuf> = (work_trees.into_iter())
+        .map(|work_tree| work_tree.components().collect())
+        .collect();
+    work_trees.sort_unstable();
+    work_trees.dedup();
+    work_trees
 }
 
 // Whether `dir` is a git dir by its shape.
@@ -1996,8 +1636,10 @@ pub(crate) fn is_git_dir(dir: &Path) -> bool {
 }
 
 // The git state of a repository lives in its git dir and its log.
+// A repository's exclude file, in its common dir's `info`, holds rules for its whole work tree.
 fn git_dir_watches(git_dir: &Path) -> impl Iterator<Item = PathOp> {
-    [git_dir.to_path_buf(), git_dir.join("logs")]
+    let info = super::common_dir_of(git_dir).join("info");
+    [git_dir.to_path_buf(), git_dir.join("logs"), info]
         .into_iter()
         .filter(|dir| dir.is_dir())
         .map(PathOp::watch_non_recursive)
@@ -2014,217 +1656,16 @@ pub(crate) fn git_dir_of(dir: &Path) -> Option<PathBuf> {
     if !metadata.is_file() {
         return None;
     }
-    let content = std::fs::read_to_string(&dot_git).ok()?;
+    let content = String::from_utf8(crate::stat::read_regular(&dot_git)?).ok()?;
     let target = content.strip_prefix("gitdir:")?.trim();
     crate::path_utils::canonicalize(dir.join(target)).ok()
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-struct FileIdentity {
-    size: u64,
-    mtime: u64,
-}
-
-// Returns destination -> source. Explicit pairs from the OS win outright; the
-// rest is inferred from files that kept their exact size and mtime. Call while
-// the removed paths are still indexed — that is the only source of their
-// metadata once they are gone from disk.
-fn detect_renames(
-    picker: &crate::file_picker::FilePicker,
-    base_path: &Path,
-    paths_to_remove: &[(&Path, bool)],
-    paths_to_add_or_modify: &[&Path],
-    explicit: &[(PathBuf, PathBuf)],
-) -> ahash::AHashMap<PathBuf, PathBuf> {
-    // Subscribers only ever see paths relative to the base, so a move that
-    // crosses the boundary stays a plain removal or creation.
-    let mut renames: ahash::AHashMap<PathBuf, PathBuf> = explicit
-        .iter()
-        .filter(|(from, to)| from != to && from.starts_with(base_path) && to.starts_with(base_path))
-        .map(|(from, to)| (to.clone(), from.clone()))
-        .collect();
-
-    if paths_to_remove.is_empty() || paths_to_add_or_modify.is_empty() {
-        return renames;
-    }
-
-    let explicit_sources: ahash::AHashSet<&Path> = renames.values().map(PathBuf::as_path).collect();
-    let removed: Vec<(PathBuf, FileIdentity)> = paths_to_remove
-        .iter()
-        .filter(|(path, _)| !explicit_sources.contains(path))
-        .filter_map(|(path, _)| {
-            let file = picker.get_file_by_path(path)?;
-            Some((
-                path.to_path_buf(),
-                FileIdentity {
-                    size: file.size,
-                    mtime: file.modified,
-                },
-            ))
-        })
-        .collect();
-
-    let added: Vec<(PathBuf, FileIdentity)> = paths_to_add_or_modify
-        .iter()
-        .filter(|path| !renames.contains_key(**path))
-        // A path already live in the index was edited, not moved into place.
-        .filter(|path| {
-            picker
-                .get_file_by_path(path)
-                .is_none_or(|file| file.is_deleted())
-        })
-        .filter_map(|path| {
-            let meta = std::fs::metadata(path).ok()?;
-            let mtime = meta
-                .modified()
-                .ok()?
-                .duration_since(std::time::UNIX_EPOCH)
-                .ok()?
-                .as_secs();
-            Some((
-                path.to_path_buf(),
-                FileIdentity {
-                    size: meta.len(),
-                    mtime,
-                },
-            ))
-        })
-        .collect();
-
-    for (from, to) in pair_renames_by_identity(&removed, &added) {
-        renames.insert(to, from);
-    }
-
-    renames
-}
-
-// Pair a removed with an added path when they are the only two files in the
-// batch sharing a (size, mtime) — a rename preserves both exactly. Uniqueness
-// on both sides is what stops bulk operations from cross-wiring histories.
-fn pair_renames_by_identity(
-    removed: &[(PathBuf, FileIdentity)],
-    added: &[(PathBuf, FileIdentity)],
-) -> Vec<(PathBuf, PathBuf)> {
-    if removed.is_empty() || added.is_empty() {
-        return Vec::new();
-    }
-
-    // `None` marks an identity claimed by more than one distinct path. The OS
-    // repeats a path within a batch (FSEvents does routinely), and a repeat is
-    // still one candidate, not a collision.
-    fn index_by_identity(
-        entries: &[(PathBuf, FileIdentity)],
-    ) -> ahash::AHashMap<FileIdentity, Option<&Path>> {
-        let mut by_identity: ahash::AHashMap<FileIdentity, Option<&Path>> =
-            ahash::AHashMap::default();
-        for (path, identity) in entries {
-            by_identity
-                .entry(*identity)
-                .and_modify(|slot| {
-                    if *slot != Some(path.as_path()) {
-                        *slot = None;
-                    }
-                })
-                .or_insert(Some(path.as_path()));
-        }
-        by_identity
-    }
-
-    let sources = index_by_identity(removed);
-    let targets = index_by_identity(added);
-
-    targets
-        .into_iter()
-        .filter_map(|(identity, target)| {
-            let target = target?;
-            let source = (*sources.get(&identity)?)?;
-            Some((source.to_path_buf(), target.to_path_buf()))
-        })
-        .collect()
-}
-
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum PathState {
-    Gone,
-    File,
-    // `walkable` when the index's walk descends into it, a symlink only when following them.
-    Dir { walkable: bool },
-}
-
-impl PathState {
-    // One lstat, and a stat of the target only for a symlink.
-    fn of(path: &Path, follow_symlinks: bool) -> Self {
-        let Ok(meta) = std::fs::symlink_metadata(path) else {
-            return Self::Gone;
-        };
-        if meta.is_dir() {
-            return Self::Dir { walkable: true };
-        }
-        if !meta.file_type().is_symlink() {
-            return Self::File;
-        }
-        match std::fs::metadata(path) {
-            Ok(target) if target.is_dir() => Self::Dir {
-                walkable: follow_symlinks,
-            },
-            Ok(_) => Self::File,
-            Err(_) => Self::Gone,
-        }
-    }
-}
-
-/// Requests the rescan that recovers changes dropped by the watcher; a throttled
-/// one stays deferred until the cooldown ends.
-pub(crate) fn request_recovery_rescan(
-    picker: &SharedFilePicker,
-    frecency: &SharedFrecency,
-    base_path: &Path,
-    reason: RescanReason,
-) {
-    match picker.trigger_recovery_rescan(frecency, reason) {
-        Ok(RescanRequest::Started) => {
-            warn!(%reason, "Triggering full rescan");
-            picker.watch_registry().dispatch_rescan(base_path);
-        }
-        Ok(RescanRequest::Deferred) => {
-            if let Ok(guard) = picker.read()
-                && let Some(watcher) = guard.as_ref().and_then(|p| p.background_watcher.as_ref())
-            {
-                watcher.wake_for_deferred_rescan();
-            }
-        }
-        Ok(RescanRequest::Dropped) => {}
-        Err(e) => error!(%reason, "Failed to trigger full rescan: {:?}", e),
-    }
-}
-
-/// Returns `true` when the rescan started; throttled requests either stay
-/// deferred or leave the incremental state as the freshest one.
-fn request_rescan(
-    picker: &SharedFilePicker,
-    frecency: &SharedFrecency,
-    base_path: &Path,
-    reason: RescanReason,
-) -> bool {
-    match picker.trigger_full_rescan_with_reason(frecency, reason) {
-        Ok(request) if request.started() => {
-            warn!(%reason, "Triggering full rescan");
-            picker.watch_registry().dispatch_rescan(base_path);
-            true
-        }
-        Ok(_) => false,
-        Err(e) => {
-            error!(%reason, "Failed to trigger full rescan: {:?}", e);
-            false
-        }
-    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::file_picker::{FilePicker, FilePickerOptions};
-    use crate::watch::{WatchEvent, WatchOptions};
+    use crate::watch::{WatchEvent, WatchEventKind, WatchOptions};
     use notify::Event;
     use notify::event::{CreateKind, DataChange, ModifyKind, RemoveKind};
     use std::sync::mpsc;
@@ -2290,36 +1731,20 @@ mod tests {
         for i in 0..MAX_OVERFLOW_FILES * 2 {
             std::fs::write(dir.join(format!("file-{i}.txt")), "content").unwrap();
         }
-        index_new_directory(
-            &dir,
-            &shared_picker,
-            &SharedFrecency::noop(),
-            &None,
-            &GitStatusWorker::new(),
-            None,
-        );
-        {
-            let guard = shared_picker.read().unwrap();
-            assert!(guard.as_ref().unwrap().get_overflow_files().len() <= MAX_OVERFLOW_FILES);
+        let created = Event::new(EventKind::Create(CreateKind::Folder)).add_path(dir.clone());
+        shared_picker.feed(None, vec![DebouncedEvent::new(created, Instant::now())]);
+        // Past the capacity none of its files is read or reported: the rescan that takes them in
+        // tells subscribers once its index is in place.
+        let mut reported = Vec::new();
+        loop {
+            let events = receiver.recv_timeout(Duration::from_secs(10)).unwrap();
+            if let Some(rescan) = events.iter().find(|e| e.kind == WatchEventKind::Rescan) {
+                assert_eq!(rescan.path, base);
+                break;
+            }
+            reported.extend(events);
         }
-        let marker = base.join("after-overflow.txt");
-        shared_picker.watch_registry().dispatch(
-            &base,
-            vec![RawWatchEvent {
-                path: marker.clone(),
-                kind: WatchEventKind::Removed,
-                is_ignored: false,
-                from: None,
-            }],
-        );
-        let events = receiver.recv_timeout(Duration::from_secs(1)).unwrap();
-        assert_eq!(events.len(), 1);
-        assert_eq!(events[0].kind, WatchEventKind::Rescan);
-        assert_eq!(events[0].path, base);
-        let next = receiver.recv_timeout(Duration::from_secs(1)).unwrap();
-        assert_eq!(next.len(), 1);
-        assert_eq!(next[0].kind, WatchEventKind::Removed);
-        assert_eq!(next[0].path, marker);
+        assert!(reported.is_empty(), "{reported:?}");
         assert!(shared_picker.wait_for_indexing_complete(Duration::from_secs(10)));
         let guard = shared_picker.read().unwrap();
         let picker = guard.as_ref().unwrap();
@@ -2397,118 +1822,15 @@ mod tests {
         assert_eq!(received[0].kind, WatchEventKind::Created);
     }
 
-    fn identity(size: u64, mtime: u64) -> FileIdentity {
-        FileIdentity { size, mtime }
-    }
-
-    fn entry(path: &str, size: u64, mtime: u64) -> (PathBuf, FileIdentity) {
-        (PathBuf::from(path), identity(size, mtime))
-    }
-
-    #[test]
-    fn unique_size_and_mtime_pairs_as_a_rename() {
-        let pairs = pair_renames_by_identity(
-            &[entry("/w/old.rs", 120, 1_700_000_000)],
-            &[entry("/w/new.rs", 120, 1_700_000_000)],
-        );
-
-        assert_eq!(
-            pairs,
-            vec![(PathBuf::from("/w/old.rs"), PathBuf::from("/w/new.rs"))]
-        );
-    }
-
-    #[test]
-    fn ambiguous_identities_are_never_paired() {
-        let two_removed = pair_renames_by_identity(
-            &[entry("/w/a.rs", 10, 5), entry("/w/b.rs", 10, 5)],
-            &[entry("/w/c.rs", 10, 5)],
-        );
-        assert!(
-            two_removed.is_empty(),
-            "two removed files sharing an identity are ambiguous: {two_removed:?}"
-        );
-
-        let two_added = pair_renames_by_identity(
-            &[entry("/w/a.rs", 10, 5)],
-            &[entry("/w/b.rs", 10, 5), entry("/w/c.rs", 10, 5)],
-        );
-        assert!(
-            two_added.is_empty(),
-            "two added files sharing an identity are ambiguous: {two_added:?}"
-        );
-    }
-
-    #[test]
-    fn a_repeated_path_is_one_candidate_not_a_collision() {
-        // FSEvents routinely reports the same path several times per batch.
-        let pairs = pair_renames_by_identity(
-            &[entry("/w/old.rs", 15, 99), entry("/w/old.rs", 15, 99)],
-            &[entry("/w/new.rs", 15, 99), entry("/w/new.rs", 15, 99)],
-        );
-
-        assert_eq!(
-            pairs,
-            vec![(PathBuf::from("/w/old.rs"), PathBuf::from("/w/new.rs"))]
-        );
-    }
-
-    #[test]
-    fn empty_files_are_paired_only_when_unambiguous() {
-        let unique = pair_renames_by_identity(&[entry("/w/a", 0, 7)], &[entry("/w/b", 0, 7)]);
-        assert_eq!(
-            unique,
-            vec![(PathBuf::from("/w/a"), PathBuf::from("/w/b"))],
-            "a lone empty file still has a usable identity"
-        );
-
-        let colliding = pair_renames_by_identity(
-            &[entry("/w/a", 0, 7), entry("/w/b", 0, 7)],
-            &[entry("/w/c", 0, 7), entry("/w/d", 0, 7)],
-        );
-        assert!(colliding.is_empty(), "{colliding:?}");
-    }
-
-    #[test]
-    fn differing_metadata_is_not_a_rename() {
-        // git checkout rewrites mtime, so branch switches must never pair.
-        let fresh_mtime = pair_renames_by_identity(
-            &[entry("/w/old.rs", 120, 1_700_000_000)],
-            &[entry("/w/new.rs", 120, 1_700_000_900)],
-        );
-        assert!(fresh_mtime.is_empty(), "{fresh_mtime:?}");
-
-        let other_size = pair_renames_by_identity(
-            &[entry("/w/old.rs", 120, 1_700_000_000)],
-            &[entry("/w/new.rs", 121, 1_700_000_000)],
-        );
-        assert!(other_size.is_empty(), "{other_size:?}");
-    }
-
-    #[test]
-    fn independent_identities_pair_side_by_side() {
-        let pairs = pair_renames_by_identity(
-            &[entry("/w/a.rs", 10, 1), entry("/w/b.rs", 20, 2)],
-            &[entry("/w/y.rs", 20, 2), entry("/w/x.rs", 10, 1)],
-        );
-
-        let mut pairs = pairs;
-        pairs.sort();
-        assert_eq!(
-            pairs,
-            vec![
-                (PathBuf::from("/w/a.rs"), PathBuf::from("/w/x.rs")),
-                (PathBuf::from("/w/b.rs"), PathBuf::from("/w/y.rs")),
-            ]
-        );
-    }
-
     #[test]
     fn dotgit_status_filter_matches_worktree_state_changes() {
         let tmp = tempfile::tempdir().unwrap();
         let repo = git2::Repository::init(tmp.path()).unwrap();
         let git_dir = repo.path().to_path_buf();
-        let repo = Some(repo);
+        let repo = Some(&repo);
+        use crate::watch::git_changes::{
+            affects_worktree_state, is_dotgit_change_affecting_status,
+        };
 
         // A linked worktree's operation in progress is its own, not the main checkout's.
         for nested in [
@@ -2521,7 +1843,7 @@ mod tests {
         let affecting = ["index", "index.lock", "HEAD", "logs/HEAD", "MERGE_HEAD"];
         for p in affecting {
             assert!(
-                is_dotgit_change_affecting_status(&git_dir.join(p), &repo),
+                is_dotgit_change_affecting_status(&git_dir.join(p), repo),
                 "{p} must trigger a git status rescan"
             );
         }
@@ -2536,7 +1858,7 @@ mod tests {
         ];
         for p in non_affecting {
             assert!(
-                !is_dotgit_change_affecting_status(&git_dir.join(p), &repo),
+                !is_dotgit_change_affecting_status(&git_dir.join(p), repo),
                 "{p} must NOT trigger a git status rescan"
             );
         }
@@ -2544,11 +1866,11 @@ mod tests {
         // Worktree paths outside .git never match.
         assert!(!is_dotgit_change_affecting_status(
             &tmp.path().join("src/main.rs"),
-            &repo
+            repo
         ));
         assert!(!is_dotgit_change_affecting_status(
             &git_dir.join("index"),
-            &None
+            None
         ));
     }
 
@@ -2561,21 +1883,24 @@ mod tests {
         git2::Repository::init(&inner).unwrap();
         std::fs::create_dir(&worktree).unwrap();
         let (shared_picker, _events) = subscribed_picker(&base);
+        // The registry is the installed watcher's.
+        (shared_picker.write().unwrap().as_mut().unwrap()).background_watcher =
+            Some(BackgroundWatcher::unstarted(&base));
         let linked = base.join("main/.git/worktrees/worktree");
         assert!(shared_picker.register_git_dir(&inner.join(".git"), &inner));
         assert!(shared_picker.register_git_dir(&linked, &worktree));
         let removed = |path: &Path| {
             let event = Event::new(EventKind::Remove(notify::event::RemoveKind::Folder))
                 .add_path(path.to_path_buf());
-            handle_debounced_events(
-                &WatcherOptions::default(),
-                vec![DebouncedEvent::new(event, Instant::now())],
-                &base,
-                &None,
+            crate::watch::apply_events(
                 &shared_picker,
-                &SharedFrecency::noop(),
-                &GitStatusWorker::new(),
+                &WatcherOptions::default(),
+                None,
+                None,
+                vec![DebouncedEvent::new(event, Instant::now())],
             );
+            // Listeners hear on the dispatch thread.
+            shared_picker.watch_registry().wait_for_dispatch();
         };
         // A repository's git dir that still exists is kept.
         removed(&inner.join(".git/index.lock"));
@@ -2614,15 +1939,15 @@ mod tests {
         let changed = |path: &Path| {
             let event =
                 Event::new(EventKind::Modify(notify::event::ModifyKind::Any)).add_path(path.into());
-            handle_debounced_events(
-                &WatcherOptions::default(),
-                vec![DebouncedEvent::new(event, Instant::now())],
-                &base,
-                &None,
+            crate::watch::apply_events(
                 &shared_picker,
-                &SharedFrecency::noop(),
-                &GitStatusWorker::new(),
+                &WatcherOptions::default(),
+                None,
+                None,
+                vec![DebouncedEvent::new(event, Instant::now())],
             );
+            // Listeners hear on the dispatch thread.
+            shared_picker.watch_registry().wait_for_dispatch();
         };
         changed(&inner);
         assert!(
@@ -2659,15 +1984,15 @@ mod tests {
         let handle = |path: PathBuf| {
             let event =
                 Event::new(EventKind::Modify(notify::event::ModifyKind::Any)).add_path(path);
-            handle_debounced_events(
-                &WatcherOptions::default(),
-                vec![DebouncedEvent::new(event, Instant::now())],
-                &base,
-                &workdir,
+            crate::watch::apply_events(
                 &shared_picker,
-                &SharedFrecency::noop(),
-                &GitStatusWorker::new(),
+                &WatcherOptions::default(),
+                workdir.as_deref(),
+                None,
+                vec![DebouncedEvent::new(event, Instant::now())],
             );
+            // Listeners hear on the dispatch thread.
+            shared_picker.watch_registry().wait_for_dispatch();
         };
         handle(base.join("file.txt"));
         handle(repo.path().join("refs/heads/main"));
@@ -2727,15 +2052,15 @@ mod tests {
         let handle = |options: &WatcherOptions, path: PathBuf| {
             let event =
                 Event::new(EventKind::Modify(notify::event::ModifyKind::Any)).add_path(path);
-            handle_debounced_events(
-                options,
-                vec![DebouncedEvent::new(event, Instant::now())],
-                &base,
-                &None,
+            crate::watch::apply_events(
                 &shared_picker,
-                &SharedFrecency::noop(),
-                &GitStatusWorker::new(),
+                options,
+                None,
+                None,
+                vec![DebouncedEvent::new(event, Instant::now())],
             );
+            // Listeners hear on the dispatch thread.
+            shared_picker.watch_registry().wait_for_dispatch();
         };
         let without_git = WatcherOptions {
             ignore_options: FilePickerIgnoreOptions {
@@ -2873,6 +2198,24 @@ mod tests {
         );
     }
 
+    // A covered repository's first log in one batch with `logs/HEAD`: the batch announces it,
+    // and the log's task does not again.
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
+    #[test]
+    fn a_first_log_with_its_head_in_one_batch_is_announced_once() {
+        assert_eq!(first_log_announcements(&["logs", "logs/HEAD"]), 1);
+    }
+
+    // A first log of remote-tracking refs alone is announced by the log's task, as before.
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
+    #[test]
+    fn a_first_remote_tracking_log_alone_is_announced_by_its_task() {
+        assert_eq!(
+            first_log_announcements(&["logs", "logs/refs/remotes/origin/main"]),
+            1
+        );
+    }
+
     #[test]
     fn an_outside_common_dir_watched_for_refs_is_no_git_state() {
         let tmp = tempfile::tempdir().unwrap();
@@ -2932,6 +2275,70 @@ mod tests {
         assert!(!shared_picker.register_git_dir(&base.join(".git"), &base));
     }
 
+    // A linked worktree's git dir registered by a change of its HEAD, before the worktree's `.git`
+    // reaches the watcher, is followed at once: its ref listener hears its next ref change.
+    #[test]
+    fn a_git_dir_registered_by_a_change_of_its_state_is_followed_for_refs() {
+        let tmp = tempfile::tempdir().unwrap();
+        let base = crate::path_utils::canonicalize(tmp.path()).unwrap();
+        let main = base.join("main");
+        std::fs::create_dir(&main).unwrap();
+        let repo = git2::Repository::init(&main).unwrap();
+        std::fs::write(main.join("file.txt"), "a").unwrap();
+        commit(&repo);
+        let head = repo.head().unwrap().peel_to_commit().unwrap();
+        repo.branch("wt", &head, false).unwrap();
+        let sub = base.join("sub");
+        std::fs::create_dir(&sub).unwrap();
+        std::fs::write(sub.join("s.txt"), "s").unwrap();
+        let (shared_picker, workdir) = polled_picker(&base);
+        let (sender, heard) = mpsc::channel::<PathBuf>();
+        let _refs = shared_picker
+            .subscribe_ref_changes(&sub, move |root| sender.send(root.to_path_buf()).unwrap());
+        let handle = |path: PathBuf| modified(&shared_picker, &base, &workdir, path);
+        let watches = shared_picker.installed_watches().unwrap();
+        let idle = || {
+            let deadline = Instant::now() + Duration::from_secs(30);
+            while watches.busy() {
+                assert!(Instant::now() < deadline, "the watcher's thread stays busy");
+                std::thread::sleep(Duration::from_millis(20));
+            }
+        };
+
+        // What `git worktree add` writes before the worktree's `.git`.
+        let main_git_dir = crate::path_utils::canonicalize(repo.path()).unwrap();
+        let admin = main_git_dir.join("worktrees/wt");
+        let worktree = sub.join("wt");
+        std::fs::create_dir_all(&admin).unwrap();
+        std::fs::create_dir(&worktree).unwrap();
+        std::fs::write(admin.join("commondir"), "../..\n").unwrap();
+        let gitdir = format!("{}\n", worktree.join(".git").display());
+        std::fs::write(admin.join("gitdir"), gitdir).unwrap();
+        std::fs::write(admin.join("HEAD"), "ref: refs/heads/wt\n").unwrap();
+        handle(admin.join("HEAD"));
+        let registered = shared_picker.registered_git_dirs();
+        assert!(
+            registered.iter().any(|known| known.git_dir == admin),
+            "the worktree's git dir is not registered"
+        );
+        std::fs::write(
+            worktree.join(".git"),
+            format!("gitdir: {}\n", admin.display()),
+        )
+        .unwrap();
+        handle(worktree.join(".git"));
+        idle();
+        drain(&heard);
+
+        let signature = git2::Signature::now("fff", "fff@example.invalid").unwrap();
+        let tree = head.tree().unwrap();
+        let next = (repo.commit(None, &signature, &signature, "next", &tree, &[&head])).unwrap();
+        std::fs::write(main_git_dir.join("refs/heads/wt"), format!("{next}\n")).unwrap();
+        handle(main_git_dir.join("refs/heads/wt"));
+        let told = drain(&heard);
+        assert!(told.contains(&worktree), "{told:?}");
+    }
+
     #[cfg(target_os = "macos")]
     #[test]
     fn fsevents_changes_the_tree_s_stream_only_at_its_setup() {
@@ -2949,40 +2356,9 @@ mod tests {
         repos[1]
             .worktree("nested", &linked.join("nested"), None)
             .unwrap();
-        NATIVE_ROOTS.lock().push(linked.clone());
-        let shared_picker = SharedFilePicker::default();
-        FilePicker::new_with_shared_state(
-            shared_picker.clone(),
-            SharedFrecency::noop(),
-            FilePickerOptions {
-                base_path: linked.to_string_lossy().into_owned(),
-                enable_content_indexing: false,
-                watch: true,
-                ..Default::default()
-            },
-        )
-        .unwrap();
-        assert!(shared_picker.wait_for_scan(Duration::from_secs(30)));
-        assert!(shared_picker.wait_for_watcher(Duration::from_secs(30)));
-        let watches = (shared_picker.read().unwrap().as_ref())
-            .and_then(|picker| {
-                picker
-                    .background_watcher
-                    .as_ref()
-                    .map(BackgroundWatcher::watches)
-            })
-            .unwrap();
-        let paths = |outside: bool| {
-            let guard = watches.streams.lock();
-            let streams = guard.as_ref().unwrap();
-            let stream = match outside {
-                true => streams.outside.as_ref().unwrap(),
-                false => &streams.tree,
-            };
-            let mut paths: Vec<_> = stream.watched_paths().unwrap();
-            paths.sort();
-            paths
-        };
+        let (shared_picker, watcher) = native_picker(&linked, 3);
+        let watches = watcher.watches;
+        let paths = |outside: bool| watches.watched_paths(outside);
 
         // The walk met the nested worktree's git dir, outside the tree, after the setup.
         assert_eq!(paths(false), [(linked.clone(), RecursiveMode::Recursive)]);
@@ -2996,7 +2372,7 @@ mod tests {
     }
 
     // The outside stream restarts after the walk for a repository met then; what it may have
-    // missed meanwhile is recovered before that returns.
+    // missed meanwhile is recovered on the watcher's thread.
     #[cfg(target_os = "macos")]
     #[test]
     fn a_restarted_outside_stream_recovers_what_it_may_have_missed() {
@@ -3021,7 +2397,7 @@ mod tests {
         std::fs::create_dir(linked.join("lone")).unwrap();
         let gitlink = format!("gitdir: {}\n", lone.display());
         std::fs::write(linked.join("lone/.git"), gitlink).unwrap();
-        let (shared_picker, watcher) = native_picker(&linked);
+        let (shared_picker, watcher) = native_picker(&linked, 3);
         let (state_sender, state) = mpsc::channel::<PathBuf>();
         let _state = shared_picker
             .subscribe_repository_state(move |root| state_sender.send(root.to_path_buf()).unwrap());
@@ -3043,35 +2419,397 @@ mod tests {
             .unwrap();
         (watcher.dir_hook().unwrap())(&linked.join("fresh"));
 
-        let announced = drain(&state);
-        for work_tree in [&linked, &linked.join("nested")] {
+        // The watcher's thread may restart the stream for the new worktree first: the same is
+        // recovered. The window counts from the end of its restarts, run one task at a time.
+        let outside_watched = || watcher.watches.watched_paths(true);
+        let work_trees = [linked.clone(), linked.join("nested")];
+        let (mut announced, mut told) = (Vec::new(), Vec::new());
+        let window = Duration::from_secs(10);
+        let mut deadline = Instant::now() + window;
+        // However long the restarts take, the wait ends, and what was seen by then is asserted.
+        let limit = Instant::now() + Duration::from_secs(120);
+        loop {
+            if watcher.watches.busy() {
+                deadline = Instant::now() + window;
+            }
+            announced.extend(drain(&state));
+            told.extend(drain(&heard));
+            let mut recovered = work_trees
+                .iter()
+                .all(|work_tree| announced.contains(work_tree))
+                && told.contains(&linked)
+                && told.contains(&linked.join("lone"))
+                && git_status.full_rescans_requested() > status_rescans
+                && watcher.watches.refs.watched().contains(&lone.join("refs"));
+            if recovered {
+                // The query waits behind the tasks queued before it, restarts included.
+                let asked = Instant::now();
+                recovered = (outside_watched().iter()).any(|(path, _)| *path == lone.join("logs"));
+                deadline += asked.elapsed();
+            }
+            if recovered || Instant::now() >= deadline.min(limit) {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        for work_tree in &work_trees {
             assert!(
                 announced.contains(work_tree),
                 "{work_tree:?} in {announced:?}"
             );
         }
-        let heard = drain(&heard);
-        assert!(heard.contains(&linked), "{heard:?}");
+        assert!(told.contains(&linked), "{told:?}");
         assert!(
-            heard.contains(&linked.join("lone")),
-            "its refs appeared: {heard:?}"
+            told.contains(&linked.join("lone")),
+            "its refs appeared: {told:?}"
         );
         assert!(git_status.full_rescans_requested() > status_rescans);
         assert!(watcher.watches.refs.watched().contains(&lone.join("refs")));
-        let guard = watcher.watches.streams.lock();
-        let outside = guard.as_ref().unwrap().outside.as_ref().unwrap();
-        let watched = outside.watched_paths().unwrap();
+        let watched = outside_watched();
         assert!(
             watched.iter().any(|(path, _)| *path == lone.join("logs")),
             "{watched:?}"
         );
     }
 
+    // A ref store that appears outside the tree is watched by a task that restarts the outside
+    // stream: ref listeners hear once of each work tree its recovery and its own plan found.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_task_that_restarts_the_outside_stream_tells_each_work_tree_once() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = crate::path_utils::canonicalize(tmp.path()).unwrap();
+        let main = root.join("main");
+        let repo = git2::Repository::init(&main).unwrap();
+        std::fs::write(main.join("file.txt"), "a").unwrap();
+        commit(&repo);
+        let linked = root.join("linked");
+        repo.worktree("linked", &linked, None).unwrap();
+        // A repository whose git dir, outside the index, has no refs yet.
+        let lone = root.join("lone.git");
+        std::fs::create_dir_all(lone.join("objects")).unwrap();
+        std::fs::write(lone.join("HEAD"), "ref: refs/heads/main\n").unwrap();
+        std::fs::create_dir(linked.join("lone")).unwrap();
+        let gitlink = format!("gitdir: {}\n", lone.display());
+        std::fs::write(linked.join("lone/.git"), gitlink).unwrap();
+        let (shared_picker, watcher) = native_picker(&linked, 3);
+        let _refs = shared_picker.subscribe_ref_changes(&linked, |_| {});
+        let idle = || {
+            let deadline = Instant::now() + Duration::from_secs(60);
+            while watcher.watches.busy() && Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(20));
+            }
+        };
+        idle();
+        let since = TASKS.load(Ordering::SeqCst);
+
+        // The store appears whole, as one event, reported as the stream would deliver it.
+        let staged = root.join("staged-refs");
+        std::fs::create_dir_all(staged.join("heads")).unwrap();
+        std::fs::rename(&staged, lone.join("refs")).unwrap();
+        let reported = Instant::now();
+        let refs = vec![lone.join("refs")];
+        let answer = shared_picker.apply_reported_changes(&SharedFrecency::noop(), refs);
+        assert_eq!(answer, crate::ReportedChanges::Applied);
+        let watched = within_product_time(&linked, reported, Duration::from_secs(10), 1, || {
+            watcher.watches.refs.watched().contains(&lone.join("refs"))
+        });
+        assert!(watched, "the new ref store is not watched within 10 s");
+        idle();
+        let told: Vec<_> = (REFS_TOLD.lock().iter())
+            .filter(|(task, work_tree)| *task > since && work_tree.starts_with(&linked))
+            .cloned()
+            .collect();
+        for work_tree in [linked.clone(), linked.join("lone")] {
+            let mut tasks: Vec<_> = (told.iter())
+                .filter(|(_, known)| *known == work_tree)
+                .map(|(task, _)| *task)
+                .collect();
+            let times = tasks.len();
+            tasks.dedup();
+            assert!(times > 0, "{work_tree:?} was not told: {told:?}");
+            assert_eq!(
+                tasks.len(),
+                times,
+                "{work_tree:?} twice in a task: {told:?}"
+            );
+        }
+    }
+
+    // A directory appears unseen, holding a repository and files, and only one of its files is
+    // reported: the directory is walked whole, so its files are indexed and its repository heard.
+    #[test]
+    fn a_file_below_a_directory_that_appeared_unseen_brings_in_the_whole_directory() {
+        let tmp = tempfile::tempdir().unwrap();
+        let base = crate::path_utils::canonicalize(tmp.path()).unwrap();
+        std::fs::write(base.join("a.txt"), "a").unwrap();
+        let (shared_picker, _) = polled_picker(&base);
+        let watches = (shared_picker.read().unwrap().as_ref())
+            .and_then(|picker| picker.background_watcher.as_ref().map(|w| w.watches()))
+            .unwrap();
+        let (sender, heard) = mpsc::channel::<PathBuf>();
+        let _state = shared_picker
+            .subscribe_repository_state(move |root| sender.send(root.to_path_buf()).unwrap());
+        let unseen = base.join("unseen");
+        UNDELIVERED.lock().push(unseen.clone());
+        git2::Repository::init(unseen.join("repo")).unwrap();
+        for file in ["repo/a.rs", "repo/b.rs", "c.rs"] {
+            std::fs::write(unseen.join(file), "fn f() {}").unwrap();
+        }
+        let reported = vec![unseen.join("repo/a.rs")];
+        let answer = shared_picker.apply_reported_changes(&SharedFrecency::noop(), reported);
+        assert_eq!(answer, crate::ReportedChanges::Applied);
+        let idle = within(Instant::now(), Duration::from_secs(30), || !watches.busy());
+        assert!(idle, "the watcher's thread is still busy");
+        shared_picker.watch_registry().wait_for_dispatch();
+        let files: Vec<String> = {
+            let guard = shared_picker.read().unwrap();
+            let picker = guard.as_ref().unwrap();
+            let live = (picker.get_files().iter()).filter(|file| !file.is_deleted());
+            live.map(|file| file.relative_path(picker)).collect()
+        };
+        for file in ["unseen/repo/a.rs", "unseen/repo/b.rs", "unseen/c.rs"] {
+            assert!(
+                files.iter().any(|known| known == file),
+                "{file} not in {files:?}"
+            );
+        }
+        assert_eq!(drain(&heard), [unseen.join("repo")]);
+    }
+
+    // Ignored files below directories the index never saw change nothing: none is walked, as
+    // none would be again and again while those files are written.
+    #[test]
+    fn an_ignored_file_below_a_directory_never_seen_walks_nothing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let base = crate::path_utils::canonicalize(tmp.path()).unwrap();
+        git2::Repository::init(&base).unwrap();
+        std::fs::write(base.join(".gitignore"), "*.log\nbuild/\n").unwrap();
+        let (shared_picker, _) = polled_picker(&base);
+        let unseen = base.join("unseen");
+        UNDELIVERED.lock().push(unseen.clone());
+        std::fs::create_dir_all(unseen.join("logs")).unwrap();
+        std::fs::create_dir_all(unseen.join("build/sub")).unwrap();
+        std::fs::write(unseen.join("logs/a.log"), "a").unwrap();
+        std::fs::write(unseen.join("build/sub/b.rs"), "fn f() {}").unwrap();
+        let reported = vec![unseen.join("logs/a.log"), unseen.join("build/sub/b.rs")];
+        let answer = shared_picker.apply_reported_changes(&SharedFrecency::noop(), reported);
+        assert_eq!(answer, crate::ReportedChanges::Applied);
+        assert_eq!(super::super::reconcile::walks_at_or_below(&unseen), 0);
+        let guard = shared_picker.read().unwrap();
+        let picker = guard.as_ref().unwrap();
+        let below =
+            |file: &crate::types::FileItem| file.relative_path(picker).starts_with("unseen/");
+        assert!(!picker.get_files().iter().any(below));
+    }
+
+    // A directory walked for a file below it is known from then on: that file reported again,
+    // or a new one in it, walks nothing more.
+    #[test]
+    fn a_directory_walked_for_a_file_never_seen_is_walked_once() {
+        let tmp = tempfile::tempdir().unwrap();
+        let base = crate::path_utils::canonicalize(tmp.path()).unwrap();
+        std::fs::write(base.join("a.txt"), "a").unwrap();
+        let (shared_picker, _) = polled_picker(&base);
+        let unseen = base.join("unseen");
+        UNDELIVERED.lock().push(unseen.clone());
+        std::fs::create_dir_all(unseen.join("sub")).unwrap();
+        std::fs::write(unseen.join("sub/a.rs"), "fn f() {}").unwrap();
+        let frecency = SharedFrecency::noop();
+        let walks = || super::super::reconcile::walks_at_or_below(&unseen);
+        let answer = shared_picker.apply_reported_changes(&frecency, vec![unseen.join("sub/a.rs")]);
+        assert_eq!(answer, crate::ReportedChanges::Applied);
+        assert_eq!(walks(), 1);
+        shared_picker.apply_reported_changes(&frecency, vec![unseen.join("sub/a.rs")]);
+        assert_eq!(walks(), 1);
+        // The walk's root holds no file of its own, so only the walk made it known.
+        std::fs::write(unseen.join("b.rs"), "fn g() {}").unwrap();
+        shared_picker.apply_reported_changes(&frecency, vec![unseen.join("b.rs")]);
+        assert_eq!(walks(), 1);
+        let guard = shared_picker.read().unwrap();
+        let picker = guard.as_ref().unwrap();
+        let files: Vec<String> = (picker.get_files().iter())
+            .filter(|file| !file.is_deleted())
+            .map(|file| file.relative_path(picker))
+            .collect();
+        for file in ["unseen/sub/a.rs", "unseen/b.rs"] {
+            assert!(
+                files.iter().any(|known| known == file),
+                "{file} not in {files:?}"
+            );
+        }
+    }
+
+    // Not a test of its own: the stream of `Control`, which a test runs in a child process.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn fsevents_control() {
+        let root = std::env::var_os(CONTROL_ROOT);
+        if let (Some(root), Some(seen)) = (root, std::env::var_os(CONTROL_SEEN)) {
+            run_control(Path::new(&root), Path::new(&seen));
+        }
+    }
+
+    // A linked worktree of a repository outside the tree is added inside it: repository and ref
+    // listeners hear of it, each work tree once in a task of the watcher's thread.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_task_that_follows_a_new_linked_worktree_tells_each_work_tree_once() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = crate::path_utils::canonicalize(tmp.path()).unwrap();
+        let (tree, outside) = (root.join("tree"), root.join("outside"));
+        for (dir, file) in [(&tree, "a.txt"), (&outside, "m.txt")] {
+            let repo = git2::Repository::init(dir).unwrap();
+            std::fs::write(dir.join(file), "a").unwrap();
+            commit(&repo);
+        }
+        let (shared_picker, watcher) = native_picker(&tree, 2);
+        let _repositories = shared_picker.subscribe_repository_state(|_| {});
+        let _refs = shared_picker.subscribe_ref_changes(&tree, |_| {});
+        let idle = || {
+            let deadline = Instant::now() + Duration::from_secs(60);
+            while watcher.watches.busy() && Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(20));
+            }
+        };
+        idle();
+        let since = TASKS.load(Ordering::SeqCst);
+        let told = |told: &Mutex<Vec<(usize, PathBuf)>>| -> Vec<(usize, PathBuf)> {
+            (told.lock().iter())
+                .filter(|(task, work_tree)| *task > since && work_tree.starts_with(&tree))
+                .cloned()
+                .collect()
+        };
+
+        let control = until_delivering(&tree);
+        let outside = git2::Repository::open(&outside).unwrap();
+        // A worktree FSEvents lost for every client leaves the result open: a fresh one is added.
+        retried_while_lost(|attempt| {
+            let name = match attempt {
+                1 => "wt".to_string(),
+                _ => format!("wt-{attempt}"),
+            };
+            let worktree = tree.join(&name);
+            outside.worktree(&name, &worktree, None).unwrap();
+            // Any path in the worktree, written after its `.git`, has the watcher follow it through
+            // a restart: FSEvents may report the files without the `.git` itself.
+            let inside = |path: &Path| path.starts_with(&worktree) && path != worktree;
+            let delivery = delivered(&tree, &format!("the worktree {name}"), inside, &control);
+            if let Ok(at) = delivery {
+                // One update of the outside stream watches its git dir, logs, info and refs.
+                let heard = within_product_time(&tree, at, Duration::from_secs(10), 1, || {
+                    (told(&REPOSITORIES_TOLD).iter()).any(|(_, known)| *known == worktree)
+                });
+                let starts = stream_starts_since(&tree, at);
+                assert!(
+                    starts <= 1,
+                    "the product restarted the streams {starts} times to follow {name}, not once"
+                );
+                assert!(
+                    heard,
+                    "{name} not told within 10 s of the delivery: {:?}",
+                    told(&REPOSITORIES_TOLD)
+                );
+            }
+            std::thread::sleep(Duration::from_millis(500));
+            idle();
+            for told in [told(&REPOSITORIES_TOLD), told(&REFS_TOLD)] {
+                let mut once = told.clone();
+                once.sort();
+                once.dedup();
+                assert_eq!(once.len(), told.len(), "twice in a task: {told:?}");
+            }
+            delivery
+        });
+    }
+
+    // A repository with its git dir outside appears in a ready index: its watches change on the
+    // watcher's thread, so a slow stream restart holds up no change the loop applies meanwhile.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_slow_stream_restart_holds_up_no_reported_change() {
+        use crate::scan::tests::on_a_thread;
+        let tmp = tempfile::tempdir().unwrap();
+        let root = crate::path_utils::canonicalize(tmp.path()).unwrap();
+        let (main, tree) = (root.join("main"), root.join("tree"));
+        std::fs::create_dir_all(&main).unwrap();
+        let repo = git2::Repository::init(&main).unwrap();
+        std::fs::write(main.join("file.txt"), "a").unwrap();
+        commit(&repo);
+        std::fs::create_dir_all(&tree).unwrap();
+        std::fs::write(tree.join("a.rs"), "fn a() {}").unwrap();
+        let (shared_picker, _watcher) = native_picker(&tree, 1);
+        slow_stream_starts_for(&tree, Duration::from_secs(4));
+        repo.worktree("wt", &tree.join("wt"), None).unwrap();
+        let (reporter, reported) = (shared_picker.clone(), tree.join("wt"));
+        let worktree = on_a_thread(move || {
+            reporter.apply_reported_changes(&SharedFrecency::noop(), vec![reported])
+        });
+        std::thread::sleep(Duration::from_millis(300));
+        std::fs::write(tree.join("b.rs"), "fn b() {}").unwrap();
+        let (started, reporter) = (Instant::now(), shared_picker.clone());
+        let reported = vec![tree.join("b.rs")];
+        let answered =
+            on_a_thread(move || reporter.apply_reported_changes(&SharedFrecency::noop(), reported));
+        let (answered, waited) = (
+            answered.recv_timeout(Duration::from_secs(30)),
+            started.elapsed(),
+        );
+        assert!(
+            answered.is_ok() && waited < Duration::from_millis(1500),
+            "a reported change waited {waited:?}"
+        );
+        let worktree = worktree.recv_timeout(Duration::from_secs(30));
+        assert!(worktree.is_ok(), "the worktree's report: {worktree:?}");
+    }
+
+    // A stopped watcher's owner thread drops what is still queued for it: no repository is
+    // watched or announced, and no stream changes, for an index that is gone.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_stopped_watcher_drops_its_queued_tasks() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = crate::path_utils::canonicalize(tmp.path()).unwrap();
+        let (main, tree) = (root.join("main"), root.join("tree"));
+        std::fs::create_dir_all(&main).unwrap();
+        let repo = git2::Repository::init(&main).unwrap();
+        std::fs::write(main.join("file.txt"), "a").unwrap();
+        commit(&repo);
+        std::fs::create_dir_all(&tree).unwrap();
+        std::fs::write(tree.join("a.rs"), "fn a() {}").unwrap();
+        let (shared_picker, watcher) = native_picker(&tree, 1);
+        slow_stream_starts_for(&tree, Duration::from_secs(1));
+        let worktrees: Vec<PathBuf> = (0..4).map(|i| tree.join(format!("wt{i}"))).collect();
+        for (i, path) in worktrees.iter().enumerate() {
+            repo.worktree(&format!("wt{i}"), path, None).unwrap();
+        }
+        let _ = shared_picker.apply_reported_changes(&SharedFrecency::noop(), worktrees);
+        std::thread::sleep(Duration::from_millis(300));
+        shared_picker.remove_index();
+        let at_removal = tasks_handled(&tree);
+        std::thread::sleep(Duration::from_secs(6));
+        // The task running at the removal ends; none queued after it starts.
+        assert!(
+            tasks_handled(&tree) <= at_removal + 1,
+            "{} tasks started after the removal",
+            tasks_handled(&tree) - at_removal
+        );
+        // Once the task in flight ends, the test seam counts the dropped tasks as handled.
+        let deadline = Instant::now() + Duration::from_secs(60);
+        while watcher.watches.busy() {
+            assert!(
+                Instant::now() < deadline,
+                "dropped tasks still count as queued"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
     #[test]
     fn a_watch_update_goes_on_past_a_failed_path() {
         let tmp = tempfile::tempdir().unwrap();
         let config = Config::default().with_poll_interval(Duration::from_secs(60));
-        let debouncer = new_debouncer_opt::<_, notify::PollWatcher, _>(
+        let debouncer = new_debouncer_opt::<_, Tapped<notify::PollWatcher>, _>(
             Duration::from_secs(60),
             None,
             |_: DebounceEventResult| {},
@@ -3098,7 +2836,7 @@ mod tests {
     #[test]
     fn fsevents_restarts_its_stream_for_each_update_but_not_for_a_path_it_watches() {
         let tmp = tempfile::tempdir().unwrap();
-        let debouncer = new_debouncer_opt::<_, notify::RecommendedWatcher, _>(
+        let debouncer = new_debouncer_opt::<_, Tapped<notify::RecommendedWatcher>, _>(
             Duration::from_secs(60),
             None,
             |_: DebounceEventResult| {},
@@ -3168,11 +2906,14 @@ mod tests {
         (shared_picker, workdir)
     }
 
-    // An index of `base` with the native watcher, and its watcher's shared state.
+    // An index of `base` with the native watcher, and its watcher's shared state. Its first stream
+    // is started within 10 s and the index is ready within 30 s, besides the daemon's time.
     #[cfg(target_os = "macos")]
-    fn native_picker(base: &Path) -> (SharedFilePicker, WatcherHandle) {
+    // `starts`: those its setup needs, of the tree's stream and the git state inside and out.
+    fn native_picker(base: &Path, starts: usize) -> (SharedFilePicker, WatcherHandle) {
         NATIVE_ROOTS.lock().push(base.to_path_buf());
         let shared_picker = SharedFilePicker::default();
+        let created = Instant::now();
         FilePicker::new_with_shared_state(
             shared_picker.clone(),
             SharedFrecency::noop(),
@@ -3184,8 +2925,13 @@ mod tests {
             },
         )
         .unwrap();
-        assert!(shared_picker.wait_for_scan(Duration::from_secs(30)));
-        assert!(shared_picker.wait_for_watcher(Duration::from_secs(30)));
+        let requested = within(created, Duration::from_secs(10), || stream_starts(base) > 0);
+        assert!(requested, "no stream was started within 10 s");
+        let ready = within_product_time(base, created, Duration::from_secs(30), starts, || {
+            shared_picker.wait_for_scan(Duration::ZERO)
+                && shared_picker.wait_for_watcher(Duration::ZERO)
+        });
+        assert!(ready, "the scan and the watcher are not ready");
         let handle = (shared_picker.read().unwrap().as_ref())
             .and_then(|picker| picker.background_watcher.as_ref())
             .map(|watcher| WatcherHandle {
@@ -3211,15 +2957,16 @@ mod tests {
 
     fn modified(picker: &SharedFilePicker, base: &Path, workdir: &Option<PathBuf>, path: PathBuf) {
         let event = Event::new(EventKind::Modify(ModifyKind::Any)).add_path(path);
-        handle_debounced_events(
-            &WatcherOptions::default(),
-            vec![DebouncedEvent::new(event, Instant::now())],
-            base,
-            workdir,
+        let _ = base;
+        crate::watch::apply_events(
             picker,
-            &SharedFrecency::noop(),
-            &GitStatusWorker::new(),
+            &WatcherOptions::default(),
+            workdir.as_deref(),
+            None,
+            vec![DebouncedEvent::new(event, Instant::now())],
         );
+        // Listeners hear on the dispatch thread.
+        picker.watch_registry().wait_for_dispatch();
     }
 
     // What a listener heard so far, in path order.
@@ -3246,14 +2993,60 @@ mod tests {
             .into_iter()
             .map(|kind| DebouncedEvent::new(Event::new(kind).add_path(path.to_path_buf()), now))
             .collect();
-        handle_debounced_events(
-            &WatcherOptions::default(),
-            events,
-            base,
-            &None,
+        let _ = base;
+        crate::watch::apply_events(
             shared_picker,
-            &SharedFrecency::noop(),
-            &GitStatusWorker::new(),
+            &WatcherOptions::default(),
+            None,
+            None,
+            events,
         );
+    }
+
+    // How often repository listeners hear of an index's own repository from one batch that
+    // reports its git dir's `logs` as new, with `created` below the git dir.
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
+    fn first_log_announcements(created: &[&str]) -> usize {
+        let tmp = tempfile::tempdir().unwrap();
+        let base = crate::path_utils::canonicalize(tmp.path()).unwrap();
+        let repo = git2::Repository::init(&base).unwrap();
+        std::fs::write(base.join("a.txt"), "a").unwrap();
+        commit(&repo);
+        let remote_log = base.join(".git/logs/refs/remotes/origin/main");
+        std::fs::create_dir_all(remote_log.parent().unwrap()).unwrap();
+        std::fs::write(&remote_log, "").unwrap();
+        let (shared_picker, workdir) = polled_picker(&base);
+        let watches = (shared_picker.read().unwrap().as_ref())
+            .and_then(|picker| picker.background_watcher.as_ref().map(|w| w.watches()))
+            .unwrap();
+        let (sender, heard) = mpsc::channel::<PathBuf>();
+        let _state = shared_picker
+            .subscribe_repository_state(move |root| sender.send(root.to_path_buf()).unwrap());
+        let now = Instant::now();
+        let events = (created.iter())
+            .map(|path| {
+                let event = Event::new(EventKind::Create(CreateKind::Any));
+                DebouncedEvent::new(event.add_path(base.join(".git").join(path)), now)
+            })
+            .collect();
+        let options = WatcherOptions::default();
+        crate::watch::apply_events(&shared_picker, &options, workdir.as_deref(), None, events);
+        let idle = within(Instant::now(), Duration::from_secs(30), || !watches.busy());
+        assert!(idle, "the watcher's thread is still busy");
+        shared_picker.watch_registry().wait_for_dispatch();
+        let heard = drain(&heard);
+        assert!(heard.iter().all(|root| *root == base), "{heard:?}");
+        heard.len()
+    }
+
+    // Whether `done` holds within `limit` of `from`.
+    fn within(from: Instant, limit: Duration, mut done: impl FnMut() -> bool) -> bool {
+        while !done() {
+            if from.elapsed() >= limit {
+                return done();
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        true
     }
 }

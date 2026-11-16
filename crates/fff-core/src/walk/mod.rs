@@ -7,18 +7,84 @@
 
 use crate::file_picker::FilePickerIgnoreOptions;
 use crate::types::FileItem;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+mod rules;
+use rules::IgnoreSources;
+pub(crate) use rules::{IgnoreRules, IgnoreSource};
 
 #[cfg(feature = "zlob")]
 mod zlob;
 #[cfg(feature = "zlob")]
-pub(crate) use zlob::walk_collect_files;
+use zlob::walk_files;
 
 #[cfg(all(not(feature = "zlob"), feature = "ripgrep"))]
 mod ripgrep;
 #[cfg(all(not(feature = "zlob"), feature = "ripgrep"))]
-pub(crate) use ripgrep::walk_collect_files;
+use ripgrep::walk_files;
+
+// Each directory's ignore files are hashed as the walker reaches it, before it reads them and on
+// its own threads: no second pass, no shared pool thread. Fails once `hooks.cancelled` is set.
+pub(crate) fn walk_collect_files(
+    base_path: &Path,
+    subtree: Option<&Path>,
+    is_git_repo: bool,
+    policy: WalkPolicy<'_>,
+    threads: usize,
+    synced_files_count: &Arc<AtomicUsize>,
+    hooks: WalkHooks<'_>,
+) -> crate::Result<WalkOutput> {
+    let sources = Arc::new(IgnoreSources::new(policy.ignore));
+    let walk_root = subtree.unwrap_or(base_path);
+    sources.read_in(walk_root);
+    if is_git_repo
+        && !policy.ignore.disable_git
+        && let Some(exclude) = exclude_file_of(base_path, walk_root)
+    {
+        sources.read_file(exclude);
+    }
+    let on_dir: DirHook = {
+        let (sources, on_dir) = (Arc::clone(&sources), hooks.on_dir.cloned());
+        Arc::new(move |dir: &Path| {
+            if let Some(on_dir) = &on_dir {
+                on_dir(dir);
+            }
+            sources.read_in(dir);
+        })
+    };
+    let walk_hooks = WalkHooks::new(Some(&on_dir), hooks.cancelled);
+    let walked = walk_files(
+        base_path,
+        subtree,
+        is_git_repo,
+        policy,
+        threads,
+        synced_files_count,
+        walk_hooks,
+    );
+    if hooks.cancelled() {
+        return Err(crate::Error::WalkFailed("the walk was cancelled".into()));
+    }
+    let mut output = walked?;
+    output.ignore_sources = sources.finish();
+    Ok(output)
+}
+
+// The exclude file of the repository whose whole work tree within the index the walk covers:
+// the index's own for a walk of the root, a nested one's for a walk of its work tree.
+fn exclude_file_of(base_path: &Path, walk_root: &Path) -> Option<PathBuf> {
+    let common_dir = if walk_root == base_path {
+        git2::Repository::discover(base_path)
+            .ok()?
+            .commondir()
+            .to_path_buf()
+    } else {
+        crate::watch::common_dir_of(&crate::watch::git_dir_of(walk_root)?)
+    };
+    Some(common_dir.join("info").join("exclude"))
+}
 
 /// A walk limited to `subtree` still traverses from `base_path`, so the root's
 /// ignore and exclusion policy applies unchanged. Returns the subtree's path
@@ -44,11 +110,30 @@ pub(crate) struct WalkPolicy<'a> {
 /// walker opens it or reads its entries and ignore files.
 pub(crate) type DirHook = Arc<dyn Fn(&Path) + Send + Sync>;
 
+// What a walk reports while it runs, and what stops it.
+#[derive(Clone, Copy, Default)]
+pub(crate) struct WalkHooks<'a> {
+    on_dir: Option<&'a DirHook>,
+    cancelled: Option<&'a Arc<AtomicBool>>,
+}
+
+impl<'a> WalkHooks<'a> {
+    pub(crate) fn new(on_dir: Option<&'a DirHook>, cancelled: Option<&'a Arc<AtomicBool>>) -> Self {
+        Self { on_dir, cancelled }
+    }
+
+    pub(crate) fn cancelled(&self) -> bool {
+        (self.cancelled).is_some_and(|cancelled| cancelled.load(Ordering::Relaxed))
+    }
+}
+
 pub(crate) struct WalkOutput {
     pub(crate) pairs: Vec<(FileItem, String)>,
     /// Every non-ignored directory the walk visited, relative, ending with /
     pub(crate) dirs: Vec<String>,
     pub(crate) ignore_rules: Option<WalkIgnoreRules>,
+    // What each ignore file at or below the walked directory held when the walk read it.
+    pub(crate) ignore_sources: Vec<(PathBuf, IgnoreSource)>,
 }
 
 #[cfg_attr(not(feature = "zlob"), derive(Clone))]
@@ -57,6 +142,9 @@ pub(crate) struct WalkIgnoreRules {
     inner: ::zlob::walk::WalkerOutcomeRules,
     #[cfg(feature = "zlob")]
     skip_hidden: bool,
+    // The walk's root, which the rules' paths are relative to.
+    #[cfg(feature = "zlob")]
+    root: std::path::PathBuf,
     #[cfg(not(feature = "zlob"))]
     inner: ::ignore::IncrementalIgnore,
 }
@@ -84,9 +172,18 @@ impl WalkIgnoreRules {
         {
             return true;
         }
-        self.inner
-            .rules()
-            .is_some_and(|rules| rules.is_ignored(relative_path))
+        let Some(rules) = self.inner.rules() else {
+            return false;
+        };
+        if !rules.is_ignored(relative_path) {
+            return false;
+        }
+        // zlob takes a path that is gone for ignored: such a path is ignored only below a
+        // directory that is, the nearest one still there deciding.
+        (relative_path.ancestors())
+            .filter(|path| !path.as_os_str().is_empty())
+            .find(|path| self.root.join(path).symlink_metadata().is_ok())
+            .is_some_and(|path| path == relative_path || rules.is_ignored(path))
     }
 
     #[cfg(not(feature = "zlob"))]
@@ -97,7 +194,7 @@ impl WalkIgnoreRules {
 
 #[cfg(test)]
 mod tests {
-    use super::{WalkPolicy, walk_collect_files};
+    use super::{WalkHooks, WalkPolicy, walk_collect_files};
     use crate::file_picker::FilePickerIgnoreOptions;
     use std::fs;
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -120,7 +217,16 @@ mod tests {
         fs::write(root.join("target/out.bin"), "bin").unwrap();
 
         let counter = Arc::new(AtomicUsize::new(0));
-        let out = walk_collect_files(root, None, true, policy(false), 1, &counter, None).unwrap();
+        let out = walk_collect_files(
+            root,
+            None,
+            true,
+            policy(false),
+            1,
+            &counter,
+            WalkHooks::default(),
+        )
+        .unwrap();
 
         let mut names: Vec<String> = out.pairs.into_iter().map(|(_, rel)| rel).collect();
         names.sort();
@@ -149,8 +255,16 @@ mod tests {
         let mut results = Vec::new();
         for threads in [1, 4] {
             let counter = Arc::new(AtomicUsize::new(0));
-            let out = walk_collect_files(root, None, true, policy(false), threads, &counter, None)
-                .unwrap();
+            let out = walk_collect_files(
+                root,
+                None,
+                true,
+                policy(false),
+                threads,
+                &counter,
+                WalkHooks::default(),
+            )
+            .unwrap();
             let mut files: Vec<_> = out
                 .pairs
                 .into_iter()
@@ -179,7 +293,16 @@ mod tests {
         fs::write(root.join("main.rs"), "fn main() {}\n").unwrap();
         fs::write(root.join("module/lib.rs"), "pub fn lib() {}\n").unwrap();
         let counter = Arc::new(AtomicUsize::new(0));
-        let out = walk_collect_files(root, None, true, policy(false), 4, &counter, None).unwrap();
+        let out = walk_collect_files(
+            root,
+            None,
+            true,
+            policy(false),
+            4,
+            &counter,
+            WalkHooks::default(),
+        )
+        .unwrap();
         let mut paths: Vec<_> = out.pairs.into_iter().map(|(_, path)| path).collect();
         paths.sort();
         assert_eq!(
@@ -198,7 +321,16 @@ mod tests {
         fs::write(root.join("index.js"), "x").unwrap();
 
         let counter = Arc::new(AtomicUsize::new(0));
-        let out = walk_collect_files(root, None, false, policy(false), 1, &counter, None).unwrap();
+        let out = walk_collect_files(
+            root,
+            None,
+            false,
+            policy(false),
+            1,
+            &counter,
+            WalkHooks::default(),
+        )
+        .unwrap();
         let names: Vec<String> = out.pairs.into_iter().map(|(_, rel)| rel).collect();
 
         assert!(names.iter().any(|n| n.ends_with("index.js")));
@@ -227,7 +359,7 @@ mod tests {
             policy(false),
             1,
             &counter,
-            None,
+            WalkHooks::default(),
         )
         .unwrap();
         let names: Vec<String> = out.pairs.into_iter().map(|(_, rel)| rel).collect();
@@ -249,7 +381,7 @@ mod tests {
             policy(false),
             1,
             &counter,
-            None,
+            WalkHooks::default(),
         );
         assert!(result.is_err());
     }
@@ -288,7 +420,7 @@ mod tests {
                 policy(false),
                 threads,
                 &counter,
-                Some(&hook),
+                WalkHooks::new(Some(&hook), None),
             )
             .unwrap();
             let mut names: Vec<String> = out.pairs.into_iter().map(|(_, rel)| rel).collect();
@@ -319,11 +451,47 @@ mod tests {
                 policy(false),
                 1,
                 &counter,
-                Some(&hook),
+                WalkHooks::new(Some(&hook), None),
             )
             .unwrap();
             assert_eq!(*seen.lock(), [std::path::Path::new("a/b")]);
         }
+    }
+
+    // The walker may read an ignore file between its hash and a write restoring the content.
+    #[test]
+    fn an_ignore_file_the_walk_read_changed_is_recorded_as_unknown() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        fs::create_dir(root.join(".git")).unwrap();
+        fs::create_dir(root.join("a")).unwrap();
+        fs::write(root.join(".gitignore"), "one/\n").unwrap();
+        let ignore = root.join(".gitignore");
+        let hook: super::DirHook = {
+            let ignore = ignore.clone();
+            Arc::new(move |_: &std::path::Path| {
+                let _ = fs::write(&ignore, "two/\n");
+            })
+        };
+        let counter = Arc::new(AtomicUsize::new(0));
+        let out = walk_collect_files(
+            root,
+            None,
+            true,
+            policy(false),
+            1,
+            &counter,
+            WalkHooks::new(Some(&hook), None),
+        )
+        .unwrap();
+        let recorded = (out.ignore_sources.into_iter())
+            .find(|(path, _)| *path == ignore)
+            .map(|(_, source)| source);
+        fs::write(&ignore, "one/\n").unwrap();
+        let long_ago = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_000_000_000);
+        let file = fs::File::options().write(true).open(&ignore).unwrap();
+        file.set_modified(long_ago).unwrap();
+        assert!(super::IgnoreSource::changed(recorded, &ignore));
     }
 
     // Stow-style file symlinks pointing outside the root must be indexed with
@@ -344,7 +512,16 @@ mod tests {
         std::os::unix::fs::symlink("../dotfiles/missing", root.join("broken")).unwrap();
 
         let counter = Arc::new(AtomicUsize::new(0));
-        let out = walk_collect_files(&root, None, false, policy(true), 1, &counter, None).unwrap();
+        let out = walk_collect_files(
+            &root,
+            None,
+            false,
+            policy(true),
+            1,
+            &counter,
+            WalkHooks::default(),
+        )
+        .unwrap();
         let mut names: Vec<String> = out.pairs.iter().map(|(_, rel)| rel.clone()).collect();
         names.sort();
 
@@ -355,7 +532,16 @@ mod tests {
         assert_eq!(item.size, 10);
         assert_eq!(&rel[item.filename_offset_in_relative_path()..], "sesh.toml");
 
-        let out = walk_collect_files(&root, None, false, policy(false), 1, &counter, None).unwrap();
+        let out = walk_collect_files(
+            &root,
+            None,
+            false,
+            policy(false),
+            1,
+            &counter,
+            WalkHooks::default(),
+        )
+        .unwrap();
         let names: Vec<String> = out.pairs.into_iter().map(|(_, rel)| rel).collect();
         assert_eq!(names, ["projects.toml"]);
     }
@@ -372,12 +558,26 @@ mod tests {
         fs::write(root.join("Cargo.toml"), "x").unwrap();
 
         let counter = Arc::new(AtomicUsize::new(0));
-        let out = walk_collect_files(root, None, true, policy(false), 1, &counter, None).unwrap();
+        let out = walk_collect_files(
+            root,
+            None,
+            true,
+            policy(false),
+            1,
+            &counter,
+            WalkHooks::default(),
+        )
+        .unwrap();
 
         let rules = out.ignore_rules.expect("zlob surfaces ignore rules");
+        fs::create_dir(root.join("target")).unwrap();
+        fs::write(root.join("debug.log"), "").unwrap();
         assert!(rules.is_ignored(Path::new("target/"), true));
         assert!(rules.is_ignored(Path::new("debug.log"), false));
         assert!(!rules.is_ignored(Path::new("Cargo.toml"), false));
+        // A path that is gone is ignored only below a directory that is.
+        assert!(!rules.is_ignored(Path::new("gone.log"), false));
+        assert!(rules.is_ignored(Path::new("target/gone.o"), false));
     }
 
     // Both backends must honor `info/exclude`, which linked worktrees read from
@@ -422,8 +622,16 @@ mod tests {
 
         for base in [&root, &worktree] {
             let counter = Arc::new(AtomicUsize::new(0));
-            let out =
-                walk_collect_files(base, None, true, policy(false), 1, &counter, None).unwrap();
+            let out = walk_collect_files(
+                base,
+                None,
+                true,
+                policy(false),
+                1,
+                &counter,
+                WalkHooks::default(),
+            )
+            .unwrap();
             let names: Vec<String> = out.pairs.iter().map(|(_, rel)| rel.clone()).collect();
 
             assert!(names.iter().any(|n| n == "src/a.txt"), "{names:?}");
@@ -436,6 +644,9 @@ mod tests {
             #[cfg(feature = "zlob")]
             {
                 let rules = out.ignore_rules.expect("zlob surfaces ignore rules");
+                fs::create_dir_all(base.join("excluded/later")).unwrap();
+                fs::write(base.join("excluded/later/new.txt"), "x").unwrap();
+                fs::write(base.join("debug.log"), "").unwrap();
                 assert!(rules.is_ignored(Path::new("excluded/later/new.txt"), false));
                 assert!(rules.is_ignored(Path::new("debug.log"), false));
                 assert!(!rules.is_ignored(Path::new("src/a.txt"), false));
@@ -474,7 +685,16 @@ mod tests {
         }
 
         let counter = Arc::new(AtomicUsize::new(0));
-        let out = walk_collect_files(root, None, true, policy(false), 1, &counter, None).unwrap();
+        let out = walk_collect_files(
+            root,
+            None,
+            true,
+            policy(false),
+            1,
+            &counter,
+            WalkHooks::default(),
+        )
+        .unwrap();
         let names: Vec<String> = out.pairs.iter().map(|(_, rel)| rel.clone()).collect();
 
         assert!(names.iter().any(|n| n == "src/hit.ts"), "{names:?}");
@@ -484,6 +704,8 @@ mod tests {
 
         // The watcher filters incremental updates with these rules.
         let rules = out.ignore_rules.expect("zlob surfaces ignore rules");
+        fs::create_dir_all(root.join(".worktrees/wt1")).unwrap();
+        fs::write(root.join(".worktrees/wt1/new.ts"), "x").unwrap();
         assert!(rules.is_ignored(std::path::Path::new(".worktrees/wt1/new.ts"), false));
         assert!(!rules.is_ignored(std::path::Path::new("src/hit.ts"), false));
     }
@@ -534,7 +756,7 @@ mod tests {
                 },
                 1,
                 &counter,
-                None,
+                WalkHooks::default(),
             )
             .unwrap()
             .pairs

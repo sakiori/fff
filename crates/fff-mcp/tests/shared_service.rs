@@ -434,20 +434,19 @@ fn scope_indexed_by_parent_watcher_joins_parent_coverage() {
     let tmp = Sandbox::new();
     let service = tmp.service();
     let (project, _) = fixture(tmp.path());
-    // While this file exists, the service's watchers leave new directories unindexed.
-    let hold = tmp.path().join("hold-dir-indexing");
-    let hold_env = [("FFF_TEST_HOLD_DIR_INDEXING", hold.to_str().unwrap())];
-    let mut parent = Client::start_configured(BIN, &project, &service, "1", &[], &hold_env);
+    // While its rules leave `new/` out, the parent's index holds nothing of it.
+    git2::Repository::init(&project).unwrap();
+    std::fs::write(project.join(".gitignore"), "new/\n").unwrap();
+    let mut parent = Client::start(&project, &service);
     assert!(
         parent
             .tool("grep", json!({"query":"UniqueNeedle"}))
             .contains("outside.rs")
     );
-    std::fs::write(&hold, "").unwrap();
     let empty = project.join("new/empty");
     std::fs::create_dir_all(&empty).unwrap();
-    // The parent's watcher has not indexed the directory, so the child builds its own index.
-    let mut child = Client::start_configured(BIN, &empty, &service, "1", &[], &hold_env);
+    // The parent's index does not cover the directory, so the child builds its own index.
+    let mut child = Client::start(&empty, &service);
     assert!(
         !child
             .tool("find_files", json!({"query":"inside"}))
@@ -471,7 +470,7 @@ fn scope_indexed_by_parent_watcher_joins_parent_coverage() {
         "{own}"
     );
     // Only the parent's watcher indexing the directory can move the child now.
-    std::fs::remove_file(&hold).unwrap();
+    std::fs::write(project.join(".gitignore"), "").unwrap();
     wait_status(
         &service,
         "child never joined coverage the watcher added",

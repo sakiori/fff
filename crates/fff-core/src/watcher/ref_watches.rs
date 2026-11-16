@@ -1,3 +1,4 @@
+use crate::git_dirs::RegisteredGitDir;
 use crate::shared::{SharedFilePicker, related};
 use git2::Repository;
 use notify::event::ModifyKind;
@@ -48,6 +49,7 @@ pub(crate) struct RefWatches {
     // Watches stay once added, as removing one restarts the backend's stream.
     keep: bool,
     own: Option<OwnRepository>,
+    // A leaf lock: nothing else is locked while it is held, the picker's lock included.
     state: Mutex<RefState>,
 }
 
@@ -106,8 +108,9 @@ impl RefWatches {
             common_dir: own.common_dir.clone(),
             storage: RefStorage::of(&own.common_dir),
         }];
+        let registered = Registered::of(picker);
         let targets: Vec<_> = (ref_targets(&followed, self.keep).into_iter())
-            .filter(|(path, _, _)| !self.covered_otherwise(path, picker) && path.is_dir())
+            .filter(|(path, _, _)| !self.covered_otherwise(path, &registered) && path.is_dir())
             .map(|(path, mode, _)| (path, mode))
             .collect();
         let ops = (targets.iter())
@@ -115,6 +118,13 @@ impl RefWatches {
             .collect();
         self.state.lock().watched = targets.into();
         ops
+    }
+
+    // The work trees whose refs a listener follows.
+    pub(crate) fn followed_work_trees(&self) -> Vec<PathBuf> {
+        (self.state.lock().followed.iter())
+            .map(|followed| followed.work_tree.clone())
+            .collect()
     }
 
     pub(crate) fn own_git_dir(&self) -> Option<PathBuf> {
@@ -143,15 +153,24 @@ impl RefWatches {
             .map(|own| own.work_tree.clone())
     }
 
-    // `renew` is a repository created again, whose watches went with the old one.
+    // `renew` is a repository created again, whose watches went with the old one. The picker is
+    // read before the state is locked, as by a plan begun a moment earlier.
     pub(crate) fn plan(&self, picker: &SharedFilePicker, renew: Option<&Path>) -> RefPlan {
         let scopes = picker.ref_scopes();
+        // What is watched changes only on the watcher's thread, which plans.
+        let unwatching = !self.keep && !self.state.lock().watched.is_empty();
+        let registered = match scopes.is_empty() && !unwatching {
+            true => Registered::default(),
+            false => Registered::of(picker),
+        };
         let mut state = self.state.lock();
+        #[cfg(test)]
+        tests::reached(&self.base_path, tests::Point::Planning);
         let followed = if scopes.is_empty() {
             state.storages.clear();
             Vec::new()
         } else {
-            self.followed(picker, &scopes, &mut state.storages)
+            self.followed(&registered, &scopes, &mut state.storages)
         };
         let renewed = std::mem::take(&mut state.renewed);
         let mut ops = Vec::new();
@@ -159,7 +178,7 @@ impl RefWatches {
         let mut watched = Vec::new();
         let mut missing = Vec::new();
         for (path, mode, work_trees) in ref_targets(&followed, self.keep) {
-            if self.covered_otherwise(&path, picker) {
+            if self.covered_otherwise(&path, &registered) {
                 continue;
             }
             if !path.is_dir() {
@@ -188,7 +207,7 @@ impl RefWatches {
             }
             if self.keep {
                 watched.push((path.clone(), *mode));
-            } else if !self.covered_otherwise(path, picker) {
+            } else if !self.covered_otherwise(path, &registered) {
                 ops.push(PathOp::unwatch(path.clone()));
             }
         }
@@ -213,6 +232,8 @@ impl RefWatches {
     // The next plan watches these anew: a directory gone and back before it looked lost its
     // watch while its path stayed known.
     pub(crate) fn renew(&self, paths: Vec<PathBuf>) {
+        #[cfg(test)]
+        tests::reached(&self.base_path, tests::Point::Renewing);
         self.state.lock().renewed.extend(paths);
     }
 
@@ -234,7 +255,7 @@ impl RefWatches {
     // related to a listener's scope.
     fn followed(
         &self,
-        picker: &SharedFilePicker,
+        registered: &Registered,
         scopes: &[PathBuf],
         storages: &mut Vec<(PathBuf, RefStorage)>,
     ) -> Vec<Followed> {
@@ -248,11 +269,17 @@ impl RefWatches {
                     own.common_dir.clone(),
                 )
             });
-        let registered = (picker.registered_git_dirs().into_iter())
+        let registered = (registered.all.iter())
             .filter(|known| {
                 known.work_tree.starts_with(&self.base_path) && wanted(&known.work_tree)
             })
-            .map(|known| (known.git_dir, known.work_tree, known.common_dir));
+            .map(|known| {
+                (
+                    known.git_dir.clone(),
+                    known.work_tree.clone(),
+                    known.common_dir.clone(),
+                )
+            });
         let repositories: Vec<_> = own.chain(registered).collect();
         let mut followed: Vec<Followed> = Vec::new();
         for (git_dir, work_tree, common_dir) in repositories {
@@ -279,12 +306,28 @@ impl RefWatches {
 
     // Whether the tree's or a git state watch delivers `dir` already; a backend keeps one
     // watch per path, so unwatching it would end that one too.
-    fn covered_otherwise(&self, dir: &Path, picker: &SharedFilePicker) -> bool {
+    fn covered_otherwise(&self, dir: &Path, registered: &Registered) -> bool {
         self.recursive && dir.starts_with(&self.base_path)
-            || self.own.as_ref().is_some_and(|own| own.git_dir == dir)
-            || picker
-                .registered_work_tree(dir)
+            || (self.own.as_ref()).is_some_and(|own| own.git_dir == dir || own.common_dir == dir)
+            || (registered.work_trees.get(dir))
                 .is_some_and(|work_tree| work_tree.starts_with(&self.base_path))
+    }
+}
+
+// The git dirs the index registered, read before the ref state is locked.
+#[derive(Default)]
+struct Registered {
+    all: Vec<RegisteredGitDir>,
+    work_trees: ahash::AHashMap<PathBuf, PathBuf>,
+}
+
+impl Registered {
+    fn of(picker: &SharedFilePicker) -> Self {
+        let all = picker.registered_git_dirs();
+        let work_trees = (all.iter())
+            .map(|known| (known.git_dir.clone(), known.work_tree.clone()))
+            .collect();
+        Self { all, work_trees }
     }
 }
 
@@ -922,8 +965,8 @@ fn real_path(path: &Path) -> Option<PathBuf> {
 // Where the refs of the repository with git dir `git_dir` live: the common dir its
 // `commondir` file names, as a linked worktree's does, or the git dir itself.
 pub(crate) fn common_dir_of(git_dir: &Path) -> PathBuf {
-    std::fs::read_to_string(git_dir.join("commondir"))
-        .ok()
+    crate::stat::read_regular(&git_dir.join("commondir"))
+        .and_then(|target| String::from_utf8(target).ok())
         .map(|target| canonical_dir(&git_dir.join(target.trim())))
         .unwrap_or_else(|| git_dir.to_path_buf())
 }
@@ -933,14 +976,116 @@ fn canonical_dir(dir: &Path) -> PathBuf {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
+    use super::super::git_changes::GitChanges;
     use super::*;
+    use crate::scan::tests::{on_a_thread, poll_for};
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::time::Duration;
+
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    pub(super) enum Point {
+        // A plan holds the state.
+        Planning,
+        // A renewal is about to take the state.
+        Renewing,
+    }
+
+    type Hook = Box<dyn FnOnce() + Send>;
+
+    // Each hook runs once, when the ref watches of its base path next reach its point.
+    static HOOKS: Mutex<Vec<(PathBuf, Point, Hook)>> = Mutex::new(Vec::new());
+
+    pub(super) fn reached(base_path: &Path, point: Point) {
+        let hook = {
+            let mut hooks = HOOKS.lock();
+            let position =
+                (hooks.iter()).position(|(path, at, _)| path == base_path && *at == point);
+            position.map(|position| hooks.remove(position).2)
+        };
+        if let Some(hook) = hook {
+            hook();
+        }
+    }
+
+    fn on(base_path: &Path, point: Point, hook: impl FnOnce() + Send + 'static) {
+        (HOOKS.lock()).push((base_path.to_path_buf(), point, Box::new(hook)));
+    }
+
+    // The picker's reader waiting for the ref state, a writer queued behind it and a plan holding
+    // the state: the plan takes no lock of the picker, so the three never wait on each other.
+    #[test]
+    fn a_plan_holding_the_ref_state_never_waits_behind_a_writer_of_the_picker() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = crate::path_utils::canonicalize(tmp.path()).unwrap();
+        let picker = indexed(&root);
+        git2::Repository::init(root.join("a")).unwrap();
+        picker.register_git_dir(&root.join("a/.git"), &root.join("a"));
+        // Never dropped: its drop takes the picker's lock, which a failure leaves taken.
+        std::mem::forget(picker.subscribe_ref_changes(&root, |_| {}));
+        let watches = (picker.read().unwrap().as_ref())
+            .and_then(|index| index.background_watcher.as_ref())
+            .map(|watcher| watcher.watches())
+            .unwrap();
+        let gate = Arc::new(AtomicBool::new(false));
+        let planning = Arc::new(AtomicBool::new(false));
+        let renewing = Arc::new(AtomicBool::new(false));
+        let (open, inside) = (Arc::clone(&gate), Arc::clone(&planning));
+        on(&root, Point::Planning, move || {
+            inside.store(true, Ordering::SeqCst);
+            poll_for(Duration::from_secs(30), || open.load(Ordering::SeqCst));
+        });
+        let renews = Arc::clone(&renewing);
+        on(&root, Point::Renewing, move || {
+            renews.store(true, Ordering::SeqCst)
+        });
+        let planned = on_a_thread({
+            let picker = picker.clone();
+            move || drop(watches.refs.plan(&picker, None))
+        });
+        let seen = |flag: &Arc<AtomicBool>| {
+            poll_for(Duration::from_secs(30), || flag.load(Ordering::SeqCst))
+        };
+        assert!(seen(&planning), "the plan never took the ref state");
+        let announced = on_a_thread({
+            let picker = picker.clone();
+            move || GitChanges::resyncing_refs().announce(&picker)
+        });
+        assert!(
+            seen(&renewing),
+            "the batch's announcement never renewed the ref watches"
+        );
+        let written = on_a_thread({
+            let picker = picker.clone();
+            move || drop(picker.write())
+        });
+        let mut wrote = false;
+        let queued = poll_for(Duration::from_secs(30), || {
+            wrote |= written.try_recv().is_ok();
+            wrote || picker.try_read().is_none()
+        });
+        assert!(queued, "the writer neither queued nor wrote");
+        gate.store(true, Ordering::SeqCst);
+        let limit = Duration::from_secs(30);
+        assert!(
+            planned.recv_timeout(limit).is_ok(),
+            "the plan waits for the picker while holding the ref state"
+        );
+        assert!(
+            announced.recv_timeout(limit).is_ok(),
+            "the announcement never took the ref state"
+        );
+        assert!(
+            wrote || written.recv_timeout(limit).is_ok(),
+            "the writer never took the picker"
+        );
+    }
 
     #[test]
     fn ref_watches_follow_only_the_repositories_of_the_listeners_scopes() {
         let tmp = tempfile::tempdir().unwrap();
         let root = crate::path_utils::canonicalize(tmp.path()).unwrap();
-        let picker = SharedFilePicker::default();
+        let picker = indexed(&root);
         for name in ["a", "b"] {
             git2::Repository::init(root.join(name)).unwrap();
             picker.register_git_dir(&root.join(name).join(".git"), &root.join(name));
@@ -976,7 +1121,7 @@ mod tests {
         let git_dir = repo.join(".git");
         std::fs::create_dir_all(git_dir.join("objects")).unwrap();
         std::fs::write(git_dir.join("HEAD"), "ref: refs/heads/main\n").unwrap();
-        let picker = SharedFilePicker::default();
+        let picker = indexed(&root);
         picker.register_git_dir(&git_dir, &repo);
         let _listener = picker.subscribe_ref_changes(&root, |_| {});
         let refs = RefWatches::new(&root, false, None, false, true);
@@ -1021,7 +1166,7 @@ mod tests {
         let common_dir = main.join(".git");
         let linked_git_dir = crate::watch::git_dir_of(&linked).unwrap();
         assert_eq!(RefStorage::of(&common_dir), RefStorage::Reftable);
-        let picker = SharedFilePicker::default();
+        let picker = indexed(&root);
         picker.register_git_dir(&common_dir, &main);
         picker.register_git_dir(&linked_git_dir, &linked);
         let _listener = picker.subscribe_ref_changes(&root, |_| {});
@@ -1113,7 +1258,7 @@ mod tests {
             eprintln!("skipped: the installed git cannot create a reftable repository: {reason}");
             return;
         }
-        let picker = SharedFilePicker::default();
+        let picker = indexed(&root);
         let _listener = picker.subscribe_ref_changes(&main, |_| {});
         let following = RefWatches::new(&main, false, None, true, true);
         assert!(following.own_git_dir().is_some());
@@ -1319,7 +1464,7 @@ mod tests {
         git2::Repository::init(&repo).unwrap();
         let worktrees = repo.join(".git/worktrees");
         std::fs::create_dir_all(worktrees.join("wt")).unwrap();
-        let picker = SharedFilePicker::default();
+        let picker = indexed(&root);
         picker.register_git_dir(&repo.join(".git"), &repo);
         let _listener = picker.subscribe_ref_changes(&root, |_| {});
         let refs = RefWatches::new(&root, false, None, false, true);
@@ -1406,7 +1551,7 @@ mod tests {
             git(&main, &["worktree", "add", "-q", "--detach", &path]);
         }
         let worktrees = main.join(".git/worktrees");
-        let picker = SharedFilePicker::default();
+        let picker = indexed(&root);
         picker.register_git_dir(&main.join(".git"), &main);
         for name in ["followed", "ignored"] {
             picker.register_git_dir(&worktrees.join(name), &root.join(name));
@@ -1453,7 +1598,7 @@ mod tests {
         git2::Repository::init(&repo).unwrap();
         let worktrees = repo.join(".git/worktrees");
         std::fs::create_dir_all(worktrees.join("first")).unwrap();
-        let picker = SharedFilePicker::default();
+        let picker = indexed(&root);
         picker.register_git_dir(&repo.join(".git"), &repo);
         let _listener = picker.subscribe_ref_changes(&root, |_| {});
         let refs = RefWatches::new(&root, false, None, false, true);
@@ -1508,7 +1653,7 @@ mod tests {
         }
         git(&main, &["worktree", "add", "-q", "--detach", "../other"]);
         let common_dir = main.join(".git");
-        let picker = SharedFilePicker::default();
+        let picker = indexed(&root);
         picker.register_git_dir(&common_dir, &main);
         let _listener = picker.subscribe_ref_changes(&main, |_| {});
         let refs = RefWatches::new(&main, false, None, false, true);
@@ -1573,7 +1718,7 @@ mod tests {
             .worktree("other", &root.join("other"), None)
             .unwrap();
         let worktrees = repo.join(".git/worktrees");
-        let picker = SharedFilePicker::default();
+        let picker = indexed(&root);
         picker.register_git_dir(&worktrees.join("wt"), &base.join("wt"));
         let _listener = picker.subscribe_ref_changes(&base, |_| {});
 
@@ -1636,7 +1781,7 @@ mod tests {
             .worktree("other", &root.join("other"), None)
             .unwrap();
         let common_dir = main.join(".git");
-        let picker = SharedFilePicker::default();
+        let picker = indexed(&root);
         let _listener = picker.subscribe_ref_changes(&linked, |_| {});
 
         for keep in [true, false] {
@@ -1669,6 +1814,21 @@ mod tests {
 
     fn modified() -> EventKind {
         EventKind::Modify(ModifyKind::Any)
+    }
+
+    // A handle holding an index of `root`, unscanned, whose registry the tests fill.
+    fn indexed(root: &Path) -> SharedFilePicker {
+        let picker = SharedFilePicker::default();
+        let mut index = crate::file_picker::FilePicker::new(crate::FilePickerOptions {
+            base_path: root.to_string_lossy().into_owned(),
+            watch: false,
+            ..Default::default()
+        })
+        .unwrap();
+        // The registry of git dirs is the installed watcher's.
+        index.background_watcher = Some(crate::watch::BackgroundWatcher::unstarted(root));
+        *picker.write().unwrap() = Some(index);
+        picker
     }
 
     fn ops(plan: &RefPlan) -> Vec<(bool, PathBuf)> {

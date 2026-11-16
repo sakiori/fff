@@ -155,8 +155,17 @@ Notes:
 - A `renamed` event carries both paths: `e.path` is the destination and
   `e.from` the source. It replaces the removed/created pair, so a move is one
   event. Moves in or out of the indexed tree stay a plain `created`/`removed`.
-- A `rescan` event means changes were lost (index overflow, ignore-file
-  change) — re-stat anything you care about.
+- A `rescan` event means a full rescan rebuilt the index and individual
+  changes were not reported — re-stat anything you care about. It arrives once
+  the rebuilt index is in place, after every full rescan: one you requested, or
+  one the index needs because it could not take changes in (its overflow area
+  filled up, or an update failed) or because its watcher was lost and is
+  replaced. Such a rebuild starts at once, or one rescan interval after the
+  last one started; until it is in place `getScanProgress()` reports
+  `isWatcherReady: false` while subscriptions stay open, as its `rescan` event
+  covers the gap. An index's first scan sends none. Lost watcher events and
+  changed ignore rules are checked again where they happened and reported as
+  individual events.
 - Unsubscribing takes effect synchronously on the JS thread: once it
   returns, the callback will not be invoked again.
 - Watching requires the instance to be created with watching enabled

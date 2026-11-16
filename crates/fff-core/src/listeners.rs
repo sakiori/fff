@@ -79,8 +79,15 @@ trait Remove: Send + Sync {
 }
 
 impl<E: ?Sized + 'static, S: Send + 'static> Remove for Listeners<E, S> {
+    // The listener is dropped after the lock is released: it may hold the last handle of the
+    // index, whose drop waits for a notification that needs this lock.
     fn remove(&self, id: u64) {
-        self.listeners.lock().retain(|(own, _, _)| *own != id);
+        let removed = {
+            let mut listeners = self.listeners.lock();
+            let position = listeners.iter().position(|(own, _, _)| *own == id);
+            position.map(|position| listeners.remove(position))
+        };
+        drop(removed);
     }
 }
 

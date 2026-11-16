@@ -22,9 +22,27 @@ projects at the same time. Otherwise, use upstream.
 | Rust crates | `fff-search` and the other crates. | The same crates, plus `fff-service`, the shared service's server and client. Nothing is published to crates.io. |
 | Neovim plugin, Bun, Python, pi-fff | | No fork features. Their installers download upstream's releases, so install them from upstream. |
 
-The fork also fixes how the index follows directories that are rewalked or replaced
-while it watches them. The fixes are in the core, so every build of this repository has
-them, the Neovim plugin and Python bindings included.
+The fork also changes how the index keeps itself current. The changes are in the core,
+so every build of this repository has them, the Neovim plugin and Python bindings
+included:
+
+- The index follows directories that are rewalked or replaced while it watches them.
+- One writer per index applies every change in order. Watcher events, changes a program
+  reports, events the watcher lost and changed `.gitignore` or `.ignore` files are checked
+  again where they happened, by the stat data Git compares (size, modification time,
+  inode and status-change time), instead of rescanning the whole tree and reading every
+  file again, and are reported as individual watch events rather than as a `rescan`
+  event. A file copied over another keeping its size and time is reported modified, and a
+  file moved into a new directory renamed when the move reaches the index in one change.
+- A full rescan that is still needed waits behind the running scan, and one the watcher
+  asks for starts no earlier than a fixed interval after the last full scan. Every full
+  rescan, also one a program requests, sends one `rescan` event once the rebuilt index is
+  in place; an index's first scan sends none.
+- A watcher lost to a failure is replaced by a rebuild that starts at once, or one rescan
+  interval after the last such rebuild started. Until the rebuild is in place the watcher
+  reads as starting and watch subscriptions stay open, as its `rescan` event covers the gap.
+  A watcher a program stopped stays stopped for that index: no later scan installs or
+  replaces one, while a new index of the same root watches again.
 
 ## Installing this fork
 

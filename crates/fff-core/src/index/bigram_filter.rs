@@ -1094,8 +1094,9 @@ impl BigramOverlay {
         }
     }
 
-    pub(crate) fn modify_file(&mut self, file_idx: usize, content: &[u8]) {
-        self.modified.insert(file_idx, extract_bigrams(content));
+    // Takes the bigrams of a file's content, extracted beforehand, off any lock.
+    pub(crate) fn modify_file_bigrams(&mut self, file_idx: usize, bigrams: Vec<u16>) {
+        self.modified.insert(file_idx, bigrams);
     }
 
     pub(crate) fn delete_file(&mut self, file_idx: usize) {
@@ -1318,14 +1319,15 @@ pub(crate) fn sniff_binary_for_non_indexable(
     }
 }
 
-// Release worker buffers after publishing the index, before allocator collection.
+// Release worker buffers after publishing the index, before allocator collection. Queued on each
+// worker without waiting: one worker busy elsewhere never holds up the caller.
 pub(crate) fn release_thread_buffers(pool: &rayon::ThreadPool) {
     fn release() {
         READ_BUF.with_borrow_mut(|buf| *buf = Vec::new());
         NORM_BUF.with_borrow_mut(|buf| *buf = Vec::new());
         CHUNK_BUF.with_borrow_mut(|buf| *buf = [Vec::new(), Vec::new()]);
     }
-    pool.broadcast(|_| release());
+    pool.spawn_broadcast(|_| release());
     release();
 }
 

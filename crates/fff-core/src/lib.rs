@@ -146,7 +146,7 @@ pub mod constants;
 pub mod rescan_stats;
 pub use rescan_stats::{RESCAN_STATS_ENABLED, RescanReason, RescanStats};
 
-mod rescan_throttle;
+mod rescan_schedule;
 
 // ==================================
 // these are public only for benchmarks, no backward compatibility guaranteed
@@ -157,13 +157,16 @@ pub mod simd_string_utils;
 // ==================================
 
 mod error;
+mod git_dirs;
 mod git_status_worker;
 /// Built-in exclusions for roots outside a repository.
 pub mod ignore;
 mod listeners;
+mod prepared_file;
 mod scan;
 mod score;
 mod sort_buffer;
+mod stat;
 
 pub(crate) mod index;
 pub(crate) mod parallelism;

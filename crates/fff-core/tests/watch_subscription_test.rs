@@ -332,6 +332,67 @@ fn renaming_a_file_delivers_one_renamed_event_with_both_paths() {
     );
 }
 
+// One Renamed, or, when a polling pass split the move, its creation and removal in separate
+// batches in either order; the lib tests (`rescan_tests.rs`) pin the order the index gives.
+#[test]
+fn a_file_moved_into_a_new_directory_is_one_rename_or_a_creation_and_a_removal() {
+    let tmp = TempDir::new().unwrap();
+    let base = fff_search::path_utils::canonicalize(tmp.path()).unwrap();
+    seed(&base);
+    let old = base.join("src/moved.rs");
+    fs::write(&old, "pub fn moved() {}\n").unwrap();
+    let (picker, _frecency) = make_watched_picker(&base);
+    let batches: Arc<Mutex<Vec<Vec<WatchEvent>>>> = Arc::new(Mutex::new(Vec::new()));
+    let sink = Arc::clone(&batches);
+    picker
+        .watch("", WatchOptions::default(), move |_id, events| {
+            sink.lock().push(events.to_vec())
+        })
+        .expect("watch subscription failed");
+
+    fs::create_dir(base.join("pkg")).unwrap();
+    let new = base.join("pkg/moved.rs");
+    fs::rename(&old, &new).unwrap();
+
+    let is_rename = |e: &WatchEvent| {
+        e.kind == WatchEventKind::Renamed && e.path == new && e.from.as_deref() == Some(&*old)
+    };
+    let batch_of = |got: &[Vec<WatchEvent>], kind: WatchEventKind, path: &Path| {
+        (got.iter()).position(|batch| batch.iter().any(|e| e.kind == kind && e.path == path))
+    };
+    assert!(
+        wait_for(
+            || {
+                let got = batches.lock();
+                got.iter().flatten().any(is_rename)
+                    || batch_of(&got, WatchEventKind::Created, &new).is_some()
+                        && batch_of(&got, WatchEventKind::Removed, &old).is_some()
+            },
+            Duration::from_secs(10)
+        ),
+        "neither a rename nor a creation and a removal: {:?}",
+        batches.lock()
+    );
+    std::thread::sleep(Duration::from_millis(500));
+    let got = batches.lock().clone();
+    let renames = got.iter().flatten().filter(|e| is_rename(e)).count();
+    let created = batch_of(&got, WatchEventKind::Created, &new);
+    let removed = batch_of(&got, WatchEventKind::Removed, &old);
+    let split = matches!((created, removed), (Some(created), Some(removed)) if created != removed);
+    assert!(
+        renames == 1 && created.is_none() && removed.is_none() || renames == 0 && split,
+        "expected one Renamed {} -> {}, or a creation and a removal apart, got {got:?}",
+        old.display(),
+        new.display()
+    );
+    let indexed = |path: &Path| {
+        let guard = picker.read().unwrap();
+        (guard.as_ref()).is_some_and(|p| p.get_file_by_path(path).is_some_and(|f| !f.is_deleted()))
+    };
+    assert!(indexed(&new), "{} is not indexed", new.display());
+    assert!(!indexed(&old), "{} is still indexed", old.display());
+}
+
 #[test]
 fn renaming_out_of_a_watched_subtree_still_notifies() {
     let tmp = TempDir::new().unwrap();
@@ -908,6 +969,44 @@ fn ref_listeners_hear_linked_worktrees_added_moved_and_removed() {
 #[test]
 fn ref_listeners_hear_linked_worktrees_with_the_native_watcher() {
     hears_the_set_of_worktrees(make_watched_picker);
+}
+
+// A worktree inside an ignored directory is never the index's: removing that directory and
+// pruning the worktree tells no ref listener of it, whatever the walker.
+fn a_gone_worktree_below_a_gone_ignored_directory_is_never_told(
+    make_picker: fn(&Path) -> (SharedFilePicker, SharedFrecency),
+) {
+    let tmp = TempDir::new().unwrap();
+    let root = fff_search::path_utils::canonicalize(tmp.path()).unwrap();
+    let main = root.join("main");
+    seed(&main);
+    fs::write(main.join(".gitignore"), ".worktrees/\n").unwrap();
+    git(&main, &["init", "-q", "-b", "main"]);
+    git(&main, &["add", "."]);
+    git(&main, &["commit", "-q", "-m", "init"]);
+    let (picker, _frecency) = make_picker(&main);
+    let refs = RefChanges::subscribe(&picker, &main, &main);
+    let add = ["worktree", "add", "-q", "--detach", ".worktrees/inner"];
+    refs.only(&main, || git(&main, &add), "git worktree add");
+    refs.only(
+        &main,
+        || {
+            fs::remove_dir_all(main.join(".worktrees")).unwrap();
+            git(&main, &["worktree", "prune"]);
+        },
+        "the ignored directory removed, the worktree pruned",
+    );
+}
+
+#[test]
+fn a_gone_worktree_below_a_gone_ignored_directory_is_never_told_when_polling() {
+    a_gone_worktree_below_a_gone_ignored_directory_is_never_told(make_ref_picker);
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn a_gone_worktree_below_a_gone_ignored_directory_is_never_told_natively() {
+    a_gone_worktree_below_a_gone_ignored_directory_is_never_told(make_watched_picker);
 }
 
 fn hears_the_set_of_worktrees(make_picker: fn(&Path) -> (SharedFilePicker, SharedFrecency)) {

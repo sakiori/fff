@@ -552,11 +552,7 @@ pub unsafe extern "C" fn fff_destroy(fff_handle: *mut c_void) {
     instance.picker.shutdown_watches_and_wait();
     instance.watch_callback.clear();
 
-    if let Ok(mut guard) = instance.picker.write()
-        && let Some(picker) = guard.take()
-    {
-        drop(picker);
-    }
+    instance.picker.remove_index();
 
     if let Ok(mut guard) = instance.frecency.write() {
         *guard = None;

@@ -18,16 +18,7 @@ pub static BACKGROUND_THREAD_POOL: LazyLock<rayon::ThreadPool> = LazyLock::new(|
     rayon::ThreadPoolBuilder::new()
         .num_threads(bg_threads)
         .thread_name(|i| format!("fff-bg-{i}"))
-        .start_handler(|_| {
-            // Request user-initiated scheduling priority.
-            #[cfg(target_os = "macos")]
-            unsafe {
-                let _ = libc::pthread_set_qos_class_self_np(
-                    libc::qos_class_t::QOS_CLASS_USER_INITIATED,
-                    0,
-                );
-            }
-        })
+        .start_handler(|_| pin_user_initiated())
         .build()
         .expect("failed to create background rayon pool")
 });
@@ -44,15 +35,7 @@ pub static SEARCH_THREAD_POOL: LazyLock<rayon::ThreadPool> = LazyLock::new(|| {
     rayon::ThreadPoolBuilder::new()
         .num_threads(threads)
         .thread_name(|i| format!("fff-search-{i}"))
-        .start_handler(|_| {
-            #[cfg(target_os = "macos")]
-            unsafe {
-                let _ = libc::pthread_set_qos_class_self_np(
-                    libc::qos_class_t::QOS_CLASS_USER_INITIATED,
-                    0,
-                );
-            }
-        })
+        .start_handler(|_| pin_user_initiated())
         .build()
         .expect("failed to create search rayon pool")
 });
@@ -331,6 +314,15 @@ fn sysctl_name(name: &std::ffi::CStr) -> Option<String> {
         .ok()
         .filter(|name| !name.is_empty())
         .map(str::to_owned)
+}
+
+// Requests user-initiated scheduling priority for the calling thread on macOS, so it and the
+// threads it starts (walkers, FSEvents run loops) are not demoted onto efficiency cores.
+pub(crate) fn pin_user_initiated() {
+    #[cfg(target_os = "macos")]
+    unsafe {
+        let _ = libc::pthread_set_qos_class_self_np(libc::qos_class_t::QOS_CLASS_USER_INITIATED, 0);
+    }
 }
 
 #[cfg(test)]

@@ -9,13 +9,17 @@ pub const RESCAN_STATS_ENABLED: bool = cfg!(rescan_stats);
 pub enum RescanReason {
     /// Requested through the public API (refresh, directory change).
     Explicit,
-    /// The kernel dropped events and asked us to re-read the subtree.
+    /// The kernel dropped events and asked us to re-read the subtree. No longer requested:
+    /// the subtree the lost events name is reconciled instead.
     KernelEventLoss,
-    /// A `.gitignore`/`.ignore` changed, so the cached ignore rules are stale.
+    /// A `.gitignore`/`.ignore` changed, so the cached ignore rules are stale. No longer
+    /// requested: the rules of the file's directory are read again and its subtree reconciled.
     IgnoreFileChanged,
-    /// A single debounce batch touched more paths than we apply incrementally.
+    /// A single debounce batch touched more paths than we apply incrementally. No longer
+    /// requested: such a batch is reconciled where it changed things.
     EventBatchOverflow,
-    /// The picker refused an incremental insert/update.
+    /// The picker refused an incremental insert/update, a turn of the index's loop panicked, or
+    /// its watcher was lost: the index is rebuilt.
     IndexUpdateRejected,
     /// The post-scan overflow region ran out of slots.
     OverflowCapacity,
@@ -42,15 +46,6 @@ impl RescanReason {
         }
     }
 
-    /// Reasons that leave the index knowingly incomplete, so a throttled
-    /// request must still run once the cooldown allows it.
-    pub(crate) const fn defers_when_throttled(self) -> bool {
-        matches!(
-            self,
-            RescanReason::IndexUpdateRejected | RescanReason::OverflowCapacity
-        )
-    }
-
     const fn slot(self) -> usize {
         match self {
             RescanReason::Explicit => 0,
@@ -69,17 +64,60 @@ impl std::fmt::Display for RescanReason {
     }
 }
 
-/// Snapshot of rescan requests grouped by reason.
+// Every reason that asked for one full rescan.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct RescanReasons(u8);
+
+impl RescanReasons {
+    pub(crate) fn insert(&mut self, reason: RescanReason) {
+        self.0 |= 1 << reason.slot();
+    }
+
+    pub(crate) fn iter(self) -> impl Iterator<Item = RescanReason> {
+        (RescanReason::ALL.into_iter()).filter(move |reason| self.0 & (1 << reason.slot()) != 0)
+    }
+
+    // Whether the watcher asked, not only a program.
+    pub(crate) fn include_the_watcher_s(self) -> bool {
+        self.iter().any(|reason| reason != RescanReason::Explicit)
+    }
+}
+
+impl From<RescanReason> for RescanReasons {
+    fn from(reason: RescanReason) -> Self {
+        let mut reasons = Self::default();
+        reasons.insert(reason);
+        reasons
+    }
+}
+
+impl std::fmt::Display for RescanReasons {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        for (position, reason) in self.iter().enumerate() {
+            if position > 0 {
+                f.write_str(", ")?;
+            }
+            write!(f, "{reason}")?;
+        }
+        Ok(())
+    }
+}
+
+/// Snapshot of full rescans grouped by reason: each rescan that started counts once in `total`,
+/// and under every reason that asked for it.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct RescanStats {
     pub total: usize,
-    /// Requests suppressed during the cooldown.
+    /// Requests that did not start a rescan of their own because they joined the one already
+    /// pending.
     pub throttled: usize,
     counts: [usize; RescanReason::ALL.len()],
     throttled_counts: [usize; RescanReason::ALL.len()],
+    watcher: usize,
 }
 
 impl RescanStats {
+    /// Rescans `reason` asked for, alone or with other reasons.
     pub fn count(&self, reason: RescanReason) -> usize {
         self.counts[reason.slot()]
     }
@@ -88,9 +126,9 @@ impl RescanStats {
         self.throttled_counts[reason.slot()]
     }
 
-    /// Admitted requests originating from watcher fallbacks.
+    /// Rescans the watcher asked for, also those a request through the public API joined.
     pub fn watcher_triggered(&self) -> usize {
-        self.total - self.count(RescanReason::Explicit)
+        self.watcher
     }
 
     /// Per-reason delta against an earlier snapshot.
@@ -108,6 +146,7 @@ impl RescanStats {
             throttled: self.throttled.saturating_sub(earlier.throttled),
             counts,
             throttled_counts,
+            watcher: self.watcher.saturating_sub(earlier.watcher),
         }
     }
 }
@@ -138,14 +177,22 @@ impl std::fmt::Display for RescanStats {
 #[cfg(rescan_stats)]
 #[derive(Default)]
 pub(crate) struct RescanCounters {
+    total: AtomicUsize,
+    watcher: AtomicUsize,
     counters: [AtomicUsize; RescanReason::ALL.len()],
     throttled: [AtomicUsize; RescanReason::ALL.len()],
 }
 
 #[cfg(rescan_stats)]
 impl RescanCounters {
-    pub(crate) fn record(&self, reason: RescanReason) {
-        self.counters[reason.slot()].fetch_add(1, Ordering::Relaxed);
+    pub(crate) fn record(&self, reasons: RescanReasons) {
+        self.total.fetch_add(1, Ordering::Relaxed);
+        if reasons.include_the_watcher_s() {
+            self.watcher.fetch_add(1, Ordering::Relaxed);
+        }
+        for reason in reasons.iter() {
+            self.counters[reason.slot()].fetch_add(1, Ordering::Relaxed);
+        }
     }
 
     pub(crate) fn record_throttled(&self, reason: RescanReason) {
@@ -153,11 +200,13 @@ impl RescanCounters {
     }
 
     pub(crate) fn snapshot(&self) -> RescanStats {
-        let mut stats = RescanStats::default();
+        let mut stats = RescanStats {
+            total: self.total.load(Ordering::Relaxed),
+            watcher: self.watcher.load(Ordering::Relaxed),
+            ..RescanStats::default()
+        };
         for reason in RescanReason::ALL {
-            let count = self.counters[reason.slot()].load(Ordering::Relaxed);
-            stats.counts[reason.slot()] = count;
-            stats.total += count;
+            stats.counts[reason.slot()] = self.counters[reason.slot()].load(Ordering::Relaxed);
 
             let throttled = self.throttled[reason.slot()].load(Ordering::Relaxed);
             stats.throttled_counts[reason.slot()] = throttled;
@@ -167,7 +216,8 @@ impl RescanCounters {
     }
 
     pub(crate) fn reset(&self) {
-        for counter in self.counters.iter().chain(self.throttled.iter()) {
+        let totals = [&self.total, &self.watcher];
+        for counter in (self.counters.iter().chain(&self.throttled)).chain(totals) {
             counter.store(0, Ordering::Relaxed);
         }
     }
@@ -180,7 +230,7 @@ pub(crate) struct RescanCounters;
 
 #[cfg(not(rescan_stats))]
 impl RescanCounters {
-    pub(crate) fn record(&self, _reason: RescanReason) {}
+    pub(crate) fn record(&self, _reasons: RescanReasons) {}
 
     pub(crate) fn record_throttled(&self, _reason: RescanReason) {}
 
@@ -198,25 +248,30 @@ mod tests {
     #[test]
     fn counters_attribute_and_diff_per_reason() {
         let counters = RescanCounters::default();
-        counters.record(RescanReason::Explicit);
+        counters.record(RescanReason::Explicit.into());
         let baseline = counters.snapshot();
 
-        counters.record(RescanReason::IgnoreFileChanged);
-        counters.record(RescanReason::IgnoreFileChanged);
-        counters.record(RescanReason::OverflowCapacity);
+        counters.record(RescanReason::IgnoreFileChanged.into());
+        counters.record(RescanReason::IgnoreFileChanged.into());
+        let mut joined = RescanReasons::from(RescanReason::Explicit);
+        joined.insert(RescanReason::OverflowCapacity);
+        counters.record(joined);
 
         let stats = counters.snapshot();
         assert_eq!(stats.total, 4);
         assert_eq!(stats.watcher_triggered(), 3);
+        assert_eq!(stats.count(RescanReason::Explicit), 2);
 
         let delta = stats.since(&baseline);
         assert_eq!(delta.total, 3);
-        assert_eq!(delta.count(RescanReason::Explicit), 0);
+        assert_eq!(delta.watcher_triggered(), 3);
+        assert_eq!(delta.count(RescanReason::Explicit), 1);
         assert_eq!(delta.count(RescanReason::IgnoreFileChanged), 2);
         assert_eq!(
             delta.to_string(),
-            "3 rescan(s) [ignore_file_changed=2, overflow_capacity=1]"
+            "3 rescan(s) [explicit=1, ignore_file_changed=2, overflow_capacity=1]"
         );
+        assert_eq!(joined.to_string(), "explicit, overflow_capacity");
 
         counters.reset();
         assert_eq!(counters.snapshot(), RescanStats::default());

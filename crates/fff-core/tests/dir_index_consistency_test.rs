@@ -313,7 +313,7 @@ fn empty_directory_at_scan_is_searchable_and_watched() {
 #[test]
 fn repeated_empty_directory_overflow_eventually_recovers() {
     // Each wave moves in a prepared tree that overflows the index, and one
-    // rescan recovers it. The cooldown never ends on its own: the test ends it.
+    // rescan recovers it. The interval never ends on its own: the test ends it.
     const COOLDOWN: Duration = Duration::from_secs(3600);
     const GUARD: Duration = Duration::from_secs(60);
     let tmp = TempDir::new().unwrap();
@@ -339,7 +339,9 @@ fn repeated_empty_directory_overflow_eventually_recovers() {
         fs::rename(&incoming, base.join(wave)).unwrap();
     };
 
-    // Outside a cooldown, the first rejected update starts the rescan at once.
+    // Outside the interval after a full scan, the first rejected update starts the rescan
+    // at once. The interval counts from the end of the first scan too: the test ends it.
+    picker.end_rescan_cooldown();
     let before = picker.rescan_stats();
     move_in("first");
     assert!(
@@ -352,29 +354,28 @@ fn repeated_empty_directory_overflow_eventually_recovers() {
         "the first overflow must be recovered by one rescan"
     );
 
-    // An explicit rescan settles anything the first wave left and restarts the cooldown.
+    // An explicit rescan settles anything the first wave left and restarts the interval.
     picker
         .trigger_full_rescan_async(&SharedFrecency::noop())
         .unwrap();
     assert!(picker.wait_for_indexing_complete(GUARD));
 
-    // Inside the cooldown, the second wave's rescan waits.
+    // Inside the interval, the second wave's rescan waits.
     let before = picker.rescan_stats();
     move_in("second");
+    // The walk of the new tree fills the overflow area, then asks for the rescan.
     assert!(
-        wait_until(
-            || picker.rescan_stats().count_throttled(reason) > before.count_throttled(reason),
-            GUARD
-        ),
-        "the second overflow never requested a rescan"
+        wait_until(|| covered("second") > 0, GUARD),
+        "the second wave was never walked"
     );
+    std::thread::sleep(Duration::from_millis(500));
     assert!(
         covered("second") < 1201,
-        "no rescan may run inside the cooldown"
+        "no rescan may run inside the interval"
     );
     assert_eq!(picker.rescan_stats().count(reason), before.count(reason));
 
-    // Once the cooldown ends, the deferred rescan recovers the second wave.
+    // Once the interval ends, the pending rescan recovers the second wave.
     picker.end_rescan_cooldown();
     assert!(
         wait_until(|| covered("second") == 1201, GUARD),
@@ -383,6 +384,6 @@ fn repeated_empty_directory_overflow_eventually_recovers() {
     assert_eq!(
         picker.rescan_stats().count(reason),
         before.count(reason) + 1,
-        "the deferred rescan must run once"
+        "the pending rescan must run once"
     );
 }

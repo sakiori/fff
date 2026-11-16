@@ -3,13 +3,12 @@ use crate::file_picker::{
 };
 use crate::ignore::ignored_dir_globs;
 use crate::types::FileItem;
-use crate::walk::{DirHook, WalkIgnoreRules, WalkOutput, WalkPolicy};
+use crate::walk::{WalkHooks, WalkIgnoreRules, WalkOutput, WalkPolicy};
 use parking_lot::Mutex;
 use std::borrow::Cow;
 use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::time::SystemTime;
 use zlob::walk::{WalkBuilder, WalkFlags, WalkMetadata, WalkState};
 
 const PROGRESS_STEP: usize = 13;
@@ -23,21 +22,27 @@ struct WorkerFiles {
 }
 
 #[tracing::instrument(skip_all, name = "zlob walker", level = "info")]
-pub(crate) fn walk_collect_files(
+pub(super) fn walk_files(
     base_path: &Path,
     subtree: Option<&Path>,
     is_git_repo: bool,
     policy: WalkPolicy<'_>,
     threads: usize,
     synced_files_count: &Arc<AtomicUsize>,
-    on_dir: Option<&DirHook>,
+    hooks: WalkHooks<'_>,
 ) -> crate::Result<WalkOutput> {
+    let on_dir = hooks.on_dir;
     let WalkPolicy {
         follow_symlinks,
         ignore: ignore_options,
     } = policy;
     let use_non_git_defaults = !is_git_repo && !ignore_options.disable_git;
     let mut flags = WalkFlags::GITIGNORE;
+    // An index rooted below its work tree takes the rules above it, the repository's exclude
+    // file included, as ripgrep's walker does; zlob would list nothing of a root they ignore.
+    if is_git_repo && !ignore_options.disable_git && !root_ignored(base_path) {
+        flags |= WalkFlags::GITIGNORE_PARENTS;
+    }
     if ignore_options.disable_git {
         flags |= WalkFlags::SKIP_GITIGNORE | WalkFlags::NO_GIT_EXCLUDE | WalkFlags::NO_GIT_GLOBAL;
     }
@@ -57,7 +62,9 @@ pub(crate) fn walk_collect_files(
         .options(flags)
         .threads(threads)
         // Bulk-fetch the only metadata FileItem needs; zlob never stats more.
-        .metadata(WalkMetadata::SIZE | WalkMetadata::MTIME | WalkMetadata::INODE);
+        .metadata(
+            WalkMetadata::SIZE | WalkMetadata::MTIME | WalkMetadata::CTIME | WalkMetadata::INODE,
+        );
 
     let extra_ignore = &ignore_options.extra_ignore;
     if use_non_git_defaults || !extra_ignore.is_empty() {
@@ -80,6 +87,9 @@ pub(crate) fn walk_collect_files(
         .map(|subtree| super::subtree_relative(base_path, subtree))
         .transpose()?;
     let outcome = match builder.run(|entry| {
+        if hooks.cancelled() {
+            return WalkState::Quit;
+        }
         let collected = &collected[entry.worker_id()];
         if ignore_options.disable_git && entry.path().file_name().is_some_and(|name| name == ".git")
         {
@@ -146,28 +156,19 @@ pub(crate) fn walk_collect_files(
         let is_binary = is_known_binary_extension_basename(basename)
             && (!is_ambiguous_binary_name(basename) || starts_with_binary_content(entry.path()));
 
-        let (size, modified, ino) = match target {
-            Some(meta) => (
-                meta.len(),
-                meta.modified()
-                    .ok()
-                    .and_then(|t| t.duration_since(SystemTime::UNIX_EPOCH).ok())
-                    .map_or(0, |d| d.as_secs()),
-                crate::types::inode_bits(&meta),
-            ),
-            // zlob reports mtime in ns since the Unix epoch; FileItem wants secs.
-            None => (
-                entry.size().unwrap_or(0),
-                entry
-                    .modified_ns()
-                    .map(|ns| (ns / 1_000_000_000).max(0) as u64)
-                    .unwrap_or(0),
-                entry.inode().map_or(0, |ino| ino as u32),
-            ),
+        let stat = match target {
+            Some(meta) => crate::stat::Stat::of(&meta),
+            None => stat_of_entry(&entry),
         };
 
-        let mut item = FileItem::new_raw(basename_offset as u16, size, modified, None, is_binary);
-        item.ino = ino;
+        let mut item = FileItem::new_raw(
+            basename_offset as u16,
+            stat.size,
+            stat.modified,
+            None,
+            is_binary,
+        );
+        item.set_stat(stat);
         item.mark_definition_language(basename);
 
         let mut guard = collected.lock();
@@ -202,11 +203,44 @@ pub(crate) fn walk_collect_files(
         (use_non_git_defaults || outcome.rules().is_some()).then_some(WalkIgnoreRules {
             inner: outcome,
             skip_hidden: use_non_git_defaults,
+            root: base_path.to_path_buf(),
         });
 
     Ok(WalkOutput {
         pairs,
         dirs,
         ignore_rules,
+        ignore_sources: Vec::new(),
     })
+}
+
+// As `Stat::of` reads it from a stat; zlob reports times in ns since the Unix epoch.
+fn stat_of_entry(entry: &zlob::walk::WalkEntry<'_>) -> crate::stat::Stat {
+    let modified = entry.modified_ns().unwrap_or(0);
+    let (stamp, inode) = match (cfg!(unix), entry.inode(), entry.changed_ns()) {
+        (true, Some(inode), Some(changed)) => (
+            crate::stat::stamp_of(inode, changed),
+            crate::stat::inode_of(inode),
+        ),
+        _ => (0, 0),
+    };
+    crate::stat::Stat {
+        size: entry.size().unwrap_or(0),
+        modified: (modified / 1_000_000_000).max(0) as u64,
+        nanos: modified.rem_euclid(1_000_000_000) as u32,
+        stamp,
+        inode,
+    }
+}
+
+// Whether the repository around `base_path`, which lies below its work tree, ignores it.
+fn root_ignored(base_path: &Path) -> bool {
+    let Ok(repo) = git2::Repository::discover(base_path) else {
+        return false;
+    };
+    let below = repo.workdir().is_some_and(|workdir| {
+        let workdir = crate::path_utils::canonicalize(workdir).unwrap_or(workdir.to_path_buf());
+        workdir != base_path && base_path.starts_with(&workdir)
+    });
+    below && repo.is_path_ignored(base_path) == Ok(true)
 }

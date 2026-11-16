@@ -31,14 +31,16 @@ pub enum ProgramRequest {
     IsScanning,
     /// Scan state of the index, with the files of the session's directory once it is ready.
     Progress,
-    /// Requests a rescan of the shared index, coalesced with one already running.
+    /// Requests a full rescan of the shared index. During a scan it starts one more rescan
+    /// right after that scan, which later requests join.
     Rescan,
     /// The git work tree containing the session's directory.
     Repository,
     /// Applies changes the program made to `paths`, absolute or relative to the session's
     /// directory and inside it, to the index as the watcher would, without a rescan. The
     /// reply follows once the index holds them, or, while a scan runs, once they wait to be
-    /// applied when it commits.
+    /// applied when it commits. New files past what the index takes in without a full rescan
+    /// wait for that rescan, as the watcher's do.
     Changed {
         paths: Vec<PathBuf>,
     },

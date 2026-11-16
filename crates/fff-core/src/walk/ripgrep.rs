@@ -1,6 +1,6 @@
 use crate::ignore::non_git_repo_overrides;
 use crate::types::FileItem;
-use crate::walk::{DirHook, WalkIgnoreRules, WalkOutput, WalkPolicy};
+use crate::walk::{WalkHooks, WalkIgnoreRules, WalkOutput, WalkPolicy};
 use crate::watch::is_git_file;
 use ignore::WalkBuilder;
 use std::path::Path;
@@ -10,15 +10,16 @@ use std::sync::{
 };
 
 #[tracing::instrument(skip_all, name = "ripgrep walker", level = "info")]
-pub(crate) fn walk_collect_files(
+pub(super) fn walk_files(
     base_path: &Path,
     subtree: Option<&Path>,
     is_git_repo: bool,
     policy: WalkPolicy<'_>,
     threads: usize,
     synced_files_count: &Arc<AtomicUsize>,
-    on_dir: Option<&DirHook>,
+    hooks: WalkHooks<'_>,
 ) -> crate::Result<WalkOutput> {
+    let on_dir = hooks.on_dir;
     let ignore = policy.ignore;
     if !ignore.extra_ignore.is_empty() || ignore.disable_git || ignore.disable_ignore_files {
         return Err(crate::Error::WalkFailed(
@@ -44,11 +45,18 @@ pub(crate) fn walk_collect_files(
     if let Some(subtree) = subtree {
         super::subtree_relative(base_path, subtree)?;
     }
-    if subtree.is_some() || on_dir.is_some() {
+    if subtree.is_some() || on_dir.is_some() || hooks.cancelled.is_some() {
         let subtree = subtree.map(Path::to_path_buf);
         let on_dir = on_dir.cloned();
+        let cancelled = hooks.cancelled.cloned();
         // Runs while the parent is listed, so before the entry's own directory is read.
         walk_builder.filter_entry(move |entry| {
+            if cancelled
+                .as_ref()
+                .is_some_and(|cancelled| cancelled.load(Ordering::Relaxed))
+            {
+                return false;
+            }
             let path = entry.path();
             // Descend only into the subtree and the ancestors leading to it.
             if let Some(subtree) = &subtree
@@ -77,6 +85,9 @@ pub(crate) fn walk_collect_files(
         let base_path = base_path.to_path_buf();
 
         Box::new(move |result| {
+            if hooks.cancelled() {
+                return ignore::WalkState::Quit;
+            }
             let Ok(entry) = result else {
                 return ignore::WalkState::Continue;
             };
@@ -119,6 +130,7 @@ pub(crate) fn walk_collect_files(
     Ok(WalkOutput {
         pairs,
         dirs,
+        ignore_sources: Vec::new(),
         // Ripgrep lets .ignore re-include hidden entries in a non-Git root.
         ignore_rules: (!is_git_repo).then(|| WalkIgnoreRules {
             inner: walk_builder.build_matchers().pop().expect("one walk root"),

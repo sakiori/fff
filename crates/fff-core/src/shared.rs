@@ -8,22 +8,23 @@ use crate::error::Error;
 use crate::file_picker::FilePicker;
 use crate::frecency::FrecencyTracker;
 use crate::git::GitStatusCache;
+use crate::git_dirs::RegisteredGitDir;
 use crate::git_recency;
 use crate::git_status_worker::GitStatusWorker;
 use crate::listeners::{CoverageListeners, ListenerSubscription, RefListeners, WorkTreeListeners};
 use crate::query_tracker::QueryTracker;
 use crate::rescan_stats::{RescanCounters, RescanReason, RescanStats};
-use crate::rescan_throttle::{Admission, RescanThrottle};
-use crate::scan::ScanJob;
-use crate::watch::{EventHold, WatchEvent, WatchId, WatchOptions, WatchRegistry};
+use crate::watch::{IndexWriter, Message, WatchEvent, WatchId, WatchOptions, WatchRegistry};
 use git2::Repository;
 
 /// What became of changes a program reported with [`SharedFilePicker::apply_reported_changes`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ReportedChanges {
-    /// The index holds them.
+    /// The index holds them: they were applied before the call returned. New files past what
+    /// the index takes in without a full rescan are the exception: they wait for that rescan.
     Applied,
-    /// A scan runs; it applies them once it commits.
+    /// They are pending: reported while a scan runs, the scan applies them when it publishes
+    /// its result, before [`crate::BackgroundStatus::is_scan_pending`] turns false.
     Held,
 }
 
@@ -97,11 +98,8 @@ pub struct SharedPickerInner {
     coverage: Arc<CoverageListeners>,
     repository: Arc<WorkTreeListeners>,
     refs: Arc<RefListeners>,
-    // Git dirs of repositories inside the index, with their work trees.
-    git_dirs: parking_lot::Mutex<ahash::AHashMap<PathBuf, GitDir>>,
     rescans: RescanCounters,
-    rescan_throttle: RescanThrottle,
-    held_events: EventHold,
+    writer: IndexWriter,
     git_status_paused: Arc<AtomicBool>,
 }
 
@@ -113,29 +111,10 @@ impl Default for SharedPickerInner {
             coverage: Arc::default(),
             repository: Arc::default(),
             refs: Arc::default(),
-            git_dirs: Default::default(),
             rescans: Default::default(),
-            rescan_throttle: RescanThrottle::default(),
-            held_events: EventHold::default(),
+            writer: IndexWriter::default(),
             git_status_paused: Arc::new(AtomicBool::new(false)),
         }
-    }
-}
-
-/// Outcome of a rescan request.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum RescanRequest {
-    /// Started, or queued behind the active scan.
-    Started,
-    /// Throttled; runs once the cooldown ends unless another rescan starts first.
-    Deferred,
-    /// Throttled; incremental updates remain the freshest state.
-    Dropped,
-}
-
-impl RescanRequest {
-    pub(crate) fn started(self) -> bool {
-        self == RescanRequest::Started
     }
 }
 
@@ -177,10 +156,13 @@ impl SharedFilePicker {
     /// Signal the background scan to cancel. Non-blocking: post-scan
     /// threads check this flag and bail out at their next cancellation point.
     pub fn cancel(&self) {
-        if let Ok(guard) = self.read()
-            && let Some(picker) = guard.as_ref()
-        {
+        let index = self.read().ok().and_then(|guard| {
+            let picker = guard.as_ref()?;
             picker.cancel();
+            Some(picker.signals.index_key())
+        });
+        if let Some(index) = index {
+            self.send(Message::Cancel { index });
         }
     }
 
@@ -188,24 +170,82 @@ impl SharedFilePicker {
     /// for them: each existing path is added or updated unless the index's ignore rules
     /// exclude it, each missing one is removed with any indexed files below it, and the
     /// content index follows. An index that does not follow symlinks treats a reported
-    /// symlink as removed, as its scan skips symlinks. Returns [`ReportedChanges::Held`] while a scan runs; the scan
-    /// applies them once it commits, as it does with watcher events. Applying a change the
-    /// watcher also delivers is harmless.
+    /// symlink as removed, as its scan skips symlinks. The changes are applied on the index's
+    /// writer in order with the watcher's, and the call waits for that, also from a listener
+    /// or a watch callback. While a scan runs, the writer keeps them for it and the call
+    /// returns [`ReportedChanges::Held`]. New files past what the index takes in without a
+    /// full rescan, reported one by one or below a reported directory, are not read: they wait
+    /// for the full rescan that then follows. Applying a change the watcher also delivers is
+    /// harmless.
     pub fn apply_reported_changes(
         &self,
         shared_frecency: &SharedFrecency,
         paths: Vec<PathBuf>,
     ) -> ReportedChanges {
-        if crate::watch::apply_reported_changes(self, shared_frecency, paths) {
+        if crate::watch::apply_reported_changes(self, shared_frecency.clone(), paths) {
             ReportedChanges::Applied
         } else {
             ReportedChanges::Held
         }
     }
 
-    /// Watcher events held while a scan replaces the index they would update.
-    pub(crate) fn event_hold(&self) -> &EventHold {
-        &self.0.held_events
+    /// Drops the index as setting `None` through [`Self::write`] does, but in order with what its
+    /// loop applies, and waits; the handle holds no index until a new one is created on it.
+    pub fn remove_index(&self) {
+        // Cancelled first, so the loop's work for it stops and the removal never waits it out.
+        let held = (self.read().ok())
+            .is_some_and(|guard| guard.as_ref().inspect(|picker| picker.cancel()).is_some());
+        if !held {
+            return;
+        }
+        let (removed, done) = std::sync::mpsc::channel();
+        if !self.send(Message::Remove { removed }) || done.recv().is_err() {
+            let index = self.write().ok().and_then(|mut guard| guard.take());
+            drop(index);
+        }
+    }
+
+    // Queued on the index's loop, which records them for a running scan or applies them, and
+    // answers whether it applied them. `None` without an index; no frecency uses the index's own.
+    pub(crate) fn submit_events(
+        &self,
+        frecency: Option<SharedFrecency>,
+        events: Vec<notify_debouncer_full::DebouncedEvent>,
+    ) -> Option<std::sync::mpsc::Receiver<bool>> {
+        let index = (self.read().ok())
+            .and_then(|guard| guard.as_ref().map(|picker| picker.signals.index_key()))?;
+        let (applied, done) = std::sync::mpsc::channel();
+        self.send(Message::Events {
+            index,
+            events,
+            frecency,
+            applied: Some(applied),
+        });
+        Some(done)
+    }
+
+    // Has the index's loop take a batch, as from its watcher, and waits for it.
+    #[cfg(test)]
+    pub(crate) fn feed(
+        &self,
+        frecency: Option<SharedFrecency>,
+        events: Vec<notify_debouncer_full::DebouncedEvent>,
+    ) -> bool {
+        (self.submit_events(frecency, events)).is_some_and(|done| done.recv().unwrap_or(false))
+    }
+
+    // Everything that changes the index reaches its loop through here.
+    pub(crate) fn send(&self, message: Message) -> bool {
+        self.0.writer.send(self, message)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn submit(&self, index: u64, work: crate::watch::Work) {
+        self.send(Message::Work { index, work });
+    }
+
+    pub(crate) fn rescans(&self) -> &RescanCounters {
+        &self.0.rescans
     }
 
     /// Produce a non-owning handle to the same inner picker.
@@ -226,17 +266,16 @@ impl SharedFilePicker {
     /// Block until the background filesystem scan finishes.
     /// Returns `true` if scan completed, `false` on timeout.
     pub fn wait_for_scan(&self, timeout: Duration) -> bool {
-        let signal = {
+        let signals = {
             let guard = self.0.picker.read();
             match &*guard {
-                Some(picker) => Arc::clone(&picker.signals.scanning),
+                Some(picker) => picker.scan_signals(),
                 None => return true,
             }
         };
 
-        poll_until(timeout, || {
-            !signal.load(std::sync::atomic::Ordering::Acquire)
-        })
+        // A rescan requested and not yet started counts as running.
+        poll_until(timeout, || !signals.is_scanning())
     }
 
     /// Block until the background file watcher is ready.
@@ -259,33 +298,32 @@ impl SharedFilePicker {
     /// Blocks until both the filesystem walk and post-scan indexing are done.
     /// Returns true once scanning=false AND post_scan_indexing_active=false.
     pub fn wait_for_indexing_complete(&self, timeout: Duration) -> bool {
-        let (scanning, post_scan_active) = {
+        let signals = {
             let guard = self.0.picker.read();
             match &*guard {
-                Some(picker) => (
-                    Arc::clone(&picker.signals.scanning),
-                    Arc::clone(&picker.signals.post_scan_indexing_active),
-                ),
+                Some(picker) => picker.scan_signals(),
                 None => return true,
             }
         };
 
-        poll_until(timeout, || {
-            !scanning.load(std::sync::atomic::Ordering::Acquire)
-                && !post_scan_active.load(std::sync::atomic::Ordering::Acquire)
-        })
+        let done = || {
+            !signals.is_scanning()
+                && !(signals.post_scan_indexing_active).load(std::sync::atomic::Ordering::Acquire)
+        };
+        poll_until(timeout, done)
     }
 
-    /// Trigger a full filesystem rescan without blocking the caller.
-    /// Performs a safe async rescan. Guarantees only single active rescan per picker.
-    /// If many rescans requested the last one guaranteed to be finished.
-    pub fn trigger_full_rescan_async(&self, shared_frecency: &SharedFrecency) -> Result<(), Error> {
-        self.trigger_full_rescan_with_reason(shared_frecency, RescanReason::Explicit)
-            .map(|_| ())
+    /// Trigger a full filesystem rescan without blocking the caller. It starts at once, or
+    /// right after the running scan ends; requests made meanwhile join it.
+    pub fn trigger_full_rescan_async(
+        &self,
+        _shared_frecency: &SharedFrecency,
+    ) -> Result<(), Error> {
+        self.request_full_rescan(RescanReason::Explicit, true)
     }
 
-    /// Returns admitted and throttled rescan requests by reason.
-    /// Counters start at picker creation or the last reset.
+    /// Returns the full rescans that started, and the requests that joined a pending one, by
+    /// reason. Counters start at picker creation or the last reset.
     pub fn rescan_stats(&self) -> RescanStats {
         self.0.rescans.snapshot()
     }
@@ -294,106 +332,82 @@ impl SharedFilePicker {
         self.0.rescans.reset();
     }
 
-    /// Requests a rescan. Watcher requests inside the cooldown are throttled;
-    /// see [`RescanRequest`] for what happens to them.
+    /// Requests a watcher's full rescan, after the running scan and the interval; returns whether
+    /// it started now. Waits for the index's loop to take it: never call it there.
+    #[cfg(test)]
     pub(crate) fn trigger_full_rescan_with_reason(
         &self,
-        shared_frecency: &SharedFrecency,
+        _shared_frecency: &SharedFrecency,
         reason: RescanReason,
-    ) -> Result<RescanRequest, Error> {
-        self.trigger_rescan(shared_frecency, reason, reason.defers_when_throttled())
+    ) -> Result<bool, Error> {
+        let index = self.index_key()?;
+        let (started, answer) = std::sync::mpsc::channel();
+        self.send(Message::Rescan {
+            index,
+            reason,
+            immediate: false,
+            ticket: None,
+            started: Some(started),
+        });
+        Ok(answer.recv().unwrap_or(false))
     }
 
-    /// Requests a rescan for changes the index is known to miss: inside the
-    /// cooldown it stays deferred instead of being dropped.
-    pub(crate) fn trigger_recovery_rescan(
-        &self,
-        shared_frecency: &SharedFrecency,
-        reason: RescanReason,
-    ) -> Result<RescanRequest, Error> {
-        self.trigger_rescan(shared_frecency, reason, true)
-    }
-
-    fn trigger_rescan(
-        &self,
-        shared_frecency: &SharedFrecency,
-        reason: RescanReason,
-        defers: bool,
-    ) -> Result<RescanRequest, Error> {
-        // for giant folders we have no other choice other than throttling rescans
-        // if user is running application in millions of files with a ton of rescan events
-        // we drop / throttle some of requests to avoid constant burst of IO
-        if reason == RescanReason::Explicit {
-            self.0.rescan_throttle.note_explicit_scan();
-        } else {
-            match self.admit_rescan(reason, defers) {
-                Admission::Admitted => {}
-                Admission::Deferred(_) => return Ok(RescanRequest::Deferred),
-                Admission::Dropped => return Ok(RescanRequest::Dropped),
+    // Requests are never dropped: they join the one pending full rescan (Syncthing queues at
+    // most one scan behind the running one). An immediate one counts as pending from now on.
+    fn request_full_rescan(&self, reason: RescanReason, immediate: bool) -> Result<(), Error> {
+        let (index, ticket) = {
+            let guard = self.read()?;
+            let picker = guard.as_ref().ok_or(Error::FilePickerMissing)?;
+            // A cancelled index rescans no more.
+            if picker.signals.cancelled.load(Ordering::Acquire) {
+                return Ok(());
             }
-        }
-
-        self.0.rescans.record(reason);
-
-        ScanJob::request_rescan(self, shared_frecency)?;
-        Ok(RescanRequest::Started)
-    }
-
-    fn admit_rescan(&self, reason: RescanReason, defers: bool) -> Admission {
-        let Some(cooldown) = self
-            .read()
-            .ok()
-            .and_then(|guard| guard.as_ref().map(FilePicker::rescan_cooldown))
-        else {
-            // No index left to recover.
-            self.0.rescan_throttle.cancel_deferred();
-            return Admission::Dropped;
+            let in_flight = &picker.signals.requests_in_flight;
+            let ticket = immediate.then(|| crate::scan::RequestTicket::new(in_flight));
+            (picker.signals.index_key(), ticket)
         };
-
-        let admission = if defers {
-            self.0.rescan_throttle.admit_deferring(reason, cooldown)
-        } else {
-            self.0.rescan_throttle.admit(reason, cooldown)
-        };
-        if admission != Admission::Admitted {
-            self.0.rescans.record_throttled(reason);
-            tracing::debug!(%reason, ?admission, "Rescan throttled");
-        }
-        admission
+        // A message the loop cannot take is dropped with its ticket.
+        self.send(Message::Rescan {
+            index,
+            reason,
+            immediate,
+            ticket,
+            started: None,
+        });
+        Ok(())
     }
 
-    /// When the pending deferred rescan is due, if there is one.
-    pub(crate) fn deferred_rescan_due(&self) -> Option<Instant> {
-        self.0
-            .rescan_throttle
-            .deferred()
-            .map(|deferred| deferred.due)
+    fn index_key(&self) -> Result<u64, Error> {
+        let guard = self.read()?;
+        let picker = guard.as_ref().ok_or(Error::FilePickerMissing)?;
+        Ok(picker.signals.index_key())
     }
 
-    /// The reason of a deferred rescan whose cooldown has passed.
-    pub(crate) fn due_deferred_rescan(&self) -> Option<RescanReason> {
-        self.0
-            .rescan_throttle
-            .deferred()
-            .filter(|deferred| deferred.due <= Instant::now())
-            .map(|deferred| deferred.reason)
+    // When the loop starts the pending full rescan: `None` while a scan runs, whose end starts
+    // it, while none is pending, or once the index is cancelled.
+    #[cfg(test)]
+    pub(crate) fn next_rescan_due(&self) -> Option<Instant> {
+        let (due, answer) = std::sync::mpsc::channel();
+        self.send(Message::Due(due));
+        answer.recv().ok().flatten()
     }
 
-    /// Test control: ends the rescan cooldown, so a deferred rescan runs now
-    /// instead of when the cooldown would have ended. Debug builds only.
+    #[cfg(test)]
+    pub(crate) fn wake_writer(&self) {
+        self.send(Message::Wake);
+    }
+
+    /// Test control: ends the interval after the last full scan, so a pending rescan the
+    /// watcher requested starts now. Debug builds only.
     #[cfg(debug_assertions)]
     #[doc(hidden)]
     pub fn end_rescan_cooldown(&self) {
-        self.0.rescan_throttle.end_cooldown();
-        if let Ok(guard) = self.read()
-            && let Some(watcher) = guard.as_ref().and_then(|p| p.background_watcher.as_ref())
-        {
-            watcher.wake_for_deferred_rescan();
-        }
-    }
-
-    pub(crate) fn cancel_deferred_rescan(&self) {
-        self.0.rescan_throttle.cancel_deferred();
+        let Ok(index) = self.index_key() else {
+            return;
+        };
+        let (done, ended) = std::sync::mpsc::channel();
+        self.send(Message::EndInterval { index, done });
+        let _ = ended.recv();
     }
 
     /// Subscribe to filesystem changes matching `pattern`.
@@ -435,11 +449,12 @@ impl SharedFilePicker {
         let (base_path, has_watcher, watcher_ready) = {
             let guard = self.read()?;
             let picker = guard.as_ref().ok_or(Error::FilePickerMissing)?;
-
+            // While a lost watcher is replaced, the rebuild's rescan event covers the gap.
+            let published = picker.signals.watcher();
             (
                 picker.base_path().to_path_buf(),
                 picker.has_watcher(),
-                picker.is_watcher_ready(),
+                published.accepts_watches(),
             )
         };
 
@@ -488,59 +503,42 @@ impl SharedFilePicker {
 
     pub(crate) fn rebase_watches(&self, base_path: &Path) {
         self.0.watchers.rebase(base_path);
-        self.0.git_dirs.lock().clear();
     }
 
-    // Returns false when `git_dir` was known already as the directory it is now; true for a
-    // new one and for one removed and created again since, also within one batch.
+    // What the installed watcher watches, to use once the picker lock is released.
+    pub(crate) fn installed_watches(&self) -> Option<Arc<crate::watch::Watches>> {
+        let guard = self.read().ok()?;
+        Some(guard.as_ref()?.background_watcher.as_ref()?.watches())
+    }
+
+    // The git dirs the installed watcher watches; none while no watcher is installed.
+    fn git_dirs(&self) -> Option<Arc<crate::git_dirs::GitDirs>> {
+        Some(Arc::clone(&self.installed_watches()?.git_dirs))
+    }
+
     pub(crate) fn register_git_dir(&self, git_dir: &Path, work_tree: &Path) -> bool {
-        let identity = dir_identity(git_dir);
-        let common_dir = crate::watch::common_dir_of(git_dir);
-        let known = self.0.git_dirs.lock().insert(
-            git_dir.to_path_buf(),
-            GitDir {
-                work_tree: work_tree.to_path_buf(),
-                common_dir,
-                identity,
-            },
-        );
-        known.is_none_or(|known| known.identity != identity || identity.is_none())
+        self.git_dirs()
+            .is_some_and(|git_dirs| git_dirs.register(git_dir, work_tree))
     }
 
-    // Forgets the git dirs of repositories at or below a removed `path`, so that one created
-    // there again is recorded and watched anew: the old watches went with it. The removal
-    // decides, also when the path is back by the time the batch is read, as a file system
-    // may give the new directory the old one's inode.
     pub(crate) fn forget_git_dirs_under(&self, path: &Path) {
-        self.0.git_dirs.lock().retain(|git_dir, known| {
-            !git_dir.starts_with(path) && !known.work_tree.starts_with(path)
-        });
+        if let Some(git_dirs) = self.git_dirs() {
+            git_dirs.forget_under(path);
+        }
     }
 
-    // The registered git dir holding `path`, with its work tree.
     pub(crate) fn registered_git_dir(&self, path: &Path) -> Option<(PathBuf, PathBuf)> {
-        let git_dirs = self.0.git_dirs.lock();
-        path.ancestors().skip(1).find_map(|dir| {
-            git_dirs
-                .get(dir)
-                .map(|known| (dir.to_path_buf(), known.work_tree.clone()))
-        })
+        self.git_dirs()?.holding(path)
     }
 
-    // Every registered git dir with its work tree and common dir.
     pub(crate) fn registered_git_dirs(&self) -> Vec<RegisteredGitDir> {
-        (self.0.git_dirs.lock().iter())
-            .map(|(git_dir, known)| RegisteredGitDir {
-                git_dir: git_dir.clone(),
-                work_tree: known.work_tree.clone(),
-                common_dir: known.common_dir.clone(),
-            })
-            .collect()
+        self.git_dirs()
+            .map(|git_dirs| git_dirs.all())
+            .unwrap_or_default()
     }
 
-    // The work tree of the registered git dir `git_dir` itself.
     pub(crate) fn registered_work_tree(&self, git_dir: &Path) -> Option<PathBuf> {
-        (self.0.git_dirs.lock().get(git_dir)).map(|known| known.work_tree.clone())
+        self.git_dirs()?.work_tree(git_dir)
     }
 
     pub(crate) fn watch_registry(&self) -> &Arc<WatchRegistry> {
@@ -548,7 +546,8 @@ impl SharedFilePicker {
     }
 
     /// Calls `listener` whenever the set of live indexed directories changes: a scan
-    /// result is installed, or the watcher adds, restores or removes directories.
+    /// result is installed, the watcher adds, restores or removes directories, or the
+    /// index reads ignore rules again after an ignore file changed.
     /// The listener may run while the picker lock is held: it must return promptly
     /// and must not access this picker. Dropping the subscription removes it.
     pub fn subscribe_coverage(
@@ -562,9 +561,12 @@ impl SharedFilePicker {
     /// its git state that affects file status: the index, HEAD, its log or an operation in
     /// progress such as a merge. The work tree is the index's own repository's or that of a
     /// repository nested in the index, which is also announced once it is first watched.
-    /// Files under `.git` are never watch events. The listener runs on the watcher's or a
-    /// scan's thread: it must return promptly and must not access this picker. Dropping the
-    /// subscription removes it.
+    /// Files under `.git` are never watch events. Listeners run in order on the thread that
+    /// calls the watch callbacks, never on one the index waits for: one may use this picker
+    /// and report changes, while a slow one delays later notifications and watch events.
+    /// Dropping the last handle of the picker, or replacing its index, waits for the
+    /// notifications already queued and the one running, so do neither while holding a lock
+    /// a listener takes. Dropping the subscription removes it.
     pub fn subscribe_repository_state(
         &self,
         listener: impl Fn(&Path) + Send + Sync + 'static,
@@ -575,7 +577,10 @@ impl SharedFilePicker {
     // Git spells a work tree with a trailing separator; listeners hear one spelling.
     pub(crate) fn notify_repository_change(&self, work_tree: &Path) {
         let work_tree: PathBuf = work_tree.components().collect();
-        self.0.repository.notify(&work_tree);
+        #[cfg(test)]
+        crate::watch::repository_told(&work_tree);
+        let listeners = Arc::clone(&self.0.repository);
+        (self.0.watchers).notify_listeners(move || listeners.notify(&work_tree));
     }
 
     /// Calls `listener` with the root of a git work tree inside `scope` or containing it when
@@ -589,8 +594,8 @@ impl SharedFilePicker {
     /// [`Self::subscribe_repository_state`] names. The watcher watches the refs of the
     /// repositories related to a listener's scope only while one is subscribed, from before
     /// this returns. This and dropping the subscription change the watcher's watches, so call
-    /// them off async executors. The listener runs on the watcher's thread: it must return
-    /// promptly and must not access this picker.
+    /// them off async executors. Listeners run as those of
+    /// [`Self::subscribe_repository_state`] do.
     pub fn subscribe_ref_changes(
         &self,
         scope: &Path,
@@ -616,29 +621,37 @@ impl SharedFilePicker {
     // Git spells a work tree with a trailing separator; listeners hear one spelling.
     pub(crate) fn notify_ref_change(&self, work_tree: &Path) {
         let work_tree: PathBuf = work_tree.components().collect();
-        self.0
-            .refs
-            .notify_where(&work_tree, |scope| related(scope, &work_tree));
+        #[cfg(test)]
+        crate::watch::ref_told(&work_tree);
+        let listeners = Arc::clone(&self.0.refs);
+        (self.0.watchers).notify_listeners(move || {
+            listeners.notify_where(&work_tree, |scope| related(scope, &work_tree));
+        });
     }
 
     // Tells the ref listeners of `work_tree` whose scope is not related to `moved` of its HEAD.
     pub(crate) fn notify_head_beside(&self, moved: &Path, work_tree: &Path) {
         let moved: PathBuf = moved.components().collect();
         let work_tree: PathBuf = work_tree.components().collect();
-        self.0.refs.notify_where(&work_tree, |scope| {
-            related(scope, &work_tree) && !related(scope, &moved)
+        let listeners = Arc::clone(&self.0.refs);
+        (self.0.watchers).notify_listeners(move || {
+            listeners.notify_where(&work_tree, |scope| {
+                related(scope, &work_tree) && !related(scope, &moved)
+            });
         });
     }
 
-    // Brings the watcher's ref watches in line with the ref listeners, outside the picker lock.
+    // Has the watcher's owner thread bring its ref watches in line with the ref listeners, and
+    // waits for it outside the picker lock.
     fn sync_ref_watches(&self) {
-        let watches = self.read().ok().and_then(|guard| {
+        let (done, followed) = std::sync::mpsc::channel();
+        let sent = self.read().ok().is_some_and(|guard| {
             (guard.as_ref())
                 .and_then(|picker| picker.background_watcher.as_ref())
-                .map(crate::watch::BackgroundWatcher::watches)
+                .is_some_and(|watcher| watcher.follow_refs(done))
         });
-        if let Some(watches) = watches {
-            watches.sync_refs(self);
+        if sent {
+            let _ = followed.recv();
         }
     }
 
@@ -889,45 +902,7 @@ pub type SharedFrecency = SharedDb<FrecencyTracker>;
 /// Thread-safe shared handle to the [`QueryTracker`] instance.
 pub type SharedQueryTracker = SharedDb<QueryTracker>;
 
-// A git dir the index registered, with its work tree and the common dir holding its refs.
-pub(crate) struct RegisteredGitDir {
-    pub(crate) git_dir: PathBuf,
-    pub(crate) work_tree: PathBuf,
-    pub(crate) common_dir: PathBuf,
-}
-
 // Whether a ref listener of `scope` hears `work_tree`: one inside it or containing it.
 pub(crate) fn related(scope: &Path, work_tree: &Path) -> bool {
     work_tree.starts_with(scope) || scope.starts_with(work_tree)
-}
-
-// A recorded git dir: its work tree, the common dir holding its refs, and which directory
-// it was when recorded.
-pub(crate) struct GitDir {
-    work_tree: PathBuf,
-    common_dir: PathBuf,
-    identity: Option<DirIdentity>,
-}
-
-// What tells a directory from one created at the same path later: a file system may give
-// the new one the inode the old one freed, but not its birth time, where it records one.
-#[derive(Clone, Copy, PartialEq, Eq)]
-struct DirIdentity {
-    file: (u64, u64),
-    born: Option<std::time::SystemTime>,
-}
-
-fn dir_identity(path: &Path) -> Option<DirIdentity> {
-    let metadata = std::fs::metadata(path).ok()?;
-    #[cfg(unix)]
-    let file = {
-        use std::os::unix::fs::MetadataExt;
-        (metadata.dev(), metadata.ino())
-    };
-    #[cfg(not(unix))]
-    let file = (0, 0);
-    Some(DirIdentity {
-        file,
-        born: metadata.created().ok(),
-    })
 }

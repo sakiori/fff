@@ -299,8 +299,12 @@ export interface ScanProgress {
  * Normalized watch event kind.
  * A file removed and recreated in one processed batch is marked as modified.
  *
- * rescan = internal OS buffers were overloaded, some events might be missing.
- * The `path` is going to be a folder needs to be rescanned
+ * rescan = a full rescan rebuilt the index, which holds the rebuilt state when
+ * the event arrives, or a subscription fell behind, reconnected or moved to
+ * another index, so changes were not reported one by one; re-stat what you care
+ * about. Every full rescan sends one, whoever asked for it; an index's first
+ * scan sends none. The `path` is the watched directory. Events the watcher lost
+ * are recovered and reported as individual changes.
  *
  * renamed = the file was moved to the other path without changing the content
  */
@@ -308,7 +312,7 @@ export type WatchEventKind = "created" | "modified" | "removed" | "rescan" | "re
 
 /** A single filesystem change notification. */
 export interface WatchEvent {
-  /** Absolute path of the affected file (base path to rescan if `kind == rescan`) */
+  /** Absolute path of the affected file (the watched directory if `kind == rescan`) */
   path: string;
   kind: WatchEventKind;
   /** Absolute path the file moved from. Only set when `kind == "renamed"`. */

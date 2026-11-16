@@ -64,7 +64,10 @@ pub(crate) struct GitEvents {
 }
 
 /// A single watch event. `kind`: 0 = created, 1 = modified, 2 = removed,
-/// 3 = rescan (events were lost; re-stat what you care about),
+/// 3 = rescan (a full rescan rebuilt the index, which holds the rebuilt state
+/// when the event arrives, or a service-backed subscription fell behind,
+/// reconnected or moved to another index, so changes were not reported one by
+/// one; re-stat what you care about),
 /// 4 = renamed (`path` is the destination; read the source with
 /// `fff_watch_events_get_from_path`), 5 = repository (only when requested,
 /// see [`FffWatchOptions::repository`]), 6 = failed and 7 = ready (service-backed
@@ -471,9 +474,12 @@ pub unsafe extern "C" fn fff_watch_events_get_from_path(
 
 /// Kind of event `index` (0 = created, 1 = modified, 2 = removed, 3 = rescan,
 /// 4 = renamed, 5 = repository, 6 = failed, 7 = ready, 8 = refs).
-/// 3 (rescan aka "re-stat something" kind) returned when OS based buffer
-/// has been overflown and some events might be loss. Paths will contain a list of
-/// directories that needs to be rescanned to ensure consistency.
+/// 3 (rescan) is returned once a full rescan rebuilt the index, or when a
+/// service-backed subscription fell behind, reconnected or moved to another
+/// index, so changes were not reported one by one. Every full rescan sends one,
+/// whoever asked for it; an index's first scan sends none. `path` is the watched
+/// directory. Events the watcher lost are recovered and reported as individual
+/// changes.
 /// 4 reports a move: `path` is the destination and
 /// `fff_watch_events_get_from_path` yields the source.
 /// 5 names the work tree whose git state changed, and 8 one whose refs changed, for

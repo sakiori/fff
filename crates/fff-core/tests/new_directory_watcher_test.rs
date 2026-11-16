@@ -5,12 +5,12 @@
 //!   1. The watcher starts with watches on directories discovered during the
 //!      initial scan.
 //!   2. A brand-new subdirectory is created at runtime (after the scan).
-//!   3. The watcher's event handler detects the directory Create event,
-//!      collects it, and sends it to the owner thread via `watch_tx`.
-//!   4. The owner thread adds a NonRecursive watch on the new directory and
-//!      walks its subtree (`index_new_directory`) to inject files that
-//!      already exist (race-window + burst/mv-in coverage) and to watch
-//!      nested subdirectories.
+//!   3. The watcher's event handler hands the directory Create event to the
+//!      index's loop.
+//!   4. The loop adds a NonRecursive watch on the new directory and on each
+//!      one below it before reading it, and walks its subtree to index files
+//!      that already exist (race-window + burst/mv-in coverage), in the same
+//!      update as the rest of the batch.
 //!   5. Files created *after* the watch is established are picked up via
 //!      normal event delivery.
 //!

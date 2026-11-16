@@ -835,9 +835,10 @@ fn test_grep_no_duplicates_with_overflow_trailing_bits() {
     );
 
     if let Some(overlay) = picker.bigram_overlay() {
-        overlay
-            .write()
-            .modify_file(overflow_abs, b"overflow unicorn entry");
+        overlay.write().modify_file_bigrams(
+            overflow_abs,
+            crate::index::bigram_filter::extract_bigrams(b"overflow unicorn entry"),
+        );
     }
 
     // Run a grep for "unicorn": six files match

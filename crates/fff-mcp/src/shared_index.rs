@@ -35,8 +35,6 @@ pub(crate) struct Index {
     frecency: SharedFrecency,
     background: BackgroundStatus,
     ready: tokio::sync::watch::Sender<bool>,
-    // Marked after each rescan a program requests.
-    rescans: tokio::sync::watch::Sender<()>,
     _coverage: ListenerSubscription,
 }
 
@@ -111,7 +109,6 @@ impl Index {
             frecency,
             background,
             ready: tokio::sync::watch::Sender::new(false),
-            rescans: tokio::sync::watch::Sender::new(()),
             _coverage: coverage,
         }))
     }
@@ -138,7 +135,7 @@ impl Index {
         self.background.scanned_files()
     }
 
-    // Starts a full rescan, coalesced with one already running.
+    // Starts a full rescan; during a scan, one more right after it, which later requests join.
     pub fn rescan(&self) -> Result<(), ServiceError> {
         self.picker
             .trigger_full_rescan_async(&self.frecency)
@@ -146,14 +143,7 @@ impl Index {
                 root: self.root.clone(),
                 reason: error.to_string(),
             })?;
-        self.rescans.send_replace(());
         Ok(())
-    }
-
-    // Changes after each rescan a program requests; the watcher's own rescans reach watch
-    // subscribers through the core.
-    pub fn rescans(&self) -> tokio::sync::watch::Receiver<()> {
-        self.rescans.subscribe()
     }
 
     // Applies changes a program reports to the index as the watcher would.

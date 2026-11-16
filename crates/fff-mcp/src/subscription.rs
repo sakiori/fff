@@ -48,10 +48,10 @@ pub(crate) async fn serve(
     let mut rebindings = session.rebindings();
     rebindings.borrow_and_update();
     // The binding is not held beyond this, so the index is released when the session moves.
-    let (mut core, mut rescans) = {
+    let mut core = {
         let binding = session.snapshot();
         match Core::open(&binding, &session.scope, &request, &queue, 0).await {
-            Ok(core) => (core, binding.index.rescans()),
+            Ok(core) => core,
             Err(error) => return send_message(&mut send, &Reply::Error { error }).await,
         }
     };
@@ -63,7 +63,6 @@ pub(crate) async fn serve(
         tokio::select! {
             () = closed(&mut recv) => break Ok(()),
             written = &mut writer => break written.map_err(io::Error::other).and_then(|r| r),
-            _ = rescans.changed(), if !failed => queue.lose(),
             _ = health.tick(), if !failed => {
                 if let Some(error) = failure(&session) {
                     failed = true;
@@ -76,10 +75,7 @@ pub(crate) async fn serve(
                 // index's callbacks, also one running now, queue nothing after the rescan.
                 let epoch = queue.move_on();
                 match Core::open(&binding, &session.scope, &request, &queue, epoch).await {
-                    Ok(moved) => {
-                        core = moved;
-                        rescans = binding.index.rescans();
-                    }
+                    Ok(moved) => core = moved,
                     Err(error) => {
                         failed = true;
                         queue.fail(error);
@@ -339,16 +335,6 @@ impl Queue {
         if pushed {
             self.ready.notify_one();
         }
-    }
-
-    fn lose(&self) {
-        let mut state = self.state.lock();
-        if state.closed {
-            return;
-        }
-        state.lose();
-        drop(state);
-        self.ready.notify_one();
     }
 
     // The subscription moves to another index: a rescan replaces what came before, and only

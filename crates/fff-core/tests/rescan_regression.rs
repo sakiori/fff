@@ -171,27 +171,27 @@ fn npm_install_style_churn_does_not_rescan() {
 }
 
 #[test]
-fn a_churning_root_is_capped_at_one_rescan_per_cooldown() {
+fn a_churning_root_ignore_file_never_rescans() {
     let repo = WatchedRepo::new(|base| {
+        git(base, &["init", "-b", "main"]);
         write(base, "src/main.rs", "fn main() {}");
+        write(base, "docs/guide.md", "guide");
     });
 
-    // Root ignore changes force watcher rescan requests.
+    // Each change of the root rules reconciles the root; none rescans it.
     for round in 0..25 {
         repo.write(".gitignore", &format!("target/\n# round {round}\n"));
         std::thread::sleep(Duration::from_millis(120));
     }
+    repo.write(".gitignore", "target/\ndocs/\n");
     repo.settle();
 
-    let stats = repo.rescans();
+    repo.assert_quiet("25 changes of the root ignore file");
     assert!(
-        stats.total <= 1,
-        "a churning root must not exceed one walk per cooldown, got {stats}"
+        wait_until(|| !repo.is_indexed("docs/guide.md")),
+        "the last root rules apply"
     );
-    assert!(
-        stats.throttled > 0,
-        "the suppressed triggers must be recorded, got {stats}"
-    );
+    assert!(repo.is_indexed("src/main.rs"));
 }
 
 struct WatchedRepo {
@@ -340,4 +340,15 @@ fn git(dir: &Path, args: &[&str]) {
         "git {args:?} failed: {}",
         String::from_utf8_lossy(&out.stderr)
     );
+}
+
+fn wait_until(mut done: impl FnMut() -> bool) -> bool {
+    let deadline = std::time::Instant::now() + Duration::from_secs(20);
+    while !done() {
+        if std::time::Instant::now() >= deadline {
+            return false;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    true
 }

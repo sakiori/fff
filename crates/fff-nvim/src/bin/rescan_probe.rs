@@ -71,12 +71,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             for reason in RescanReason::ALL {
                 for _ in 0..delta.count(reason) {
                     println!(
-                        "[{now:>8.2}s] request   {reason:<21} files={files} overflow={overflow}"
+                        "[{now:>8.2}s] rescan    {reason:<21} files={files} overflow={overflow}"
                     );
                 }
-                let suppressed = delta.count_throttled(reason);
-                if suppressed > 0 {
-                    println!("[{now:>8.2}s] throttled {reason:<21} x{suppressed}");
+                let joined = delta.count_throttled(reason);
+                if joined > 0 {
+                    println!("[{now:>8.2}s] pending   {reason:<21} x{joined}");
                 }
             }
             last = stats;
@@ -93,7 +93,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("{stats}");
     if stats.watcher_triggered() > 0 {
         println!(
-            "{:.1} watcher rescan requests/minute",
+            "{:.1} watcher rescans/minute",
             stats.watcher_triggered() as f64 / elapsed.as_secs_f64().max(1.0) * 60.0
         );
     } else {
@@ -101,9 +101,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     if stats.throttled > 0 {
         println!(
-            "{} additional request(s) were throttled; {} total requests observed",
-            stats.throttled,
-            stats.total + stats.throttled
+            "{} request(s) joined a pending rescan instead of starting one",
+            stats.throttled
         );
     }
 

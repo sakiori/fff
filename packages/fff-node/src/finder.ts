@@ -537,7 +537,8 @@ export class FileFinder {
   }
 
   /**
-   * Trigger a rescan of the shared index, coalesced with one already running.
+   * Trigger a full rescan of the shared index. During a scan it starts one more
+   * rescan right after that scan, which later requests join.
    *
    * This is useful after major file system changes that the
    * background watcher might have missed.
@@ -556,9 +557,10 @@ export class FileFinder {
    * updated when it exists and the index does not ignore it, and removed, with
    * any indexed files below it, when it does not exist; the content index
    * follows. A symlink is not added unless the index follows symlinks, as its
-   * scan would not add it either. Report files rather than new directories: an index without a
-   * watcher does not walk a reported directory. Changes the watcher also
-   * delivers are applied once more, harmlessly. While the index scans, the
+   * scan would not add it either. A reported directory the index does not hold
+   * yet is walked at once, its files included. New files past what the index
+   * takes in without a full rescan wait for that rescan. Changes the watcher
+   * also delivers are applied once more, harmlessly. While the index scans, the
    * changes are applied when the scan commits.
    *
    * @param paths - Files the program wrote, created, renamed or deleted

@@ -37,8 +37,9 @@ use crate::git_recency::{self, GitRecencyConfig};
 use crate::grep::{GrepResult, GrepSearchOptions, grep_search, multi_grep_search};
 use crate::index::{BigramFilter, BigramOverlay};
 use crate::listeners::CoverageListeners;
+use crate::prepared_file::{Prepared, PreparedFile, RecordSlot};
 use crate::query_tracker::QueryTracker;
-use crate::scan::{ScanConfig, ScanJob, ScanSignals};
+use crate::scan::{ScanConfig, ScanSignals};
 use crate::scope::{ResolvedScope, ScopeBase, ScopeCache, SearchScope};
 use crate::score::{
     fuzzy_match_and_score_dirs, fuzzy_match_and_score_files, fuzzy_match_byte_offsets_for_page,
@@ -138,7 +139,10 @@ pub(crate) struct FileSync {
     /// the arena alive while iterating file paths.
     chunked_paths: Option<Arc<crate::simd_path::ChunkedPathStore>>,
     // The watcher reuses these rules to filter filesystem events.
-    pub(crate) ignore_rules: Option<Arc<crate::walk::WalkIgnoreRules>>,
+    pub(crate) ignore_rules: Arc<crate::walk::IgnoreRules>,
+    // What each ignore file held when its rules were read, by absolute path.
+    ignore_sources: AHashMap<PathBuf, crate::walk::IgnoreSource>,
+    // Entries a reconcile reads again although their identity matches.
     /// Search scopes resolved against this scan's layout.
     scopes: ScopeCache,
 }
@@ -159,7 +163,8 @@ impl FileSync {
             bigram_index: None,
             bigram_overlay: None,
             chunked_paths: None,
-            ignore_rules: None,
+            ignore_rules: Arc::default(),
+            ignore_sources: AHashMap::new(),
             scopes: ScopeCache::default(),
         }
     }
@@ -545,7 +550,7 @@ impl FileItem {
     /// Create a FileItem using pre-fetched metadata to avoid a redundant stat syscall.
     /// Returns `(FileItem, relative_path)`. The FileItem's `path` field is
     /// empty; callers must populate it via `set_path` or `build_chunked_path_store_and_assign`.
-    fn new_with_metadata(
+    pub(crate) fn new_with_metadata(
         path: PathBuf,
         base_path: &Path,
         git_status: Option<Status>,
@@ -578,7 +583,9 @@ impl FileItem {
             .unwrap_or(0) as u16;
 
         let mut item = Self::new_raw(filename_start, size, modified, git_status, is_binary);
-        item.ino = metadata.map_or(0, crate::types::inode_bits);
+        if let Some(metadata) = metadata {
+            item.set_stat(crate::stat::Stat::of(metadata));
+        }
         item.mark_definition_language(&relative_path);
         (item, relative_path)
     }
@@ -609,7 +616,9 @@ impl FileItem {
 
         let (mut item, rel) =
             Self::new_from_walk_parts(path, base_path, git_status, size, modified);
-        item.ino = metadata.map_or(0, crate::types::inode_bits);
+        if let Some(metadata) = metadata {
+            item.set_stat(crate::stat::Stat::of(metadata));
+        }
         (item, rel)
     }
 
@@ -723,8 +732,8 @@ pub struct FilePickerOptions {
     /// Ranking boost for files that participated in recent commits of the
     /// current branch. Enabled with default limits unless overridden.
     pub git_recency: GitRecencyConfig,
-    /// Minimum delay between watcher-initiated rescans. `None` derives it from
-    /// the index size.
+    /// Least time from the end of a full scan to a full rescan the watcher requests.
+    /// `None` derives it from the index size.
     pub rescan_cooldown: Option<std::time::Duration>,
 }
 
@@ -757,14 +766,20 @@ pub struct FilePickerIgnoreOptions {
     pub disable_ignore_files: bool,
 }
 
+// Hears each file a removal tombstones, with the entry it had.
+type OnRemoved<'a> = dyn FnMut(&Path, &FileItem) + 'a;
+
 pub struct FilePicker {
     pub mode: FFFMode,
     pub base_path: PathBuf,
     sync_data: FileSync,
-    sync_generation: u64,
     coverage: Arc<CoverageListeners>,
     pub(crate) signals: ScanSignals,
     pub(crate) background_watcher: Option<BackgroundWatcher>,
+    // Set once the watcher is stopped: no scan of the index installs one again.
+    watcher_stopped: bool,
+    // The frecency handle the index was created with; its own rescans read scores from it.
+    pub(crate) frecency: SharedFrecency,
     /// Single serialized writer for all git-status updates (scan, watcher,
     /// FFI). Owned by the picker so it exists before the first scan; its
     /// consumer thread is spawned lazily once a git workdir is discovered.
@@ -790,10 +805,7 @@ impl std::fmt::Debug for FilePicker {
         f.debug_struct("FilePicker")
             .field("base_path", &self.base_path)
             .field("sync_data", &self.sync_data)
-            .field(
-                "is_scanning",
-                &self.signals.scanning.load(Ordering::Relaxed),
-            )
+            .field("is_scanning", &self.signals.is_scanning())
             .field(
                 "scanned_files_count",
                 &self.scanned_files_count.load(Ordering::Relaxed),
@@ -837,12 +849,41 @@ impl FilePicker {
         self.sync_data.git.is_some()
     }
 
-    /// Ignore rules the walker assembled during the last scan (zlob backend
-    /// only). The background watcher uses these to filter events without
-    /// libgit2. `None` when the backend doesn't surface rules or no ignore
-    /// files were present.
-    pub(crate) fn ignore_rules(&self) -> Option<Arc<crate::walk::WalkIgnoreRules>> {
-        self.sync_data.ignore_rules.clone()
+    // The last scan's ignore rules and those of subtrees walked again since; the watcher filters
+    // events with them, and where they hold none libgit2 or the non-git defaults decide.
+    pub(crate) fn ignore_rules(&self) -> Arc<crate::walk::IgnoreRules> {
+        Arc::clone(&self.sync_data.ignore_rules)
+    }
+
+    // What the ignore file at `path` held when its current rules were read.
+    pub(crate) fn ignore_source(&self, path: &Path) -> Option<crate::walk::IgnoreSource> {
+        self.sync_data.ignore_sources.get(path).copied()
+    }
+
+    // A walk of `dir` read its ignore files anew: its rules replace those below `dir`. With no
+    // ignore file at or below `dir`, then or now, the rules above decide alike unless `forced`.
+    pub(crate) fn replace_ignore_rules(
+        &mut self,
+        dir: &Path,
+        rules: Option<crate::walk::WalkIgnoreRules>,
+        sources: Vec<(PathBuf, crate::walk::IgnoreSource)>,
+        forced: bool,
+    ) {
+        let Ok(relative) = dir.strip_prefix(&self.base_path) else {
+            return;
+        };
+        let sources_of = &mut self.sync_data.ignore_sources;
+        let known = sources_of.keys().any(|path| path.starts_with(dir))
+            || self.sync_data.ignore_rules.has_layer_within(relative);
+        if !forced && !known && sources.is_empty() {
+            return;
+        }
+        sources_of.retain(|path, _| !path.starts_with(dir));
+        Arc::make_mut(&mut self.sync_data.ignore_rules).replace_subtree(relative, rules);
+        let sources_of = &mut self.sync_data.ignore_sources;
+        sources_of.extend(sources);
+        // What the index holds below its directories follows the rules.
+        self.coverage.notify(&());
     }
 
     pub fn has_mmap_cache(&self) -> bool {
@@ -882,9 +923,14 @@ impl FilePicker {
         self.git_recency_config
     }
 
+    #[cfg(test)]
+    pub(crate) fn set_rescan_cooldown(&mut self, interval: std::time::Duration) {
+        self.rescan_cooldown = Some(interval);
+    }
+
     pub(crate) fn rescan_cooldown(&self) -> std::time::Duration {
         self.rescan_cooldown.unwrap_or_else(|| {
-            crate::rescan_throttle::rescan_cooldown(self.live_file_count(), self.has_git_repo())
+            crate::rescan_schedule::rescan_interval(self.live_file_count(), self.has_git_repo())
         })
     }
 
@@ -1040,6 +1086,8 @@ impl FilePicker {
 
         Ok(FilePicker {
             background_watcher: None,
+            watcher_stopped: false,
+            frecency: SharedFrecency::noop(),
             git_status_worker: crate::git_status_worker::GitStatusWorker::new(),
             base_path: path,
             cache_budget: Arc::new(initial_budget),
@@ -1048,7 +1096,6 @@ impl FilePicker {
             mode: options.mode,
             scanned_files_count: Arc::new(AtomicUsize::new(0)),
             sync_data: FileSync::new(),
-            sync_generation: next_sync_generation(),
             coverage: Arc::default(),
             enable_mmap_cache: options.enable_mmap_cache,
             enable_content_indexing: options.enable_content_indexing,
@@ -1105,6 +1152,7 @@ impl FilePicker {
         }
 
         let mut picker = Self::new_with_ignore_options(options, ignore_options.clone())?;
+        picker.frecency = shared_frecency.clone();
         picker.coverage = Arc::clone(shared_picker.coverage_listeners());
         picker.git_status_worker = crate::git_status_worker::GitStatusWorker::with_pause_flag(
             shared_picker.git_status_pause_flag(),
@@ -1118,66 +1166,38 @@ impl FilePicker {
             picker.mode,
         );
 
-        let warmup = picker.enable_mmap_cache;
-        let content_indexing = picker.enable_content_indexing;
-        let watch = picker.watch;
-        let mode = picker.mode;
-        let follow_symlinks = picker.follow_symlinks;
-        let enable_fs_root_scanning = picker.enable_fs_root_scanning;
-        let enable_home_dir_scanning = picker.enable_home_dir_scanning;
-
-        let signals = picker.scan_signals();
-        let scanned_files_counter = picker.scanned_files_counter();
+        let config = ScanConfig {
+            warmup: picker.enable_mmap_cache,
+            content_indexing: picker.enable_content_indexing,
+            watch: picker.watch,
+            auto_cache_budget: true,
+            install_watcher: true,
+            follow_symlinks: picker.follow_symlinks,
+            ignore_options,
+            enable_fs_root_scanning: picker.enable_fs_root_scanning,
+            enable_home_dir_scanning: picker.enable_home_dir_scanning,
+        };
         let path = picker.base_path.clone();
-        let trace_span = picker.trace_span.clone();
-
-        // Pre-arm `scanning` BEFORE publishing the new picker. `ScanJob::spawn`
-        // also sets it, but that runs after this function returns; consumers
-        // (e.g. lua `wait_for_initial_scan` after `restart_index_in_path`)
-        // that grab the signal Arc between publish and spawn would otherwise
-        // observe scanning=false and skip the wait, racing the walker. The
-        // race is wide on Windows CI where notify is slow.
-        signals
-            .scanning
-            .store(true, std::sync::atomic::Ordering::Release);
-        // The initial scan owns the new picker's single scan job from the start.
-        signals
-            .scan_job_running
-            .store(true, std::sync::atomic::Ordering::SeqCst);
 
         // Update the watch base before publishing the new picker.
         shared_picker.rebase_watches(&path);
-        // A rescan deferred for the previous index has nothing left to recover.
-        shared_picker.cancel_deferred_rescan();
-
-        {
-            let mut guard = shared_picker.write()?;
-            *guard = Some(picker);
-            // dropping old picker flips its `cancelled` flag → bg threads exit cleanly
+        // What still runs for the index it replaces stops, so its loop gets to the replacement.
+        if let Some(old) = shared_picker.read()?.as_ref() {
+            old.cancel();
+        }
+        // The loop publishes the index: only it ever replaces one, so all it writes goes to its own.
+        let (replaced, published) = std::sync::mpsc::channel();
+        let replacement = crate::watch::Replacement {
+            picker,
+            frecency: shared_frecency,
+            config,
+            replaced,
+        };
+        let sent = shared_picker.send(crate::watch::Message::Replace(Box::new(replacement)));
+        if !sent || published.recv().is_err() {
+            return Err(Error::WriterStart);
         }
         shared_picker.coverage_listeners().notify(&());
-
-        ScanJob::new_initial(
-            shared_picker,
-            shared_frecency,
-            path,
-            mode,
-            signals,
-            scanned_files_counter,
-            trace_span,
-            ScanConfig {
-                warmup,
-                content_indexing,
-                watch,
-                auto_cache_budget: true,
-                install_watcher: true,
-                follow_symlinks,
-                ignore_options,
-                enable_fs_root_scanning,
-                enable_home_dir_scanning,
-            },
-        )
-        .spawn();
 
         Ok(())
     }
@@ -1658,7 +1678,7 @@ impl FilePicker {
     // Returns an ongoing or finisshed scan progress
     pub fn get_scan_progress(&self) -> ScanProgress {
         let scanned_count = self.scanned_files_count.load(Ordering::Relaxed);
-        let is_scanning = self.signals.scanning.load(Ordering::Relaxed);
+        let is_scanning = self.signals.is_scanning();
 
         ScanProgress {
             scanned_files_count: scanned_count,
@@ -1903,98 +1923,114 @@ impl FilePicker {
         self.apply_create_or_modify(path.as_ref()).ok()
     }
 
+    // Reads the file and records it, all under the caller's lock.
     #[tracing::instrument(skip(self), level = Level::DEBUG)]
     pub(crate) fn apply_create_or_modify(
         &mut self,
         path: &Path,
     ) -> Result<&FileItem, IndexUpdateError> {
-        if let Some(idx) = self.sync_data.find_file_index(path, &self.base_path) {
-            let slot = if idx < self.sync_data.base_count {
-                FileSlot::Base(idx)
-            } else {
-                FileSlot::Overflow(idx)
-            };
-
-            return self.handle_file_modify(path, slot);
-        }
-
-        self.insert_new_file(path)
-    }
-
-    #[tracing::instrument(skip_all, fields(path = ?path), level = Level::DEBUG)]
-    fn handle_file_modify(
-        &mut self,
-        path: &Path,
-        slot: FileSlot,
-    ) -> Result<&FileItem, IndexUpdateError> {
-        let overlay = self.sync_data.bigram_overlay.as_ref().map(Arc::clone);
-        let pos = slot.index();
-
-        // this is the only way to actually know if the file is on disk, we CAN NOT
-        // rely on the watcher to proive the latest state of the file, do the actual check
-        let metadata = match std::fs::metadata(path) {
-            Ok(m) => {
-                self.untombstone_file(pos);
-
-                m
-            }
-            Err(_) => {
-                self.tombstone_file(pos);
-                return Err(IndexUpdateError::Vanished);
-            }
-        };
-
-        let (_arena, file) = self
-            .sync_data
-            .get_file_mut(pos)
-            .ok_or(IndexUpdateError::Vanished)?;
-
-        let size = metadata.len();
-        let modified_time = metadata
-            .modified()
-            .ok()
-            .and_then(|t| t.duration_since(SystemTime::UNIX_EPOCH).ok())
-            .map(|d| d.as_secs());
-
-        file.update_metadata(&self.cache_budget, modified_time, Some(size));
-        file.ino = crate::types::inode_bits(&metadata);
-
-        // Re-classify binary status from current content (chunked, fixed
-        // buffer). Already-binary files are left alone.
-        if !file.is_binary() {
-            let mut chunk = [0u8; crate::types::BINARY_CLASSIFICATION_CHUNK_SIZE];
-            file.detect_binary_per_byte(path, &mut chunk);
-        }
-
-        // Indexable base-region files feed fresh content to the bigram overlay.
-        if matches!(slot, FileSlot::Base(_))
-            && let Some(ref overlay) = overlay
-        {
-            let in_indexable = {
-                let guard = overlay.read();
-                pos < guard.base_file_count()
-            };
-
-            if in_indexable && let Ok(content) = std::fs::read(path) {
-                overlay.write().modify_file(pos, &content);
-            }
-        }
-
-        self.sync_data
-            .files()
-            .get(pos)
-            .ok_or(IndexUpdateError::Vanished)
+        let prepared = PreparedFile::read(path, &self.base_path, self.record_slot(path));
+        self.commit_prepared(prepared)
     }
 
     /// Adds a new file to picker, if the file can not be added returns `None`
     /// which indicates that it's time to trigger a new sync
     pub fn add_new_file(&mut self, path: &Path) -> Option<&FileItem> {
-        self.insert_new_file(path).ok()
+        let prepared = PreparedFile::read(path, &self.base_path, RecordSlot::default());
+        self.commit_prepared(prepared).ok()
+    }
+
+    // How many files new to the index it can still take without a rescan.
+    pub(crate) fn new_file_capacity(&self) -> usize {
+        let overflow = MAX_OVERFLOW_FILES.saturating_sub(self.get_overflow_files().len());
+        overflow.min(self.sync_data.files.remaining_capacity())
+    }
+
+    // What recording `path` needs to know of the index.
+    pub(crate) fn record_slot(&self, path: &Path) -> RecordSlot {
+        let Some(index) = self.sync_data.find_file_index(path, &self.base_path) else {
+            return RecordSlot::default();
+        };
+        let overlay = index < self.sync_data.base_count
+            && (self.sync_data.bigram_overlay.as_ref())
+                .is_some_and(|overlay| index < overlay.read().base_file_count());
+        RecordSlot {
+            held: true,
+            binary: (self.sync_data.files().get(index)).is_some_and(FileItem::is_binary),
+            overlay,
+        }
+    }
+
+    // Records a file read beforehand: nothing is read from the file system here. A file whose
+    // entry came or went since it was read is left alone, to be read again.
+    pub(crate) fn commit_prepared(
+        &mut self,
+        prepared: PreparedFile,
+    ) -> Result<&FileItem, IndexUpdateError> {
+        let PreparedFile {
+            path,
+            recorded_at,
+            metadata,
+            kind,
+        } = prepared;
+        match (self.sync_data.find_file_index(&path, &self.base_path), kind) {
+            (Some(index), Prepared::Held { binary, bigrams }) => {
+                self.commit_held(index, metadata, recorded_at, binary, bigrams)
+            }
+            (None, Prepared::New(Some((item, rel)))) => self.commit_new(item, rel),
+            (None, Prepared::New(None)) => Err(IndexUpdateError::Vanished),
+            _ => Err(IndexUpdateError::Stale),
+        }
+    }
+
+    fn commit_held(
+        &mut self,
+        index: usize,
+        metadata: Option<std::fs::Metadata>,
+        recorded_at: SystemTime,
+        binary: bool,
+        bigrams: Option<Vec<u16>>,
+    ) -> Result<&FileItem, IndexUpdateError> {
+        // The stat read with the file, not the watcher, tells whether the file is on disk.
+        let Some(metadata) = metadata else {
+            self.tombstone_file(index);
+            return Err(IndexUpdateError::Vanished);
+        };
+        self.untombstone_file(index);
+        let base_count = self.sync_data.base_count;
+        let overlay = self.sync_data.bigram_overlay.as_ref().map(Arc::clone);
+        let (_arena, file) = (self.sync_data)
+            .get_file_mut(index)
+            .ok_or(IndexUpdateError::Vanished)?;
+        let modified = (metadata.modified().ok())
+            .and_then(|time| time.duration_since(SystemTime::UNIX_EPOCH).ok())
+            .map(|since| since.as_secs());
+        file.update_metadata(&self.cache_budget, modified, Some(metadata.len()));
+        file.set_stat(crate::stat::Stat::of(&metadata));
+        file.smudge_if_racy(recorded_at);
+        // Already-binary files are left alone.
+        if binary {
+            file.set_binary(true);
+        }
+        // Indexable base-region files feed fresh content to the bigram overlay.
+        if index < base_count
+            && let Some(overlay) = overlay
+            && let Some(bigrams) = bigrams
+        {
+            let mut overlay = overlay.write();
+            if index < overlay.base_file_count() {
+                overlay.modify_file_bigrams(index, bigrams);
+            }
+        }
+        (self.sync_data.files().get(index)).ok_or(IndexUpdateError::Vanished)
     }
 
     // Nothing is written to the overflow arena unless the file lands.
-    #[tracing::instrument(skip(self))]
-    fn insert_new_file(&mut self, path: &Path) -> Result<&FileItem, IndexUpdateError> {
+    fn commit_new(
+        &mut self,
+        mut item: FileItem,
+        rel: String,
+    ) -> Result<&FileItem, IndexUpdateError> {
         // The overflow arena is sized for MAX_OVERFLOW_FILES; the files vector
         // may have more spare room than that.
         if self.get_overflow_files().len() >= MAX_OVERFLOW_FILES
@@ -2002,41 +2038,10 @@ impl FilePicker {
         {
             return Err(IndexUpdateError::CapacityExhausted);
         }
-
-        // On Windows `pathdiff::diff_paths` is byte-wise, so a short-name
-        // input never shares a prefix with the canonicalized base_path and
-        // the resulting relative path becomes absolute. Canonicalize first.
-        #[cfg(windows)]
-        let canonical_buf: Option<PathBuf> = if path.starts_with(&self.base_path) {
-            None
-        } else if let Ok(c) = crate::path_utils::canonicalize(path) {
-            Some(c)
-        } else {
-            tracing::error!(path = ?path.display(), "Failed to canonicalize file path to add");
-            return Err(IndexUpdateError::Vanished);
-        };
-
-        #[cfg(windows)]
-        let path_for_index: &Path = canonical_buf.as_deref().unwrap_or(path);
-        #[cfg(not(windows))]
-        let path_for_index: &Path = path;
-
-        let (mut file_item, rel_path) =
-            FileItem::new(path_for_index.to_path_buf(), &self.base_path, None);
-
-        // we have to perform manual classification for every new file this will be
-        // batched during the scan, this is the path when the file is ad-hoc added to the sync
-        file_item.detect_binary_per_byte(
-            path_for_index,
-            // inline chunk buf
-            &mut [0u8; crate::types::BINARY_CLASSIFICATION_CHUNK_SIZE],
-        );
-
         // Keep the dir table consistent: register (or revive) the parent dir
         // so directory search reflects watcher-added files immediately.
-        let dir_rel = crate::path_utils::to_canonical_slashes(
-            &rel_path[..file_item.path.filename_offset as usize],
-        );
+        let dir_rel =
+            crate::path_utils::to_canonical_slashes(&rel[..item.path.filename_offset as usize]);
         let parent_dir = self
             .update_dirs(|sync| sync.find_or_add_dir(&dir_rel))
             .ok_or(IndexUpdateError::CapacityExhausted)?;
@@ -2045,11 +2050,11 @@ impl FilePicker {
             // we know that overflow would never create more files during the file
             crate::simd_path::ChunkedPathStoreBuilder::new(MAX_OVERFLOW_FILES)
         });
-        file_item.set_path(builder.add_file_immediate(&rel_path, file_item.path.filename_offset));
-        file_item.set_overflow(true);
-        file_item.parent_dir_index = parent_dir;
+        item.set_path(builder.add_file_immediate(&rel, item.path.filename_offset));
+        item.set_overflow(true);
+        item.parent_dir_index = parent_dir;
 
-        if !self.sync_data.files.push(file_item) {
+        if !self.sync_data.files.push(item) {
             return Err(IndexUpdateError::CapacityExhausted);
         }
 
@@ -2135,22 +2140,15 @@ impl FilePicker {
     pub(crate) fn remove_all_files_in_dirs_with_callback<'a>(
         &mut self,
         dirs: impl IntoIterator<Item = &'a Path>,
-        mut callback: impl FnMut(&Path),
+        mut callback: impl FnMut(&Path, &FileItem),
     ) -> usize {
         self.remove_all_files_in_dirs_inner(dirs, Some(&mut callback))
-    }
-
-    pub(crate) fn remove_all_files_in_dirs<'a>(
-        &mut self,
-        dirs: impl IntoIterator<Item = &'a Path>,
-    ) -> usize {
-        self.remove_all_files_in_dirs_inner(dirs, None)
     }
 
     fn remove_all_files_in_dirs_inner<'a>(
         &mut self,
         dirs: impl IntoIterator<Item = &'a Path>,
-        callback: Option<&mut dyn FnMut(&Path)>,
+        callback: Option<&mut OnRemoved>,
     ) -> usize {
         let prefixes = dirs
             .into_iter()
@@ -2168,7 +2166,7 @@ impl FilePicker {
         dirs: &[&Path],
         keep_file: impl Fn(usize, &str) -> bool,
         keep_dir: impl Fn(usize, &str) -> bool,
-        mut on_removed: impl FnMut(&Path),
+        mut on_removed: impl FnMut(&Path, &FileItem),
     ) -> usize {
         let prefixes = dirs
             .iter()
@@ -2191,13 +2189,7 @@ impl FilePicker {
         }
     }
 
-    // Identifies the snapshot the index was built from; every scan's commit changes it.
-    pub(crate) fn sync_generation(&self) -> u64 {
-        self.sync_generation
-    }
-
     fn replace_sync(&mut self, sync: FileSync) -> FileSync {
-        self.sync_generation = next_sync_generation();
         std::mem::replace(&mut self.sync_data, sync)
     }
 
@@ -2216,7 +2208,7 @@ impl FilePicker {
         mut prefixes: Vec<(String, usize)>,
         keep_file: impl Fn(usize, &str) -> bool,
         keep_dir: impl Fn(usize, &str) -> bool,
-        mut callback: Option<&mut dyn FnMut(&Path)>,
+        mut callback: Option<&mut OnRemoved>,
     ) -> usize {
         if prefixes.is_empty() {
             return 0;
@@ -2243,7 +2235,10 @@ impl FilePicker {
             |file, arena| {
                 file.invalidate_mmap(cache_budget);
                 if let Some(callback) = callback.as_mut() {
-                    callback(file.write_absolute_path(arena, &base_path, &mut path_buf));
+                    callback(
+                        file.write_absolute_path(arena, &base_path, &mut path_buf),
+                        file,
+                    );
                 }
             },
         );
@@ -2265,17 +2260,27 @@ impl FilePicker {
         self.signals.cancelled.store(true, Ordering::Release);
     }
 
-    /// Stop the background filesystem watcher. Non-blocking.
+    /// Stop the background filesystem watcher. Non-blocking. The index installs none again,
+    /// also where a scan was installing one or a lost one waited to be replaced.
     pub fn stop_background_monitor(&mut self) {
+        self.watcher_stopped = true;
         if let Some(mut watcher) = self.background_watcher.take() {
             watcher.stop();
+        }
+        if self.watch {
+            self.signals
+                .publish_watcher(crate::watch::Published::Stopped);
         }
         self.signals.watcher_ready.store(false, Ordering::Release);
     }
 
+    pub(crate) fn watcher_stopped(&self) -> bool {
+        self.watcher_stopped
+    }
+
     /// Quick way to check if scan is going without acquiring a lock for [Self::get_scan_progress]
     pub fn is_scan_active(&self) -> bool {
-        self.signals.scanning.load(Ordering::Relaxed)
+        self.signals.is_scanning()
     }
 
     pub fn is_post_scan_active(&self) -> bool {
@@ -2353,7 +2358,7 @@ impl Drop for FilePicker {
     fn drop(&mut self) {
         // Cancel any in-flight ScanJob bound to this picker's signals so
         // it cannot mutate the replacement picker after a swap.
-        self.signals.cancelled.store(true, Ordering::Release);
+        self.cancel();
         // Wake the git-status consumer so it exits; never joined (it takes
         // the picker write lock, a blocking join here could deadlock).
         self.git_status_worker.signal_shutdown();
@@ -2369,20 +2374,8 @@ pub(crate) enum IndexUpdateError {
     OutsideIndex,
     /// The watcher-appended region is full; only a rescan can absorb the change.
     CapacityExhausted,
-}
-
-#[derive(Debug, Clone, Copy)]
-enum FileSlot {
-    Base(usize),
-    Overflow(usize),
-}
-
-impl FileSlot {
-    fn index(self) -> usize {
-        match self {
-            FileSlot::Base(i) | FileSlot::Overflow(i) => i,
-        }
-    }
+    /// The file's entry came or went since the file was read; it is read again later.
+    Stale,
 }
 
 /// Snapshot of FilePicker state for off-lock post-scan work.
@@ -2395,7 +2388,7 @@ impl FileSlot {
 /// Implements `Drop` to clear `post_scan_indexing_active`. Since only
 /// one snapshot can exist at a time (enforced by the flag check in
 /// `post_scan_snapshot`) and it is always created/dropped within
-/// `ScanJob::run`, `scan_job_running == false` implies no live snapshot.
+/// a scan's post-scan phase, a scan that ended implies no live snapshot.
 pub(crate) struct PostScanUnsafeSnapshot {
     pub files: StableVec<FileItem>,
     pub arena: Option<Arc<crate::simd_path::ChunkedPathStore>>,
@@ -2483,12 +2476,13 @@ impl FileSync {
         }
         let pool = indexing_pool();
         let walk_threads = pool.current_num_threads();
+        let walked_at = SystemTime::now();
 
         let WalkOutput {
             dirs: mut walked_dirs,
             mut pairs,
             ignore_rules,
-            ..
+            ignore_sources,
         } = crate::walk::walk_collect_files(
             base_path,
             None,
@@ -2496,9 +2490,10 @@ impl FileSync {
             policy,
             walk_threads,
             synced_files_count,
-            on_dir,
+            crate::walk::WalkHooks::new(on_dir, None),
         )?;
-        let ignore_rules = ignore_rules.map(Arc::new);
+        let ignore_rules = Arc::new(crate::walk::IgnoreRules::new(ignore_rules));
+        let ignore_sources = ignore_sources.into_iter().collect();
 
         // group walked dirs and files with a dir part to the same order
         pool.install(|| {
@@ -2558,6 +2553,10 @@ impl FileSync {
                 && f.size <= crate::constants::MAX_INDEXABLE_FILE_SIZE as u64
         };
 
+        // Git's racy rule, with the walk's start as the time its entries were recorded.
+        for file in files.iter_mut() {
+            file.smudge_if_racy(walked_at);
+        }
         let indexable_count = files.iter().filter(|file| is_indexable(file)).count();
         let mut unindexable = Vec::with_capacity(files.len() - indexable_count);
         unindexable.extend(files.extract_if(.., |file| !is_indexable(file)));
@@ -2605,6 +2604,7 @@ impl FileSync {
             bigram_overlay: None,
             chunked_paths: Some(Arc::new(chunked_paths)),
             ignore_rules,
+            ignore_sources,
             scopes: ScopeCache::default(),
         })
     }
@@ -2755,9 +2755,9 @@ pub(crate) fn is_ambiguous_binary_name(name: &str) -> bool {
 pub(crate) fn starts_with_binary_content(path: &Path) -> bool {
     use std::io::Read;
     let mut chunk = [0u8; 4096];
-    std::fs::File::open(path)
-        .and_then(|mut file| file.read(&mut chunk))
-        .is_ok_and(|read| crate::types::detect_binary_content(&chunk[..read]))
+    crate::stat::open_regular(path)
+        .and_then(|mut file| file.read(&mut chunk).ok())
+        .is_some_and(|read| crate::types::detect_binary_content(&chunk[..read]))
 }
 
 /// Like [`is_known_binary_extension`] but takes a basename string directly,
@@ -2849,18 +2849,12 @@ pub(crate) fn hint_allocator_collect(pool: &rayon::ThreadPool) {
     let _ = pool;
     #[cfg(feature = "mimalloc-collect")]
     {
-        // Collect the indexing pool workers, where the bigram builder allocated.
-        pool.broadcast(|_| unsafe { libmimalloc_sys::mi_collect(true) });
+        // Collect the indexing pool workers, where the bigram builder allocated, without waiting.
+        pool.spawn_broadcast(|_| unsafe { libmimalloc_sys::mi_collect(true) });
 
         // Main thread too.
         unsafe { libmimalloc_sys::mi_collect(true) };
     }
-}
-
-// Unique across pickers, so a picker that replaced another never repeats its value.
-fn next_sync_generation() -> u64 {
-    static GENERATION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-    GENERATION.fetch_add(1, Ordering::Relaxed) + 1
 }
 
 fn new_bigram_overlay(indexable_count: usize) -> Arc<parking_lot::RwLock<BigramOverlay>> {
@@ -3084,7 +3078,7 @@ mod tests {
         assert_eq!(
             picker.remove_all_files_in_dirs_with_callback(
                 std::iter::once(removed_dir.as_path()),
-                |path| {
+                |path, _| {
                     removed.push(path.to_path_buf());
                 }
             ),

@@ -267,8 +267,10 @@ pub struct FileItem {
     pub git_status: Option<git2::Status>,
     pub(crate) path: crate::simd_path::ChunkedString,
     pub(crate) parent_dir_index: u32,
-    // Low bits of the inode the metadata came from, 0 where unknown; fits the padding.
-    pub(crate) ino: u32,
+    // See `crate::stat::Stat`.
+    pub(crate) stamp: u32,
+    pub(crate) inode: u32,
+    pub(crate) modified_nanos: u32,
     flags: AtomicU8,
     /// Lazy mmap cache (boxed, set once). Only populated by the actual file
     /// read, controlled by the budget. Null while empty.
@@ -283,12 +285,40 @@ impl Drop for FileItem {
     }
 }
 
+impl FileItem {
+    // What a stat said of the file when its entry was recorded.
+    pub(crate) fn stat(&self) -> crate::stat::Stat {
+        crate::stat::Stat {
+            size: self.size,
+            modified: self.modified,
+            nanos: self.modified_nanos,
+            stamp: self.stamp,
+            inode: self.inode,
+        }
+    }
+
+    // Smudged when the file was written within a tick of `recorded_at`, which precedes the stat.
+    pub(crate) fn smudge_if_racy(&mut self, recorded_at: std::time::SystemTime) {
+        self.set_stat(self.stat().smudged_if_racy(recorded_at));
+    }
+
+    pub(crate) fn set_stat(&mut self, stat: crate::stat::Stat) {
+        self.size = stat.size;
+        self.modified = stat.modified;
+        self.modified_nanos = stat.nanos;
+        self.stamp = stat.stamp;
+        self.inode = stat.inode;
+    }
+}
+
 impl Clone for FileItem {
     fn clone(&self) -> Self {
         Self {
             path: self.path.clone(),
             parent_dir_index: self.parent_dir_index,
-            ino: self.ino,
+            stamp: self.stamp,
+            inode: self.inode,
+            modified_nanos: self.modified_nanos,
             size: self.size,
             modified: self.modified,
             access_frecency_score: self.access_frecency_score,
@@ -334,7 +364,9 @@ impl FileItem {
         Self {
             path,
             parent_dir_index: u32::MAX,
-            ino: 0,
+            stamp: 0,
+            inode: 0,
+            modified_nanos: 0,
             size,
             modified,
             access_frecency_score: 0,
@@ -615,32 +647,8 @@ impl FileItem {
         if self.is_binary() || self.size == 0 {
             return;
         }
-
-        let Ok(file) = std::fs::OpenOptions::new()
-            .write(false)
-            .read(true)
-            .open(path)
-        else {
-            tracing::error!(path = ?path.display(), "Failed to open indexed file");
-            return;
-        };
-        // only classify the first MAX_FFFILE_SIZE bytes, never read large files to EOF
-        let mut file = file.take(MAX_FFFILE_SIZE);
-
-        loop {
-            match file.read(chunk) {
-                Ok(0) => break,
-                Err(e) => {
-                    tracing::error!(?e, "Failed to read file chunk");
-                    break;
-                }
-                Ok(n) => {
-                    if detect_binary_content(&chunk[..n]) {
-                        self.set_binary(true);
-                        break;
-                    }
-                }
-            }
+        if content_is_binary(path, chunk) {
+            self.set_binary(true);
         }
     }
 
@@ -1140,17 +1148,40 @@ impl Default for ContentCacheBudget {
     }
 }
 
-// The low bits of a file's inode number, or 0 where the platform has none.
-pub(crate) fn inode_bits(metadata: &std::fs::Metadata) -> u32 {
-    #[cfg(unix)]
-    {
-        std::os::unix::fs::MetadataExt::ino(metadata) as u32
+// Whether the regular file at `path` holds binary content, by its first MAX_FFFILE_SIZE bytes
+// read chunk by chunk: large files are never read to the end.
+pub(crate) fn content_is_binary(path: &Path, chunk: &mut [u8]) -> bool {
+    let Some(file) = crate::stat::open_regular(path) else {
+        tracing::error!(path = ?path.display(), "Failed to open indexed file");
+        return false;
+    };
+    let mut file = file.take(MAX_FFFILE_SIZE);
+    loop {
+        match file.read(chunk) {
+            Ok(0) => return false,
+            Err(e) => {
+                tracing::error!(?e, "Failed to read file chunk");
+                return false;
+            }
+            Ok(n) if detect_binary_content(&chunk[..n]) => return true,
+            Ok(_) => {}
+        }
     }
-    #[cfg(not(unix))]
-    {
-        let _ = metadata;
-        0
-    }
+}
+
+// As `content_is_binary`, with a chunk of its own.
+pub(crate) fn file_is_binary(path: &Path) -> bool {
+    content_is_binary(path, &mut [0u8; BINARY_CLASSIFICATION_CHUNK_SIZE])
+}
+
+// A fast hasher with fixed keys, so a value hashes alike in every thread and run.
+pub(crate) fn fixed_hasher() -> ahash::RandomState {
+    ahash::RandomState::with_seeds(
+        0x243f_6a88_85a3_08d3,
+        0x1319_8a2e_0370_7344,
+        0xa409_3822_299f_31d0,
+        0x082e_fa98_ec4e_6c89,
+    )
 }
 
 #[cfg(test)]

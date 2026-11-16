@@ -730,14 +730,12 @@ pub fn stop_background_monitor(_: &Lua, _: ()) -> LuaResult<bool> {
 }
 
 pub fn cleanup_file_picker(_: &Lua, _: ()) -> LuaResult<bool> {
-    let mut file_picker = FILE_PICKER.write().into_lua_result()?;
-    if let Some(picker) = file_picker.take() {
-        drop(picker);
-        ::tracing::info!("FilePicker cleanup completed");
-        Ok(true)
-    } else {
-        Ok(false)
+    if FILE_PICKER.read().into_lua_result()?.is_none() {
+        return Ok(false);
     }
+    FILE_PICKER.remove_index();
+    ::tracing::info!("FilePicker cleanup completed");
+    Ok(true)
 }
 
 pub fn cancel_scan(_: &Lua, _: ()) -> LuaResult<bool> {

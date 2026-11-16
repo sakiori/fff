@@ -32,7 +32,8 @@ pub enum WatchEventKind {
     Created = 0,
     Modified = 1,
     Removed = 2,
-    /// Individual events were lost; rescan the reported path.
+    /// A full rescan rebuilt the index, which holds its result now; changes are not reported one by
+    /// one. Every full rescan sends one, a first scan none; `path` is the index's root.
     Rescan = 3,
     /// The file moved. `path` is the destination, `from` the source.
     Renamed = 4,
@@ -291,6 +292,8 @@ struct CallbackDelivery {
 
 enum CallbackMessage {
     Deliver(Vec<CallbackDelivery>),
+    // A listener notification, in order with the watch callbacks.
+    Run(Box<dyn FnOnce() + Send>),
     // used to drain all the callbacks and close the sender right after
     Drain(mpsc::Sender<()>),
     Stop,
@@ -340,6 +343,13 @@ impl CallbackDispatcher {
                                 }
                             }
                         }
+                        CallbackMessage::Run(work) => {
+                            let result =
+                                std::panic::catch_unwind(std::panic::AssertUnwindSafe(work));
+                            if result.is_err() {
+                                error!("listener panicked");
+                            }
+                        }
                         CallbackMessage::Drain(done) => {
                             let _ = done.send(());
                         }
@@ -358,11 +368,15 @@ impl CallbackDispatcher {
         if deliveries.is_empty() {
             return;
         }
+        self.send(CallbackMessage::Deliver(deliveries));
+    }
+
+    fn send(&self, message: CallbackMessage) {
         let Some(sender) = self.state.lock().sender.clone() else {
             error!("watch callback dispatcher is not running");
             return;
         };
-        if sender.send(CallbackMessage::Deliver(deliveries)).is_err() {
+        if sender.send(message).is_err() {
             error!("watch callback dispatcher stopped unexpectedly");
         }
     }
@@ -609,6 +623,15 @@ impl WatchRegistry {
                 });
             }
             self.dispatcher.deliver(deliveries);
+        }
+    }
+
+    // Runs `notify` on the dispatch thread, in order with the watch callbacks, as Watchman
+    // delivers its subscriptions: internal threads never wait on a listener.
+    pub(crate) fn notify_listeners(&self, notify: impl FnOnce() + Send + 'static) {
+        match self.dispatcher.start() {
+            Ok(()) => self.dispatcher.send(CallbackMessage::Run(Box::new(notify))),
+            Err(e) => error!(?e, "listeners cannot be notified"),
         }
     }
 

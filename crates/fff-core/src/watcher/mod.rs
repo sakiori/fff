@@ -6,8 +6,32 @@ mod dir_walk;
 mod ref_watches;
 pub(crate) use ref_watches::common_dir_of;
 
-mod held_events;
-pub(crate) use held_events::{EventHold, Released};
+mod changed_paths;
+mod git_changes;
+pub(crate) use git_changes::is_git_file;
+mod intake;
+#[cfg(test)]
+pub(crate) use intake::recrawls_logged;
+mod reconcile;
+#[cfg(test)]
+pub(crate) use reconcile::apply_events;
+mod renames;
+mod repository;
+
+mod rescan_tap;
+
+mod index_loop;
+mod watched;
+pub(crate) use watched::Published;
+
+mod writer;
+#[cfg(test)]
+pub(crate) use writer::Work;
+#[cfg(test)]
+pub(crate) use writer::tests::{
+    jobs_queued, most_at_once, on_applying, refuse_next_spawn, writer_loops,
+};
+pub(crate) use writer::{IndexWriter, Message, Replacement};
 
 mod watch;
 pub use watch::*;

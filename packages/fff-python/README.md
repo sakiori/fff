@@ -102,8 +102,16 @@ A `renamed` event carries both paths: `e.path` is the destination and
 `e.from_path` the source. It replaces the removed/created pair, so a move is
 one event. Moves in or out of the indexed tree stay a plain `created`/`removed`.
 
-A `rescan` event means individual changes were lost (index overflow or an
-ignore-file change) — re-check anything you care about.
+A `rescan` event means a full rescan rebuilt the index and individual changes
+were not reported — re-check anything you care about. It arrives once the
+rebuilt index is in place, after every full rescan: one you requested, or one
+the index needs because it could not take changes in (its overflow area filled
+up, or an update failed) or because its watcher was lost and is replaced. Such
+a rebuild starts at once, or one rescan interval after the last one started;
+until it is in place `scan_progress` reports `is_watcher_ready` false while
+subscriptions stay open, as its `rescan` event covers the gap. An index's first
+scan sends none. Lost watcher events and changed ignore rules are checked again
+where they happened and reported as individual events.
 
 ## Building wheels
 

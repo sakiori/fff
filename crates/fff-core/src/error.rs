@@ -13,6 +13,8 @@ pub enum Error {
     FilesystemRoot(std::path::PathBuf),
     #[error("File picker not initialized")]
     FilePickerMissing,
+    #[error("Failed to start the index's writer thread")]
+    WriterStart,
     #[error("Failed to acquire lock for frecency")]
     AcquireFrecencyLock,
     #[error("Failed to acquire lock for items by provider")]
