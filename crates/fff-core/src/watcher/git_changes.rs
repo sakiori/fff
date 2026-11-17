@@ -1,6 +1,5 @@
 use std::path::{Path, PathBuf};
 
-use git2::Repository;
 use notify::EventKind;
 use notify::event::RemoveKind;
 use tracing::info;
@@ -8,7 +7,8 @@ use tracing::info;
 use super::background_watcher::{WatchTask, WatcherOptions, git_dir_of, is_git_dir};
 use super::intake::IgnoreFilter;
 use super::ref_watches::{RefChanges, RefSignals};
-use crate::git_status_worker::GitStatusWorker;
+use super::repository::Repo;
+use crate::scm::ScmStatusWorker;
 use crate::shared::SharedFilePicker;
 
 // What a set's git events ask: subtrees whose rules an exclude file changed, whether the own
@@ -27,7 +27,7 @@ pub(crate) fn classify(
     events: &[notify::Event],
     base_path: &Path,
     git_workdir: Option<&Path>,
-    repo: Option<&Repository>,
+    repo: Option<Repo<'_>>,
     ref_signals: Option<&RefSignals>,
     options: &WatcherOptions,
     filter: &mut IgnoreFilter,
@@ -39,7 +39,8 @@ pub(crate) fn classify(
     // A linked worktree's main repository holds its `info`; the rest of its git dir is no state
     // of the index unless a ref listener follows it.
     let own_common_dir = repo
-        .map(|repo| (super::common_dir_of(repo.path()), repo.path()))
+        .map(|repo| repo.workspace.metadata.as_path())
+        .map(|git_dir| (super::common_dir_of(git_dir), git_dir))
         .filter(|(common_dir, git_dir)| common_dir.components().ne(git_dir.components()))
         .map(|(common_dir, _)| common_dir);
     let ref_only = |path: &Path| {
@@ -201,7 +202,7 @@ pub(crate) fn announce_git_state(
     base_path: &Path,
     git_workdir: &Option<PathBuf>,
     options: &WatcherOptions,
-    git_status_worker: &GitStatusWorker,
+    git_status_worker: &dyn ScmStatusWorker,
     within: Option<&[PathBuf]>,
 ) {
     if options.ignore_options.disable_git {
@@ -289,17 +290,20 @@ pub(crate) enum GitStateChange {
 fn excluded_work_tree(
     picker: &SharedFilePicker,
     path: &Path,
-    repo: Option<&Repository>,
+    repo: Option<Repo<'_>>,
 ) -> Option<PathBuf> {
     if !path.ends_with("info/exclude") {
         return None;
     }
     let git_dir = path.parent()?.parent()?;
-    if let Some(repo) = repo
-        && (repo.path().components().eq(git_dir.components())
-            || repo.commondir().components().eq(git_dir.components()))
-    {
-        return repo.workdir().map(|dir| dir.components().collect());
+    if let Some(repo) = repo {
+        let own = repo.workspace.metadata.as_path();
+        let common_dir = super::common_dir_of(own);
+        if own.components().eq(git_dir.components())
+            || common_dir.components().eq(git_dir.components())
+        {
+            return Some(repo.workspace.workdir.components().collect());
+        }
     }
     picker.registered_work_tree(git_dir)
 }
@@ -307,17 +311,15 @@ fn excluded_work_tree(
 #[inline]
 pub(crate) fn is_git_file(path: &Path) -> bool {
     // it could be in submodule
-    path.components()
-        .any(|component| component.as_os_str() == ".git")
+    crate::scm::is_metadata_path(path, None)
 }
 
-pub(super) fn is_dotgit_change_affecting_status(changed: &Path, repo: Option<&Repository>) -> bool {
-    let Some(repo) = repo else {
-        return false;
-    };
-    changed
-        .strip_prefix(repo.path())
-        .is_ok_and(affects_worktree_state)
+pub(super) fn is_dotgit_change_affecting_status(changed: &Path, repo: Option<Repo<'_>>) -> bool {
+    repo.is_some_and(|repo| {
+        (repo.workspace.git_path(changed))
+            .strip_prefix(&repo.workspace.metadata)
+            .is_ok_and(affects_worktree_state)
+    })
 }
 
 // The work tree whose state `changed` affects: of a registered git dir, or of the nearest one by
@@ -359,8 +361,7 @@ fn git_state_root(
     let work_tree = if git_dir == dot_git {
         git_dir.parent()?.to_path_buf()
     } else {
-        let repo = Repository::open(git_dir).ok()?;
-        crate::path_utils::canonicalize(repo.workdir()?).ok()?
+        foreign_work_tree(git_dir)?
     };
     *registered |= picker.register_git_dir(git_dir, &work_tree);
     Some(work_tree)
@@ -395,3 +396,16 @@ pub(super) fn affects_worktree_state(path_in_git_dir: &Path) -> bool {
 }
 
 // Watches the log a git dir gained, unless the tree's watch covers it, and announces its
+
+// The work tree of a git dir found by shape inside a `.git`; only libgit2 opens one here, so
+// builds without it announce such a repository once the walk registers it.
+#[cfg(feature = "libgit2")]
+fn foreign_work_tree(git_dir: &Path) -> Option<PathBuf> {
+    let repo = git2::Repository::open(git_dir).ok()?;
+    crate::path_utils::canonicalize(repo.workdir()?).ok()
+}
+
+#[cfg(not(feature = "libgit2"))]
+fn foreign_work_tree(_git_dir: &Path) -> Option<PathBuf> {
+    None
+}

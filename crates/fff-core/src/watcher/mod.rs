@@ -4,6 +4,8 @@ pub use background_watcher::*;
 mod dir_walk;
 
 mod ref_watches;
+#[cfg(feature = "libgit2")]
+mod reftable;
 pub(crate) use ref_watches::common_dir_of;
 
 mod changed_paths;

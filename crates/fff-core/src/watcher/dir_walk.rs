@@ -20,14 +20,14 @@ impl DirWalk {
     pub(super) fn new(
         dir: &Path,
         base_path: &Path,
-        is_git_repo: bool,
+        backend: Option<crate::scm::ScmBackend>,
         policy: WalkPolicy<'_>,
         hooks: WalkHooks<'_>,
     ) -> Option<Self> {
         let walk = match crate::walk::walk_collect_files(
             base_path,
             Some(dir),
-            is_git_repo,
+            backend,
             policy,
             walk_threads(),
             &Arc::new(AtomicUsize::new(0)),

@@ -2,7 +2,6 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use ahash::AHashSet;
-use git2::Repository;
 use notify::EventKind;
 use notify::event::{
     AccessKind, AccessMode, CreateKind, MetadataKind, ModifyKind, RemoveKind, RenameMode,
@@ -14,6 +13,7 @@ use tracing::warn;
 
 use super::changed_paths::Change;
 use super::git_changes::is_git_file;
+use super::repository::Repo;
 use crate::file_picker::FilePickerIgnoreOptions;
 use crate::shared::SharedFilePicker;
 
@@ -22,7 +22,7 @@ use crate::shared::SharedFilePicker;
 pub(crate) fn intake(
     shared: &SharedFilePicker,
     events: &[DebouncedEvent],
-    repo: Option<&Repository>,
+    repo: Option<Repo<'_>>,
 ) -> Vec<Change> {
     let Some(context) = Context::of(shared, repo) else {
         return Vec::new();
@@ -34,7 +34,7 @@ pub(crate) fn intake(
 struct Context<'a> {
     base_path: PathBuf,
     rules: Arc<crate::walk::IgnoreRules>,
-    repo: Option<&'a Repository>,
+    repo: Option<Repo<'a>>,
     ignore_options: FilePickerIgnoreOptions,
     ref_signals: Option<super::ref_watches::RefSignals>,
 }
@@ -47,7 +47,7 @@ struct Named {
 }
 
 impl<'a> Context<'a> {
-    fn of(shared: &SharedFilePicker, repo: Option<&'a Repository>) -> Option<Self> {
+    fn of(shared: &SharedFilePicker, repo: Option<Repo<'a>>) -> Option<Self> {
         let guard = shared.read().ok()?;
         let picker = guard.as_ref()?;
         let watches = (picker.background_watcher.as_ref()).map(|watcher| watcher.watches());
@@ -70,7 +70,6 @@ impl<'a> Context<'a> {
         shared: &SharedFilePicker,
         events: &[DebouncedEvent],
     ) -> Vec<Result<Change, Named>> {
-        let own_git_dir = self.repo.map(Repository::path);
         let mut changes = Vec::new();
         for event in events
             .iter()
@@ -79,14 +78,14 @@ impl<'a> Context<'a> {
             // Lost events have their subtree read again, the root's for the root, above or none
             // (Apple's FSEvents guide, Watchman's recursive pending paths, JetBrains' RECDIRTY).
             if event.need_rescan() {
-                changes.extend(self.lost(&event.event, own_git_dir));
+                changes.extend(self.lost(&event.event));
                 continue;
             }
             let kind = event.event.kind;
             if let EventKind::Modify(ModifyKind::Name(RenameMode::Both)) = kind
                 && let [from, to] = event.event.paths.as_slice()
-                && !self.is_git_path(from, own_git_dir)
-                && !self.is_git_path(to, own_git_dir)
+                && !self.is_git_path(from)
+                && !self.is_git_path(to)
             {
                 changes.push(Ok(Change::Renamed(from.clone(), to.clone())));
             }
@@ -98,7 +97,7 @@ impl<'a> Context<'a> {
                 if self.base_path.starts_with(path) {
                     continue;
                 }
-                if self.is_git_path(path, own_git_dir) {
+                if self.is_git_path(path) {
                     // Objects never tell of a repository's state.
                     let objects = (path.components()).any(|part| part.as_os_str() == "objects");
                     let foreign = (self.ref_signals.as_ref())
@@ -206,11 +205,7 @@ impl<'a> Context<'a> {
 
     // Logs each recrawl once, with its path and reason; a path of the tree is filtered as any
     // other named path first, then walked again whatever it is now.
-    fn lost(
-        &self,
-        event: &notify::Event,
-        own_git_dir: Option<&Path>,
-    ) -> Vec<Result<Change, Named>> {
+    fn lost(&self, event: &notify::Event) -> Vec<Result<Change, Named>> {
         let reason = recrawl_reason(event);
         if event.paths.is_empty() {
             warn!(path = %self.base_path.display(), reason, "Recrawling after lost events");
@@ -222,7 +217,7 @@ impl<'a> Context<'a> {
         for path in &event.paths {
             let change = if self.base_path.starts_with(path) {
                 Ok(Change::Root)
-            } else if self.is_git_path(path, own_git_dir) {
+            } else if self.is_git_path(path) {
                 Ok(Change::LostGit(path.clone()))
             } else {
                 lost.push(Err(Named {
@@ -241,10 +236,10 @@ impl<'a> Context<'a> {
     }
 
     // Bare repositories keep worktree git dirs outside of any `.git` component.
-    fn is_git_path(&self, path: &Path, own_git_dir: Option<&Path>) -> bool {
+    fn is_git_path(&self, path: &Path) -> bool {
         !path.starts_with(&self.base_path)
             || is_git_file(path)
-            || own_git_dir.is_some_and(|dir| path.starts_with(dir))
+            || self.repo.is_some_and(|repo| repo.holds_git_path(path))
     }
 
     fn is_ignore_file(&self, path: &Path) -> bool {
@@ -274,12 +269,12 @@ fn may_change_a_subtree(kind: EventKind) -> bool {
     }
 }
 
-// The ignore rules of the last walk and the subtrees walked again since, else libgit2's.
+// The ignore rules of the last walk and the subtrees walked again since, else the repository's.
 pub(crate) struct IgnoreFilter<'a> {
     base_path: &'a Path,
     rules: Arc<crate::walk::IgnoreRules>,
     // Borrowed from the caller, which uses it for git state as well.
-    repo: Option<&'a Repository>,
+    repo: Option<Repo<'a>>,
     disable_git: bool,
     // Whether the non-git heuristic decides where neither rules nor a repository do.
     pub(crate) heuristic: bool,
@@ -289,7 +284,7 @@ impl<'a> IgnoreFilter<'a> {
     pub(crate) fn new(
         base_path: &'a Path,
         rules: Arc<crate::walk::IgnoreRules>,
-        repo: Option<&'a Repository>,
+        repo: Option<Repo<'a>>,
         disable_git: bool,
     ) -> Self {
         Self {
@@ -309,7 +304,7 @@ impl<'a> IgnoreFilter<'a> {
             return ignored;
         }
         match self.repo {
-            Some(repo) => repo.is_path_ignored(path) == Ok(true),
+            Some(repo) => repo.is_ignored(path),
             None if self.disable_git || !self.heuristic => false,
             // No repo and no rules: the non-code-dir heuristic, applied to the
             // base-relative path so ancestors of the base (e.g. a temp dir

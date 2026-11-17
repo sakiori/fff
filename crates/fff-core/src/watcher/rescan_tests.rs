@@ -376,6 +376,35 @@ fn recreating_the_same_paths_does_not_consume_overflow_capacity() {
     );
 }
 
+#[cfg(any(feature = "gitoxide", feature = "libgit2"))]
+#[test]
+fn modifying_a_tracked_file_updates_its_status() {
+    let f = Fixture::with_git();
+    f.write("tracked", "initial");
+    assert!(
+        Command::new("git")
+            .args(["add", "tracked"])
+            .current_dir(&f.base)
+            .status()
+            .unwrap()
+            .success()
+    );
+    f.index();
+    f.write("tracked", "edited");
+    f.feed([modify(f.path("tracked"))]);
+    assert!(f.picker.wait_for_git_status(Duration::from_secs(10)));
+    let guard = f.picker.read().unwrap();
+    let file = guard
+        .as_ref()
+        .unwrap()
+        .get_file_by_path(f.path("tracked"))
+        .unwrap();
+    assert_eq!(
+        file.git_status,
+        Some(crate::git::Status::INDEX_NEW | crate::git::Status::WT_MODIFIED)
+    );
+}
+
 #[test]
 fn writes_inside_a_gitignored_directory_stay_incremental() {
     let f = Fixture::with_git();
@@ -2286,7 +2315,14 @@ impl Fixture {
         .unwrap();
         picker.collect_files().unwrap();
         self.picker.rebase_watches(&self.base);
+        let worker = picker
+            .scm_workspace()
+            .map(|_| Arc::clone(&picker.scm_status_worker));
         *self.picker.write().unwrap() = Some(picker);
+        if let Some(worker) = worker {
+            worker.on_workspace_scan(self.picker.weaken(), self.frecency.clone());
+            assert!(self.picker.wait_for_git_status(Duration::from_secs(10)));
+        }
     }
 
     // Hands a batch to the index's loop as its watcher would, and waits until it is applied.
@@ -2393,6 +2429,7 @@ impl Drop for Fixture {
         // the background pool; let it finish before the tree disappears.
         self.picker
             .wait_for_indexing_complete(Duration::from_secs(10));
+        self.picker.wait_for_git_status(Duration::from_secs(10));
     }
 }
 
@@ -2630,9 +2667,10 @@ fn a_directory_created_as_polling_names_it_is_indexed() {
 // The paths intake keeps of a batch, before any reconcile.
 fn kept_paths(f: &Fixture, events: &[DebouncedEvent]) -> Vec<PathBuf> {
     use super::changed_paths::Change;
-    let workdir = (f.picker.read().unwrap().as_ref().unwrap().git_root()).map(PathBuf::from);
-    let repo = workdir.and_then(|workdir| git2::Repository::open(workdir).ok());
-    (super::intake::intake(&f.picker, events, repo.as_ref()).into_iter())
+    let workspace = (f.picker.read().unwrap().as_ref().unwrap().scm_workspace()).cloned();
+    let mut repository = super::repository::LoopRepository::default();
+    let repo = repository.at(workspace.as_ref());
+    (super::intake::intake(&f.picker, events, repo).into_iter())
         .flat_map(|change| match change {
             Change::Path { path, .. } | Change::Lost(path) | Change::IgnoreFile(path) => vec![path],
             Change::Renamed(from, to) => vec![from, to],

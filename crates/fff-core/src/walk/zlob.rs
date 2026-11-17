@@ -25,7 +25,7 @@ struct WorkerFiles {
 pub(super) fn walk_files(
     base_path: &Path,
     subtree: Option<&Path>,
-    is_git_repo: bool,
+    backend: Option<crate::scm::ScmBackend>,
     policy: WalkPolicy<'_>,
     threads: usize,
     synced_files_count: &Arc<AtomicUsize>,
@@ -36,11 +36,14 @@ pub(super) fn walk_files(
         follow_symlinks,
         ignore: ignore_options,
     } = policy;
-    let use_non_git_defaults = !is_git_repo && !ignore_options.disable_git;
+    let use_non_git_defaults = backend.is_none() && !ignore_options.disable_git;
     let mut flags = WalkFlags::GITIGNORE;
     // An index rooted below its work tree takes the rules above it, the repository's exclude
     // file included, as ripgrep's walker does; zlob would list nothing of a root they ignore.
-    if is_git_repo && !ignore_options.disable_git && !root_ignored(base_path) {
+    if let Some(backend) = backend
+        && !ignore_options.disable_git
+        && !root_ignored(backend, base_path)
+    {
         flags |= WalkFlags::GITIGNORE_PARENTS;
     }
     if ignore_options.disable_git {
@@ -86,9 +89,21 @@ pub(super) fn walk_files(
     let subtree = subtree
         .map(|subtree| super::subtree_relative(base_path, subtree))
         .transpose()?;
+    // zlob already excludes .git during traversal.
+    let extra_metadata = backend
+        .map(|backend| backend.metadata_dir_name())
+        .filter(|name| *name != ".git");
     let outcome = match builder.run(|entry| {
         if hooks.cancelled() {
             return WalkState::Quit;
+        }
+        if extra_metadata.is_some_and(|name| {
+            entry
+                .path()
+                .components()
+                .any(|component| component.as_os_str() == name)
+        }) {
+            return WalkState::Continue;
         }
         let collected = &collected[entry.worker_id()];
         if ignore_options.disable_git && entry.path().file_name().is_some_and(|name| name == ".git")
@@ -234,13 +249,11 @@ fn stat_of_entry(entry: &zlob::walk::WalkEntry<'_>) -> crate::stat::Stat {
 }
 
 // Whether the repository around `base_path`, which lies below its work tree, ignores it.
-fn root_ignored(base_path: &Path) -> bool {
-    let Ok(repo) = git2::Repository::discover(base_path) else {
+fn root_ignored(backend: crate::scm::ScmBackend, base_path: &Path) -> bool {
+    let Some(workspace) = backend.discover(base_path) else {
         return false;
     };
-    let below = repo.workdir().is_some_and(|workdir| {
-        let workdir = crate::path_utils::canonicalize(workdir).unwrap_or(workdir.to_path_buf());
-        workdir != base_path && base_path.starts_with(&workdir)
-    });
-    below && repo.is_path_ignored(base_path) == Ok(true)
+    let base = workspace.git_path(base_path);
+    let below = *base != workspace.workdir && base.starts_with(&workspace.workdir);
+    below && workspace.open().is_ok_and(|repo| repo.is_ignored(&base))
 }

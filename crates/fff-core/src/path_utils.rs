@@ -169,6 +169,13 @@ pub fn validate_base_path(
     Ok(())
 }
 
+pub(crate) fn path_in_base<'a>(path: &'a str, subdir: Option<&str>) -> Option<&'a str> {
+    match subdir {
+        Some(prefix) => path.strip_prefix(prefix)?.strip_prefix('/'),
+        None => Some(path),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -7,15 +7,12 @@ use crate::dbs::lmdb::{LmdbStore, spawn_lmdb_gc};
 use crate::error::Error;
 use crate::file_picker::FilePicker;
 use crate::frecency::FrecencyTracker;
-use crate::git::GitStatusCache;
 use crate::git_dirs::RegisteredGitDir;
-use crate::git_recency;
-use crate::git_status_worker::GitStatusWorker;
 use crate::listeners::{CoverageListeners, ListenerSubscription, RefListeners, WorkTreeListeners};
 use crate::query_tracker::QueryTracker;
 use crate::rescan_stats::{RescanCounters, RescanReason, RescanStats};
+use crate::scm::ScmStatusWorker;
 use crate::watch::{IndexWriter, Message, WatchEvent, WatchId, WatchOptions, WatchRegistry};
-use git2::Repository;
 
 /// What became of changes a program reported with [`SharedFilePicker::apply_reported_changes`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -26,34 +23,6 @@ pub enum ReportedChanges {
     /// They are pending: reported while a scan runs, the scan applies them when it publishes
     /// its result, before [`crate::BackgroundStatus::is_scan_pending`] turns false.
     Held,
-}
-
-/// Poll `<git_dir>/index.lock` until it disappears (git write completed), giving up
-/// after [`GIT_LOCK_MAX_WAIT`]. Used by [`SharedPicker::refresh_git_status`]
-/// to avoid reading a half-updated index when the watcher fires mid-`git add`.
-///
-/// The wait is bounded and cheap: the lock file is typically cleared within
-/// a few milliseconds of the git command exiting.
-fn wait_for_git_index_lock_release(git_dir: &Path) {
-    const GIT_LOCK_POLL: Duration = Duration::from_millis(10);
-    const GIT_LOCK_MAX_WAIT: Duration = Duration::from_millis(500);
-
-    let lock = git_dir.join("index.lock");
-    // Fast path: no lock present.
-    if !lock.exists() {
-        return;
-    }
-    let deadline = Instant::now() + GIT_LOCK_MAX_WAIT;
-    while lock.exists() && Instant::now() < deadline {
-        std::thread::sleep(GIT_LOCK_POLL);
-    }
-    if lock.exists() {
-        tracing::warn!(
-            "Proceeding with git status refresh despite lingering \
-             .git/index.lock at {} — will retry once it clears",
-            lock.display()
-        );
-    }
 }
 
 /// Poll `done` every 10ms until it returns `true`, or until `timeout` elapses.
@@ -595,7 +564,8 @@ impl SharedFilePicker {
     /// repositories related to a listener's scope only while one is subscribed, from before
     /// this returns. This and dropping the subscription change the watcher's watches, so call
     /// them off async executors. Listeners run as those of
-    /// [`Self::subscribe_repository_state`] do.
+    /// [`Self::subscribe_repository_state`] do. Builds without the `libgit2` feature watch no
+    /// refs: listeners hear only the git state announced after a rebuild or a lost watcher.
     pub fn subscribe_ref_changes(
         &self,
         scope: &Path,
@@ -664,7 +634,7 @@ impl SharedFilePicker {
     /// pausing before [`FilePicker::new_with_shared_state`] skips the initial status read.
     pub fn pause_git_status(&self) {
         self.0.git_status_paused.store(true, Ordering::Release);
-        if let Some(worker) = self.git_status_worker() {
+        if let Some(worker) = self.scm_status_worker() {
             worker.drop_pending();
         }
     }
@@ -673,7 +643,7 @@ impl SharedFilePicker {
     /// Use [`Self::wait_for_git_status`] to know when it has been applied.
     pub fn resume_git_status(&self) {
         self.0.git_status_paused.store(false, Ordering::Release);
-        if let Some(worker) = self.git_status_worker() {
+        if let Some(worker) = self.scm_status_worker() {
             worker.request_full_rescan();
         }
     }
@@ -685,7 +655,7 @@ impl SharedFilePicker {
     /// Block until queued background git status work is applied.
     /// Returns `false` on timeout. A zero timeout makes it a non-blocking check.
     pub fn wait_for_git_status(&self, timeout: Duration) -> bool {
-        let Some(worker) = self.git_status_worker() else {
+        let Some(worker) = self.scm_status_worker() else {
             return true;
         };
 
@@ -696,11 +666,11 @@ impl SharedFilePicker {
         Arc::clone(&self.0.git_status_paused)
     }
 
-    fn git_status_worker(&self) -> Option<Arc<GitStatusWorker>> {
+    fn scm_status_worker(&self) -> Option<Arc<dyn ScmStatusWorker>> {
         let guard = self.0.picker.read();
         guard
             .as_ref()
-            .map(|picker| Arc::clone(&picker.git_status_worker))
+            .map(|picker| Arc::clone(&picker.scm_status_worker))
     }
 
     /// Refresh git statuses for all indexed files
@@ -713,30 +683,31 @@ impl SharedFilePicker {
                 return Err(Error::FilePickerMissing);
             };
             (
-                picker.git_root().map(|p| p.to_path_buf()),
+                picker.scm_workspace().cloned(),
                 picker.git_recency_config(),
                 picker.base_path().to_path_buf(),
                 picker.trace_id().to_owned(),
             )
         };
 
-        let repo = git_root.as_deref().and_then(|root| {
-            let repo = Repository::open(root)
-                .inspect_err(|e| tracing::error!(?e, "Failed to open repo for git refresh"))
-                .ok()?;
-            wait_for_git_index_lock_release(repo.path());
-            Some(repo)
-        });
-
-        let git_status = repo.as_ref().and_then(|repo| {
-            GitStatusCache::read_full_status(repo)
-                .inspect_err(|e| tracing::error!(?e, "Failed to read git status"))
+        let repo = git_root.as_ref().and_then(|workspace| {
+            workspace
+                .open()
+                .inspect_err(|e| tracing::error!(?e, "Failed to open SCM workspace"))
                 .ok()
         });
-
+        let git_status = repo.as_ref().and_then(|repo| {
+            repo.wait_for_write();
+            repo.status(true)
+                .inspect_err(|e| tracing::error!(?e, "Failed to read SCM status"))
+                .ok()
+        });
         let recency = repo
             .as_ref()
-            .and_then(|repo| git_recency::compute_git_recency(repo, &recency_config, &base_path));
+            .zip(git_root.as_ref())
+            .and_then(|(repo, workspace)| {
+                repo.recency(&recency_config, &workspace.git_path(&base_path))
+            });
 
         let mut guard = self.write()?;
         let picker = guard.as_mut().ok_or(Error::FilePickerMissing)?;
@@ -747,9 +718,7 @@ impl SharedFilePicker {
         }
 
         let statuses_count = if let Some(git_status) = git_status {
-            let count = git_status.statuses_len();
-            picker.update_git_statuses(git_status, shared_frecency)?;
-            count
+            picker.update_git_statuses(git_status, shared_frecency)?
         } else {
             0
         };
@@ -769,24 +738,28 @@ impl SharedFilePicker {
             return Ok(());
         }
 
-        let git_root = {
+        let (git_root, worker) = {
             let guard = self.read()?;
             let Some(ref picker) = *guard else {
                 return Err(Error::FilePickerMissing);
             };
-            picker.git_root().map(|p| p.to_path_buf())
+            (
+                picker.scm_workspace().cloned(),
+                Arc::clone(&picker.scm_status_worker),
+            )
         };
         let Some(git_root) = git_root else {
             return Ok(());
         };
 
-        let repo = Repository::open(&git_root)?;
-        wait_for_git_index_lock_release(repo.path());
-        let status = GitStatusCache::git_status_for_paths(&repo, paths)?;
+        let status = git_root.status_for_paths(paths)?;
 
         let mut guard = self.write()?;
         let picker = guard.as_mut().ok_or(Error::FilePickerMissing)?;
-        picker.update_git_statuses(status, shared_frecency)
+        if Arc::ptr_eq(&worker, &picker.scm_status_worker) {
+            picker.update_git_statuses(status, shared_frecency)?;
+        }
+        Ok(())
     }
 }
 

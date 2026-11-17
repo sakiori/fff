@@ -3,7 +3,6 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use ahash::{AHashMap, AHashSet};
-use git2::Repository;
 use tracing::{debug, error, info};
 
 use super::background_watcher::WatcherOptions;
@@ -12,11 +11,12 @@ use super::dir_walk::DirWalk;
 use super::git_changes::{GitEvents, announce_git_state};
 use super::intake::{IgnoreFilter, PathState};
 use super::renames::{FileIdentity, detect_renames};
+use super::repository::Repo;
 use crate::constants::MAX_OVERFLOW_FILES;
 use crate::file_picker::{FilePicker, IndexUpdateError};
-use crate::git_status_worker::GitStatusWorker;
 use crate::prepared_file::{PreparedFile, RecordSlot};
 use crate::rescan_stats::RescanReason;
+use crate::scm::{ScmBackend, ScmStatusWorker};
 use crate::shared::{SharedFilePicker, SharedFrecency};
 use crate::stat::Stat;
 use crate::types::FileItem;
@@ -34,7 +34,7 @@ pub(crate) fn reconcile(
     frecency: &SharedFrecency,
     changed: ChangedPaths,
     report: bool,
-    repo: Option<&Repository>,
+    repo: Option<Repo<'_>>,
 ) -> Option<RescanReason> {
     if changed.is_empty() {
         return None;
@@ -48,7 +48,8 @@ struct Context {
     options: WatcherOptions,
     base_path: PathBuf,
     git_workdir: Option<PathBuf>,
-    git_status_worker: Arc<GitStatusWorker>,
+    git_backend: Option<ScmBackend>,
+    git_status_worker: Arc<dyn ScmStatusWorker>,
     rules: Arc<crate::walk::IgnoreRules>,
     ref_signals: Option<super::ref_watches::RefSignals>,
     dir_hook: Option<DirHook>,
@@ -86,7 +87,8 @@ impl Context {
             options: WatcherOptions::of(picker),
             base_path: picker.base_path().to_path_buf(),
             git_workdir: picker.git_root().map(Path::to_path_buf),
-            git_status_worker: Arc::clone(&picker.git_status_worker),
+            git_backend: picker.scm_workspace().map(|workspace| workspace.backend),
+            git_status_worker: Arc::clone(&picker.scm_status_worker),
             rules: picker.ignore_rules(),
             ref_signals: None,
             dir_hook: watcher.and_then(|watcher| watcher.dir_hook()),
@@ -104,7 +106,7 @@ impl Context {
         frecency: &SharedFrecency,
         pending: Pending,
         report: bool,
-        repo: Option<&Repository>,
+        repo: Option<Repo<'_>>,
     ) -> Option<RescanReason> {
         let base_path = self.base_path.as_path();
         let mut filter = IgnoreFilter::new(
@@ -358,7 +360,6 @@ impl Context {
             follow_symlinks: self.options.follow_symlinks,
             ignore: &self.options.ignore_options,
         };
-        let is_git_repo = self.git_workdir.is_some();
         let hooks = WalkHooks::new(self.dir_hook.as_ref(), Some(&self.cancelled));
         (roots.into_iter())
             .filter_map(|root| {
@@ -367,7 +368,7 @@ impl Context {
                 }
                 #[cfg(test)]
                 WALKED.lock().push(root.clone());
-                DirWalk::new(&root, &self.base_path, is_git_repo, policy, hooks)
+                DirWalk::new(&root, &self.base_path, self.git_backend, policy, hooks)
             })
             .collect()
     }
@@ -430,7 +431,7 @@ impl Context {
         }
         git.changes.announce(shared);
         let workdir = &self.git_workdir;
-        let worker = &self.git_status_worker;
+        let worker = self.git_status_worker.as_ref();
         if !pending.lost_git.is_empty() {
             let within = Some(pending.lost_git.as_slice());
             announce_git_state(
@@ -705,7 +706,7 @@ fn track_ai_edits<'a>(
                 continue;
             }
             let shared = (shared_base.as_deref())
-                .and_then(|shared_base| crate::git::shared_twin(path, base_path, shared_base));
+                .and_then(|shared_base| crate::scm::shared_twin(path, base_path, shared_base));
             match tracker.track_access_shared(path, shared.as_deref()) {
                 Ok(_) => tracked.push(path.clone()),
                 Err(e) => error!("Failed to track frecency for {:?}: {:?}", path, e),
@@ -741,13 +742,16 @@ pub(crate) fn apply_events(
 ) -> Option<RescanReason> {
     let mut context = Context::of(shared)?;
     context.dir_hook = dir_hook.or(context.dir_hook);
-    let repo = git_workdir.and_then(|workdir| Repository::open(workdir).ok());
+    let workspace = git_workdir.and_then(|workdir| ScmBackend::configured().discover(workdir));
+    let mut repository = super::repository::LoopRepository::default();
+    let repo = repository.at(workspace.as_ref());
     let mut changed = ChangedPaths::new(&context.base_path);
-    changed.add(super::intake::intake(shared, &events, repo.as_ref()));
+    changed.add(super::intake::intake(shared, &events, repo));
     context.options = options.clone();
     context.git_workdir = git_workdir.map(Path::to_path_buf);
+    context.git_backend = workspace.as_ref().map(|workspace| workspace.backend);
     let frecency = SharedFrecency::noop();
-    context.reconcile(shared, &frecency, changed.drain(), true, repo.as_ref())
+    context.reconcile(shared, &frecency, changed.drain(), true, repo)
 }
 
 // Test seam: the root of every walk a reconcile ran.

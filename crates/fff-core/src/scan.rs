@@ -6,9 +6,9 @@ use tracing::error;
 
 use crate::FileSync;
 use crate::file_picker::{FFFMode, FilePicker, FilePickerIgnoreOptions};
-use crate::git::GitDiscovery;
 use crate::index::{build_bigram_index, sniff_binary_for_non_indexable};
 use crate::parallelism::{BACKGROUND_THREAD_POOL, indexing_pool};
+use crate::scm::ScmWorkspace;
 use crate::shared::{SharedFilePicker, SharedFrecency};
 use crate::walk::DirHook;
 use crate::watch::{Message, Published, WatcherOptions};
@@ -205,7 +205,7 @@ pub(crate) struct ScanJob {
     pub(crate) mode: FFFMode,
     pub(crate) index: u64,
     pub(crate) config: ScanConfig,
-    pub(crate) git: Option<GitDiscovery>,
+    pub(crate) git: Option<ScmWorkspace>,
     pub(crate) dir_hook: Option<DirHook>,
     /// Walker-maintained counter backing `get_scan_progress` on the UI
     /// side. Reset to 0 at scan start, incremented per-file by the

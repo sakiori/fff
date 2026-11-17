@@ -1,4 +1,4 @@
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::sync::mpsc::Sender;
@@ -14,10 +14,10 @@ use super::watched::{Running, Watched};
 use super::writer::{Message, Replacement};
 use crate::FileSync;
 use crate::error::Error;
-use crate::git::GitDiscovery;
 use crate::rescan_schedule::{Pending, RescanSchedule};
 use crate::rescan_stats::RescanReason;
 use crate::scan::{PostScan, RequestTicket, ScanConfig, ScanJob, ScanSignals};
+use crate::scm::{ScmBackend, ScmWorkspace};
 use crate::shared::{SharedFilePicker, SharedFrecency};
 use crate::types::ContentCacheBudget;
 use crate::watch::{BackgroundWatcher, Installed, Lost};
@@ -56,7 +56,7 @@ struct Walking {
     // A scan that installs a watcher waits for it to report in before it walks.
     awaiting_watcher: bool,
     recorded: ChangedPaths,
-    git: Option<GitDiscovery>,
+    git: Option<ScmWorkspace>,
     config: ScanConfig,
     frecency: SharedFrecency,
     // The scan serves a recovery: one whose walk fails is owed again, as a repair if it was one.
@@ -341,20 +341,22 @@ impl IndexLoop {
         let applied_now = match scan {
             // A scan holds changes: they join its set, filtered against the index as it is.
             Scan::Walking(walking) => {
-                let workdir = walking.git.as_ref().map(|git| git.workdir.clone());
-                let repo = repository.at(workdir.as_deref());
+                let repo = repository.at(walking.git.as_ref());
                 walking.recorded.add(intake(shared, &events, repo));
                 false
             }
             _ => {
-                let (frecency, workdir) = (shared.read().ok())
+                let (frecency, workspace) = (shared.read().ok())
                     .and_then(|guard| {
                         let picker = guard.as_ref()?;
-                        let workdir = picker.git_root().map(Path::to_path_buf);
-                        Some((frecency.unwrap_or_else(|| picker.frecency.clone()), workdir))
+                        let workspace = picker.scm_workspace().cloned();
+                        Some((
+                            frecency.unwrap_or_else(|| picker.frecency.clone()),
+                            workspace,
+                        ))
                     })
                     .unzip();
-                let repo = repository.at(workdir.flatten().as_deref());
+                let repo = repository.at(workspace.flatten().as_ref());
                 let rescan = frecency.and_then(|frecency| {
                     let mut changed = ChangedPaths::new(&base_path);
                     changed.add(intake(shared, &events, repo));
@@ -443,7 +445,11 @@ impl IndexLoop {
         if !initial {
             crate::scan::tests::reached(crate::scan::tests::Stage::Claimed, &base_path);
         }
-        let git = FileSync::discover_git(&base_path, config.ignore_options.disable_git);
+        let git = FileSync::discover_scm(
+            scm_backend(shared),
+            &base_path,
+            config.ignore_options.disable_git,
+        );
         let watch = config.install_watcher && config.watch;
         let options = watch.then(|| config.clone());
         state.scan = Scan::Walking(Box::new(Walking {
@@ -653,8 +659,8 @@ impl IndexLoop {
                     drop(stopped);
                 } else if !cancelled {
                     // The live index takes what was recorded, and the watcher reports.
-                    let workdir = git_root(shared);
-                    let repo = state.repository.at(workdir.as_deref());
+                    let workspace = scm_workspace(shared);
+                    let repo = state.repository.at(workspace.as_ref());
                     let rescan = reconcile(shared, &frecency, recorded, true, repo);
                     if let Some(reason) = rescan
                         && state.schedule.request(reason, false, None)
@@ -672,25 +678,22 @@ impl IndexLoop {
             }
         };
 
-        let Some((previous, git_status_worker)) = shared.write().ok().and_then(|mut guard| {
+        let Some((previous, scm_status_worker)) = shared.write().ok().and_then(|mut guard| {
             let picker = guard.as_mut()?;
             let live_count = sync.live_count;
             let previous = picker.commit_new_sync(sync);
             if config.auto_cache_budget && !picker.has_explicit_cache_budget() {
                 picker.set_cache_budget(ContentCacheBudget::new_for_repo(live_count));
             }
-            Some((previous, Arc::clone(&picker.git_status_worker)))
+            Some((previous, Arc::clone(&picker.scm_status_worker)))
         }) else {
             return self.end_scan(shared);
         };
         #[cfg(test)]
         crate::scan::tests::committed(&base_path);
 
-        // Spawn the git status worker once. BUG PINNNING. If the user initiated git in the folder
-        // which is a real use case we need to have a way to start the git worker background thread dynamically
         if git.is_some() {
-            git_status_worker.spawn_once(shared.weaken(), frecency.clone());
-            git_status_worker.request_full_rescan(); // this runs anyway
+            scm_status_worker.on_workspace_scan(shared.weaken(), frecency.clone());
         }
 
         #[cfg(test)]
@@ -700,9 +703,9 @@ impl IndexLoop {
         }
         // The recorded changes reach the new snapshot without events of their own: subscribers
         // hear of the whole rebuild at once below.
-        let workdir = git_root(shared);
+        let workspace = scm_workspace(shared);
         let rescan = (self.index.as_mut()).and_then(|state| {
-            let repo = state.repository.at(workdir.as_deref());
+            let repo = state.repository.at(workspace.as_ref());
             reconcile(shared, &frecency, recorded, false, repo)
         });
         if let Some(state) = self.index.as_mut()
@@ -855,7 +858,7 @@ fn start_watcher(
     shared: &SharedFilePicker,
     index: u64,
     scan: u64,
-    git: Option<GitDiscovery>,
+    git: Option<ScmWorkspace>,
     config: &ScanConfig,
     quiet: bool,
 ) -> bool {
@@ -864,7 +867,7 @@ fn start_watcher(
         Some((
             picker.base_path().to_path_buf(),
             config.watcher_options(picker.mode()),
-            Arc::clone(&picker.git_status_worker),
+            Arc::clone(&picker.scm_status_worker),
             picker.trace_span(),
         ))
     }) else {
@@ -899,10 +902,17 @@ fn rescan_interval(shared: &SharedFilePicker) -> Option<(std::time::Duration, bo
     Some((picker.rescan_cooldown(), picker.watcher_stopped()))
 }
 
-// The work tree of the published index's repository.
-fn git_root(shared: &SharedFilePicker) -> Option<PathBuf> {
+// The published index's repository.
+fn scm_workspace(shared: &SharedFilePicker) -> Option<ScmWorkspace> {
     let guard = shared.read().ok()?;
-    Some(guard.as_ref()?.git_root()?.to_path_buf())
+    guard.as_ref()?.scm_workspace().cloned()
+}
+
+// The published index's backend, or the process's before an index is published.
+fn scm_backend(shared: &SharedFilePicker) -> ScmBackend {
+    (shared.read().ok())
+        .and_then(|guard| Some(guard.as_ref()?.scm_backend))
+        .unwrap_or_else(ScmBackend::configured)
 }
 
 // Applies changes; a panic reaches the loop's turn, which has the index rebuilt.

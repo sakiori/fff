@@ -4,11 +4,9 @@ use super::rescan_tap::{RescanLog, Tapped};
 use crate::constants::MAX_OVERFLOW_FILES;
 use crate::error::Error;
 use crate::file_picker::{FFFMode, FilePicker, FilePickerIgnoreOptions};
-use crate::git::GitDiscovery;
-use crate::git_status_worker::GitStatusWorker;
+use crate::scm::{ScmStatusWorker, ScmWorkspace};
 use crate::shared::{SharedFilePicker, SharedFrecency};
 use crate::walk::DirHook;
-use git2::Repository;
 use notify::event::ModifyKind;
 use notify::{Config, EventKind, EventKindMask, PathOp, RecursiveMode, Watcher, WatcherKind};
 use notify_debouncer_full::{DebounceEventResult, DebouncedEvent, NoCache, new_debouncer_opt};
@@ -119,7 +117,7 @@ pub(crate) struct Watches {
     // The git dirs this watcher watches, which its walks register: a new watcher starts with
     // none but the own one, so it watches every repository its walk meets.
     pub(crate) git_dirs: Arc<crate::git_dirs::GitDirs>,
-    git_status: Arc<GitStatusWorker>,
+    git_status: Arc<dyn ScmStatusWorker>,
     base_path: PathBuf,
     // Set when the index's first walk begins; what a stream misses before, the walk reads.
     walking: AtomicBool,
@@ -325,6 +323,7 @@ impl Owner {
                         .and_then(|guard| Some(guard.as_ref()?.git_root()?.to_path_buf()));
                     let (base_path, git_status) =
                         (&self.watches.base_path, &self.watches.git_status);
+                    let git_status = git_status.as_ref();
                     announce_git_state(picker, base_path, &workdir, &options, git_status, None);
                 }
             }
@@ -469,12 +468,11 @@ impl Owner {
         covered: bool,
         announced: &[PathBuf],
     ) {
+        let canonical = |path: &Path| crate::path_utils::canonicalize(path).ok();
         let own = (self.own_work_tree.as_ref())
-            .filter(|work_tree| {
-                Repository::open(work_tree).is_ok_and(|repo| {
-                    let canonical = crate::path_utils::canonicalize;
-                    canonical(repo.path()).ok() == canonical(git_dir).ok()
-                })
+            .filter(|_| {
+                (self.watches.refs.own_git_dir())
+                    .is_some_and(|own| canonical(&own) == canonical(git_dir))
             })
             .cloned();
         let work_tree = own.or_else(|| {
@@ -576,10 +574,10 @@ impl BackgroundWatcher {
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn start(
         base_path: PathBuf,
-        git: Option<GitDiscovery>,
+        git: Option<ScmWorkspace>,
         shared_picker: &SharedFilePicker,
         options: WatcherOptions,
-        git_status_worker: Arc<GitStatusWorker>,
+        scm_status_worker: Arc<dyn ScmStatusWorker>,
         trace_span: tracing::Span,
         quiet: bool,
         installed: Installed,
@@ -597,16 +595,16 @@ impl BackgroundWatcher {
                 let Some(shared_picker) = picker.upgrade() else {
                     return;
                 };
-                let git_workdir = git.map(|git| git.workdir);
+                let git_workdir = git.as_ref().map(|git| git.workdir.clone());
                 let (tasks, task_receiver) = mpsc::channel::<WatchTask>();
                 // A setup that panics fails as any other, so the initial scan goes on without it.
                 let created = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                     Self::create(
                         &base_path,
-                        git_workdir.as_deref(),
+                        git.as_ref(),
                         &shared_picker,
                         &options,
-                        git_status_worker,
+                        scm_status_worker,
                         tasks,
                         quiet,
                     )
@@ -643,10 +641,10 @@ impl BackgroundWatcher {
 
     fn create(
         base_path: &Path,
-        git_workdir: Option<&Path>,
+        git: Option<&ScmWorkspace>,
         shared_picker: &SharedFilePicker,
         options: &WatcherOptions,
-        git_status_worker: Arc<GitStatusWorker>,
+        scm_status_worker: Arc<dyn ScmStatusWorker>,
         tasks: mpsc::Sender<WatchTask>,
         quiet: bool,
     ) -> Result<(Self, Streams), Error> {
@@ -684,7 +682,8 @@ impl BackgroundWatcher {
             && <notify::RecommendedWatcher as Watcher>::kind() == WatcherKind::Fsevent;
         // Removing a watch restarts the FSEvents stream, so ref watches stay once added there.
         let follows_git = !options.ignore_options.disable_git;
-        let refs = RefWatches::new(base_path, use_recursive, git_workdir, fsevents, follows_git);
+        let refs = RefWatches::new(base_path, use_recursive, git, fsevents, follows_git);
+        let git_workdir = git.map(|git| git.workdir.as_path());
         // The own git dir is watched from the start, so a walk reaching the work tree finds it
         // known, and watches it anew only once it was created again.
         let git_dirs = Arc::new(crate::git_dirs::GitDirs::default());
@@ -732,14 +731,13 @@ impl BackgroundWatcher {
         // The .git directory is excluded from the file list but we still need to observe
         // changes that affect git status (staging, committing, branch switches, merges, etc).
         // The own git dir may lie outside the tree, as a linked worktree's does.
-        let own_git = git_workdir
-            .and_then(|workdir| Repository::open(workdir).ok())
-            .map(|repo| {
-                let mut watches: Vec<_> = git_dir_watches(repo.path()).collect();
+        let own_git = git
+            .map(|git| {
+                let mut watches: Vec<_> = git_dir_watches(&git.metadata).collect();
                 // A linked worktree's `info`, created later in its main repository's git dir,
                 // appears there: that git dir is watched too, ref listeners or not.
-                let common_dir = super::common_dir_of(repo.path());
-                if common_dir.components().ne(repo.path().components()) {
+                let common_dir = super::common_dir_of(&git.metadata);
+                if common_dir.components().ne(git.metadata.components()) {
                     watches.push(PathOp::watch_non_recursive(common_dir));
                 }
                 watches
@@ -775,7 +773,7 @@ impl BackgroundWatcher {
             restarts: fsevents,
             refs,
             git_dirs,
-            git_status: git_status_worker,
+            git_status: scm_status_worker,
             base_path: base_path.to_path_buf(),
             walking: AtomicBool::new(false),
             quiet: AtomicBool::new(quiet),
@@ -869,7 +867,7 @@ impl BackgroundWatcher {
             restarts: false,
             refs: RefWatches::new(base_path, false, None, false, true),
             git_dirs: Arc::default(),
-            git_status: GitStatusWorker::new(),
+            git_status: crate::scm::ScmBackend::configured().create_worker(Arc::default()),
             base_path: base_path.to_path_buf(),
             walking: AtomicBool::new(false),
             quiet: AtomicBool::new(false),
@@ -1822,12 +1820,23 @@ mod tests {
         assert_eq!(received[0].kind, WatchEventKind::Created);
     }
 
+    #[cfg(any(feature = "libgit2", feature = "gitoxide"))]
     #[test]
     fn dotgit_status_filter_matches_worktree_state_changes() {
         let tmp = tempfile::tempdir().unwrap();
-        let repo = git2::Repository::init(tmp.path()).unwrap();
-        let git_dir = repo.path().to_path_buf();
-        let repo = Some(&repo);
+        let status = std::process::Command::new("git")
+            .args(["init", "--quiet"])
+            .current_dir(tmp.path())
+            .status()
+            .unwrap();
+        assert!(status.success());
+        let workspace = crate::scm::ScmWorkspace::discover(tmp.path()).unwrap();
+        let git_dir = workspace.metadata.clone();
+        let opened = workspace.open().unwrap();
+        let repo = Some(super::super::repository::Repo {
+            workspace: &workspace,
+            repo: &opened,
+        });
         use crate::watch::git_changes::{
             affects_worktree_state, is_dotgit_change_affecting_status,
         };
@@ -2406,7 +2415,7 @@ mod tests {
             sender.send(root.to_path_buf()).unwrap()
         });
         let git_status = (shared_picker.read().unwrap().as_ref())
-            .map(|picker| Arc::clone(&picker.git_status_worker))
+            .map(|picker| Arc::clone(&picker.scm_status_worker))
             .unwrap();
         drain(&state);
         drain(&heard);

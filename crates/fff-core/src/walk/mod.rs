@@ -30,7 +30,7 @@ use ripgrep::walk_files;
 pub(crate) fn walk_collect_files(
     base_path: &Path,
     subtree: Option<&Path>,
-    is_git_repo: bool,
+    backend: Option<crate::scm::ScmBackend>,
     policy: WalkPolicy<'_>,
     threads: usize,
     synced_files_count: &Arc<AtomicUsize>,
@@ -39,9 +39,9 @@ pub(crate) fn walk_collect_files(
     let sources = Arc::new(IgnoreSources::new(policy.ignore));
     let walk_root = subtree.unwrap_or(base_path);
     sources.read_in(walk_root);
-    if is_git_repo
+    if let Some(backend) = backend
         && !policy.ignore.disable_git
-        && let Some(exclude) = exclude_file_of(base_path, walk_root)
+        && let Some(exclude) = exclude_file_of(backend, base_path, walk_root)
     {
         sources.read_file(exclude);
     }
@@ -58,7 +58,7 @@ pub(crate) fn walk_collect_files(
     let walked = walk_files(
         base_path,
         subtree,
-        is_git_repo,
+        backend,
         policy,
         threads,
         synced_files_count,
@@ -74,15 +74,17 @@ pub(crate) fn walk_collect_files(
 
 // The exclude file of the repository whose whole work tree within the index the walk covers:
 // the index's own for a walk of the root, a nested one's for a walk of its work tree.
-fn exclude_file_of(base_path: &Path, walk_root: &Path) -> Option<PathBuf> {
-    let common_dir = if walk_root == base_path {
-        git2::Repository::discover(base_path)
-            .ok()?
-            .commondir()
-            .to_path_buf()
+fn exclude_file_of(
+    backend: crate::scm::ScmBackend,
+    base_path: &Path,
+    walk_root: &Path,
+) -> Option<PathBuf> {
+    let git_dir = if walk_root == base_path {
+        backend.discover(base_path)?.metadata
     } else {
-        crate::watch::common_dir_of(&crate::watch::git_dir_of(walk_root)?)
+        crate::watch::git_dir_of(walk_root)?
     };
+    let common_dir = crate::watch::common_dir_of(&git_dir);
     Some(common_dir.join("info").join("exclude"))
 }
 
@@ -220,7 +222,7 @@ mod tests {
         let out = walk_collect_files(
             root,
             None,
-            true,
+            Some(crate::scm::ScmBackend::configured()),
             policy(false),
             1,
             &counter,
@@ -258,7 +260,7 @@ mod tests {
             let out = walk_collect_files(
                 root,
                 None,
-                true,
+                Some(crate::scm::ScmBackend::configured()),
                 policy(false),
                 threads,
                 &counter,
@@ -296,7 +298,7 @@ mod tests {
         let out = walk_collect_files(
             root,
             None,
-            true,
+            Some(crate::scm::ScmBackend::configured()),
             policy(false),
             4,
             &counter,
@@ -324,7 +326,7 @@ mod tests {
         let out = walk_collect_files(
             root,
             None,
-            false,
+            None,
             policy(false),
             1,
             &counter,
@@ -355,7 +357,7 @@ mod tests {
         let out = walk_collect_files(
             root,
             Some(&root.join("sub")),
-            true,
+            Some(crate::scm::ScmBackend::configured()),
             policy(false),
             1,
             &counter,
@@ -377,7 +379,7 @@ mod tests {
         let result = walk_collect_files(
             dir.path(),
             Some(other.path()),
-            false,
+            None,
             policy(false),
             1,
             &counter,
@@ -416,7 +418,7 @@ mod tests {
             let out = walk_collect_files(
                 root,
                 None,
-                true,
+                Some(crate::scm::ScmBackend::configured()),
                 policy(false),
                 threads,
                 &counter,
@@ -447,7 +449,7 @@ mod tests {
             walk_collect_files(
                 root,
                 Some(&subtree),
-                true,
+                Some(crate::scm::ScmBackend::configured()),
                 policy(false),
                 1,
                 &counter,
@@ -477,7 +479,7 @@ mod tests {
         let out = walk_collect_files(
             root,
             None,
-            true,
+            Some(crate::scm::ScmBackend::configured()),
             policy(false),
             1,
             &counter,
@@ -515,7 +517,7 @@ mod tests {
         let out = walk_collect_files(
             &root,
             None,
-            false,
+            None,
             policy(true),
             1,
             &counter,
@@ -535,7 +537,7 @@ mod tests {
         let out = walk_collect_files(
             &root,
             None,
-            false,
+            None,
             policy(false),
             1,
             &counter,
@@ -561,7 +563,7 @@ mod tests {
         let out = walk_collect_files(
             root,
             None,
-            true,
+            Some(crate::scm::ScmBackend::configured()),
             policy(false),
             1,
             &counter,
@@ -625,7 +627,7 @@ mod tests {
             let out = walk_collect_files(
                 base,
                 None,
-                true,
+                Some(crate::scm::ScmBackend::configured()),
                 policy(false),
                 1,
                 &counter,
@@ -688,7 +690,7 @@ mod tests {
         let out = walk_collect_files(
             root,
             None,
-            true,
+            Some(crate::scm::ScmBackend::configured()),
             policy(false),
             1,
             &counter,
@@ -749,7 +751,7 @@ mod tests {
             walk_collect_files(
                 &root,
                 None,
-                true,
+                Some(crate::scm::ScmBackend::configured()),
                 WalkPolicy {
                     follow_symlinks: false,
                     ignore: &options,
