@@ -395,8 +395,6 @@ pub(super) fn affects_worktree_state(path_in_git_dir: &Path) -> bool {
         .any(|name| path_in_git_dir == Path::new(name))
 }
 
-// Watches the log a git dir gained, unless the tree's watch covers it, and announces its
-
 // The work tree of a git dir found by shape inside a `.git`; only libgit2 opens one here, so
 // builds without it announce such a repository once the walk registers it.
 #[cfg(feature = "libgit2")]
